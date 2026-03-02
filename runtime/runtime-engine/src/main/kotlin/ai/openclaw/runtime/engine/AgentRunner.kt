@@ -3,8 +3,12 @@ package ai.openclaw.runtime.engine
 import ai.openclaw.core.acp.AcpRuntime
 import ai.openclaw.core.agent.*
 import ai.openclaw.core.model.*
+import ai.openclaw.core.security.ApprovalDecision
+import ai.openclaw.core.security.ApprovalManager
+import ai.openclaw.core.security.ToolPolicyEnforcer
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 
 /**
  * Tool registry for managing available tools.
@@ -48,6 +52,8 @@ class AgentRunner(
     private val contextGuard: ContextGuard = ContextGuard(),
     private val sessionPersistence: SessionPersistence? = null,
     private val systemPromptBuilder: SystemPromptBuilder = SystemPromptBuilder(),
+    private val approvalManager: ApprovalManager? = null,
+    private val toolPolicyEnforcer: ToolPolicyEnforcer? = null,
 ) {
     /**
      * Run a single turn: message → LLM → tool calls → loop → done.
@@ -133,18 +139,39 @@ class AgentRunner(
                             title = event.name,
                         ))
 
-                        // Execute tool with context guard
-                        val tool = toolRegistry.get(event.name)
-                        val rawResult = if (tool != null) {
-                            try {
-                                tool.execute(event.input, ToolContext(sessionKey, agentId))
-                            } catch (e: Exception) {
-                                "Error: ${e.message}"
-                            }
+                        // Check tool policy enforcement first
+                        val policyResult = toolPolicyEnforcer?.check(event.name, agentId, sessionKey)
+                        val policyAllowed = policyResult?.allowed != false
+
+                        // Check approval before execution
+                        val approvalDecision = if (policyAllowed && approvalManager != null) {
+                            emit(AcpRuntimeEvent.Status(
+                                text = "Checking approval for ${event.name}",
+                                tag = "approval_check",
+                            ))
+                            approvalManager.checkApproval(event.name, event.input, agentId, sessionKey)
                         } else {
-                            "Error: Unknown tool '${event.name}'"
+                            ApprovalDecision.APPROVED
                         }
 
+                        // Execute tool with context guard (only if policy + approval pass)
+                        val tool = toolRegistry.get(event.name)
+                        val rawResult = when {
+                            !policyAllowed ->
+                                "Error: Tool '${event.name}' denied by policy: ${policyResult?.reason}"
+                            approvalDecision == ApprovalDecision.DENIED ->
+                                "Error: Tool call '${event.name}' was denied by approval policy."
+                            approvalDecision == ApprovalDecision.TIMED_OUT ->
+                                "Error: Tool call '${event.name}' timed out waiting for approval."
+                            tool != null -> {
+                                try {
+                                    tool.execute(event.input, ToolContext(sessionKey, agentId))
+                                } catch (e: Exception) {
+                                    "Error: ${e.message}"
+                                }
+                            }
+                            else -> "Error: Unknown tool '${event.name}'"
+                        }
                         // Guard tool result size
                         val result = contextGuard.guardToolResult(rawResult, currentMessages)
 
@@ -225,14 +252,18 @@ class EmbeddedAcpRuntime(
     private val runnerFactory: (String) -> AgentRunner,
 ) : AcpRuntime {
 
-    private data class SessionState(
+    private class SessionState(
         val sessionKey: String,
         val agentId: String,
         val model: String,
         var runner: AgentRunner,
+        @Volatile var activeJob: kotlinx.coroutines.Job? = null,
     )
 
     private val sessions = java.util.concurrent.ConcurrentHashMap<String, SessionState>()
+    private val runtimeScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    )
 
     override suspend fun ensureSession(input: AcpRuntimeEnsureInput): AcpRuntimeHandle {
         val runner = runnerFactory(input.agent)
@@ -256,17 +287,41 @@ class EmbeddedAcpRuntime(
                 emit(AcpRuntimeEvent.Error(message = "No session: ${input.handle.sessionKey}"))
             }
 
+        // Cancel any in-flight turn for this session (supports new message during processing)
+        session.activeJob?.cancel()
+
         val userMessage = LlmMessage(
             role = LlmMessage.Role.USER,
             content = input.text,
         )
 
-        return session.runner.runTurn(
-            messages = listOf(userMessage),
-            model = session.model,
-            sessionKey = session.sessionKey,
-            agentId = session.agentId,
-        )
+        return kotlinx.coroutines.flow.channelFlow {
+            val job = runtimeScope.launch {
+                session.runner.runTurn(
+                    messages = listOf(userMessage),
+                    model = session.model,
+                    sessionKey = session.sessionKey,
+                    agentId = session.agentId,
+                ).collect { event ->
+                    send(event)
+                }
+            }
+            session.activeJob = job
+            try {
+                job.join()
+                // join() returns normally even if the joined job was cancelled;
+                // check its completion status to detect cancellation.
+                if (job.isCancelled) {
+                    send(AcpRuntimeEvent.Done(stopReason = "cancelled"))
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                send(AcpRuntimeEvent.Done(stopReason = "cancelled"))
+            } finally {
+                if (session.activeJob == job) {
+                    session.activeJob = null
+                }
+            }
+        }
     }
 
     override suspend fun getCapabilities(handle: AcpRuntimeHandle?): AcpRuntimeCapabilities {
@@ -281,7 +336,9 @@ class EmbeddedAcpRuntime(
     override suspend fun getStatus(handle: AcpRuntimeHandle): AcpRuntimeStatus {
         val session = sessions[handle.sessionKey]
         return AcpRuntimeStatus(
-            summary = if (session != null) "active" else "unknown",
+            summary = if (session != null) {
+                if (session.activeJob?.isActive == true) "running" else "active"
+            } else "unknown",
             agentSessionId = session?.sessionKey,
         )
     }
@@ -302,10 +359,14 @@ class EmbeddedAcpRuntime(
     }
 
     override suspend fun cancel(handle: AcpRuntimeHandle, reason: String?) {
-        // TODO: Implement cancellation via coroutine job tracking
+        val session = sessions[handle.sessionKey] ?: return
+        val job = session.activeJob ?: return
+        job.cancel(kotlinx.coroutines.CancellationException(reason ?: "Cancelled by user"))
+        session.activeJob = null
     }
 
     override suspend fun close(handle: AcpRuntimeHandle, reason: String) {
-        sessions.remove(handle.sessionKey)
+        val session = sessions.remove(handle.sessionKey)
+        session?.activeJob?.cancel()
     }
 }

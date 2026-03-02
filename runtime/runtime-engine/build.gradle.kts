@@ -27,11 +27,13 @@ dependencies {
     api(project(":core:core-routing"))
     api(project(":core:core-config"))
     api(project(":core:core-session"))
+    api(project(":core:core-security"))
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
 
     testImplementation(libs.kotlin.test)
+    testImplementation("org.jetbrains.kotlin:kotlin-test-junit")
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.turbine)
 }
