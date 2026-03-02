@@ -1,6 +1,7 @@
 package ai.openclaw.android.ui.settings
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
@@ -31,6 +32,7 @@ class SettingsScreenTest {
 
         // These items are at the top and should be visible
         composeTestRule.onNodeWithText("API Keys").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Codex OAuth").assertIsDisplayed()
         composeTestRule.onNodeWithText("Models").assertIsDisplayed()
         composeTestRule.onNodeWithText("Agents").assertIsDisplayed()
     }
@@ -45,8 +47,10 @@ class SettingsScreenTest {
 
         // Check items exist in the semantic tree (may need scroll)
         composeTestRule.onNodeWithText("API Keys").assertExists()
+        composeTestRule.onNodeWithText("Codex OAuth").assertExists()
         composeTestRule.onNodeWithText("Models").assertExists()
         composeTestRule.onNodeWithText("Agents").assertExists()
+        composeTestRule.onNode(hasScrollAction()).performScrollToNode(hasText("Plugins"))
         composeTestRule.onNodeWithText("Plugins").assertExists()
     }
 

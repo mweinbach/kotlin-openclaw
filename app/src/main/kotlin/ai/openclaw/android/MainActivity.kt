@@ -1,25 +1,45 @@
 package ai.openclaw.android
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import ai.openclaw.android.ui.navigation.AppNavigation
 import ai.openclaw.android.ui.theme.OpenClawTheme
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val app = application as OpenClawApp
+        handleOauthIntent(app, intent)
         requestNotificationPermissionIfNeeded()
-        AgentForegroundService.start(this)
         setContent {
             OpenClawTheme {
                 AppNavigation(engine = app.engine)
             }
+        }
+        runCatching { AgentForegroundService.start(applicationContext) }
+            .onFailure { Log.w(TAG, "Foreground service start skipped", it) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val app = application as OpenClawApp
+        handleOauthIntent(app, intent)
+    }
+
+    private fun handleOauthIntent(app: OpenClawApp, intent: Intent?) {
+        val redirectUri = intent?.data ?: return
+        if (!app.engine.isCodexOauthRedirect(redirectUri)) return
+        lifecycleScope.launch {
+            app.engine.completeCodexOauthRedirect(redirectUri)
         }
     }
 
@@ -36,5 +56,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         private const val REQ_POST_NOTIFICATIONS = 1001
+        private const val TAG = "MainActivity"
     }
 }

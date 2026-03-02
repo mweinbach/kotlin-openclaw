@@ -1,11 +1,14 @@
 package ai.openclaw.android
 
 import android.content.Context
+import android.net.Uri
+import ai.openclaw.android.auth.CodexOauthManager
 import ai.openclaw.android.security.SharedPreferencesSecretStore
 import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.model.AcpRuntimeEvent
 import ai.openclaw.core.model.AgentConfig
 import ai.openclaw.core.model.AuthProfileConfig
+import ai.openclaw.core.model.ModelProviderAuthMode
 import ai.openclaw.core.model.ModelProviderConfig
 import ai.openclaw.core.model.OpenClawConfig
 import ai.openclaw.core.model.SecretInput
@@ -43,6 +46,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -62,10 +68,13 @@ class AgentEngine(private val context: Context) {
     private var gatewayHost: String = DEFAULT_GATEWAY_HOST
     private var gatewayPort: Int = DEFAULT_GATEWAY_PORT
     private var gatewayServerInternal: GatewayServer? = null
+    private val codexOauthManager by lazy { CodexOauthManager(context.applicationContext) }
+    private val _codexOauthEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
     val providerRegistry = ProviderRegistry()
     val pluginRegistry = PluginRegistry()
     val toolRegistry = ToolRegistry()
+    val codexOauthEvents: SharedFlow<String> = _codexOauthEvents.asSharedFlow()
 
     var config: OpenClawConfig = OpenClawConfig()
         private set
@@ -172,12 +181,61 @@ class AgentEngine(private val context: Context) {
         }
     }
 
+    data class CodexOauthStatus(
+        val tokenSet: Boolean,
+        val accountId: String?,
+        val email: String?,
+        val expiresAtMs: Long?,
+    )
+
+    fun beginCodexOauthLogin(): String {
+        return codexOauthManager.buildAuthorizationUrl()
+    }
+
+    fun isCodexOauthRedirect(uri: Uri): Boolean {
+        return codexOauthManager.isOauthRedirect(uri)
+    }
+
+    suspend fun completeCodexOauthRedirect(uri: Uri): Boolean {
+        if (!isCodexOauthRedirect(uri)) return false
+        return runCatching {
+            val session = codexOauthManager.exchangeFromRedirect(uri)
+            setCodexOauth(
+                accessToken = session.accessToken,
+                accountId = session.accountId,
+                refreshToken = session.refreshToken,
+                expiresAtMs = session.expiresAtMs,
+                email = session.email,
+            )
+            _codexOauthEvents.tryEmit("Codex OAuth connected.")
+            true
+        }.getOrElse { error ->
+            _codexOauthEvents.tryEmit(error.message ?: "Codex OAuth failed.")
+            true
+        }
+    }
+
     suspend fun setApiKey(providerId: String, apiKey: String) {
         val canonical = canonicalProvider(providerId)
         secretStore.storeSecret(secretKeyForProvider(canonical), apiKey, SecretCategory.LLM_API_KEY)
+        if (canonical == "openai") {
+            secretStore.deleteSecret(CODEX_OAUTH_TOKEN_KEY)
+            secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+            secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+            secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
+            secretStore.deleteSecret(CODEX_EMAIL_KEY)
+        }
 
         val updatedProfiles = (config.auth?.profiles.orEmpty()).toMutableMap()
-        if (updatedProfiles.values.none { canonicalProvider(it.provider) == canonical }) {
+        val existingProfileKey = updatedProfiles.entries
+            .firstOrNull { canonicalProvider(it.value.provider) == canonical }
+            ?.key
+        if (existingProfileKey != null) {
+            updatedProfiles[existingProfileKey] = updatedProfiles.getValue(existingProfileKey).copy(
+                provider = canonical,
+                mode = "api-key",
+            )
+        } else {
             updatedProfiles[canonical] = AuthProfileConfig(provider = canonical, mode = "api-key")
         }
 
@@ -194,6 +252,100 @@ class AgentEngine(private val context: Context) {
             ensureGatewayServer(startGateway = true)
             initialized = true
         }
+    }
+
+    suspend fun setCodexOauth(
+        accessToken: String,
+        accountId: String?,
+        refreshToken: String? = null,
+        expiresAtMs: Long? = null,
+        email: String? = null,
+    ) {
+        val token = accessToken.trim()
+        require(token.isNotBlank()) { "Codex OAuth access token cannot be blank" }
+
+        secretStore.storeSecret(CODEX_OAUTH_TOKEN_KEY, token, SecretCategory.LLM_API_KEY)
+        if (!refreshToken.isNullOrBlank()) {
+            secretStore.storeSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY, refreshToken.trim(), SecretCategory.LLM_API_KEY)
+        }
+        if (expiresAtMs != null && expiresAtMs > 0L) {
+            secretStore.storeSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY, expiresAtMs.toString(), SecretCategory.LLM_API_KEY)
+        } else {
+            secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+        }
+        val normalizedAccountId = accountId?.trim().orEmpty()
+        if (normalizedAccountId.isBlank()) {
+            secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
+        } else {
+            secretStore.storeSecret(CODEX_ACCOUNT_ID_KEY, normalizedAccountId, SecretCategory.LLM_API_KEY)
+        }
+        val normalizedEmail = email?.trim().orEmpty()
+        if (normalizedEmail.isBlank()) {
+            secretStore.deleteSecret(CODEX_EMAIL_KEY)
+        } else {
+            secretStore.storeSecret(CODEX_EMAIL_KEY, normalizedEmail, SecretCategory.LLM_API_KEY)
+        }
+
+        val updatedProfiles = (config.auth?.profiles.orEmpty()).toMutableMap()
+        val existingOpenAiProfileKey = updatedProfiles.entries
+            .firstOrNull { canonicalProvider(it.value.provider) == "openai" }
+            ?.key
+        if (existingOpenAiProfileKey != null) {
+            updatedProfiles[existingOpenAiProfileKey] = updatedProfiles.getValue(existingOpenAiProfileKey).copy(
+                provider = "openai",
+                mode = "oauth",
+            )
+        } else {
+            updatedProfiles["openai"] = AuthProfileConfig(provider = "openai", mode = "oauth")
+        }
+
+        val updatedConfig = config.copy(
+            auth = (config.auth ?: ai.openclaw.core.model.AuthConfig()).copy(
+                profiles = updatedProfiles,
+            ),
+        )
+        configManager.save(updatedConfig)
+        config = updatedConfig
+
+        initMutex.withLock {
+            registerProviders()
+            ensureGatewayServer(startGateway = true)
+            initialized = true
+        }
+    }
+
+    suspend fun clearCodexOauth() {
+        secretStore.deleteSecret(CODEX_OAUTH_TOKEN_KEY)
+        secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+        secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+        secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
+        secretStore.deleteSecret(CODEX_EMAIL_KEY)
+
+        val updatedProfiles = (config.auth?.profiles.orEmpty())
+            .filterValues { !(canonicalProvider(it.provider) == "openai" && it.mode.lowercase() == "oauth") }
+        val updatedAuth = if (updatedProfiles.isEmpty()) null else {
+            (config.auth ?: ai.openclaw.core.model.AuthConfig()).copy(profiles = updatedProfiles)
+        }
+        val updatedConfig = config.copy(auth = updatedAuth)
+
+        configManager.save(updatedConfig)
+        config = updatedConfig
+
+        initMutex.withLock {
+            registerProviders()
+            ensureGatewayServer(startGateway = true)
+            initialized = true
+        }
+    }
+
+    suspend fun getCodexOauthStatus(): CodexOauthStatus {
+        val expiresAtMs = secretStore.getSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)?.toLongOrNull()
+        return CodexOauthStatus(
+            tokenSet = secretStore.hasSecret(CODEX_OAUTH_TOKEN_KEY),
+            accountId = secretStore.getSecret(CODEX_ACCOUNT_ID_KEY),
+            email = secretStore.getSecret(CODEX_EMAIL_KEY),
+            expiresAtMs = expiresAtMs,
+        )
     }
 
     suspend fun clearApiKey(providerId: String) {
@@ -444,6 +596,7 @@ class AgentEngine(private val context: Context) {
                     OpenAiProvider(
                         apiKey = apiKey,
                         baseUrl = providerConfig?.baseUrl ?: "https://api.openai.com/v1",
+                        extraHeaders = resolveOpenAiHeaders(providerConfig),
                     ),
                 )
             }
@@ -478,6 +631,10 @@ class AgentEngine(private val context: Context) {
     ): String? {
         resolveSecretInput(providerConfig?.apiKey)?.let { return it }
 
+        if (aliases.any { canonicalProvider(it) == "openai" } && shouldUseCodexOauth(providerConfig)) {
+            resolveCodexOauthAccessToken()?.let { return it }
+        }
+
         for (provider in aliases) {
             for (secretKey in secretKeysForProvider(provider)) {
                 secretStore.getSecret(secretKey)
@@ -502,6 +659,80 @@ class AgentEngine(private val context: Context) {
         return null
     }
 
+    private suspend fun resolveCodexOauthAccessToken(): String? {
+        val currentToken = secretStore.getSecret(CODEX_OAUTH_TOKEN_KEY)
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        val expiresAtMs = secretStore.getSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)?.toLongOrNull()
+        val now = System.currentTimeMillis()
+        if (expiresAtMs == null || expiresAtMs > now + CODEX_EXPIRY_MARGIN_MS) {
+            return currentToken
+        }
+
+        val refreshToken = secretStore.getSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+            ?.takeIf { it.isNotBlank() }
+            ?: return currentToken
+
+        return runCatching {
+            val refreshed = codexOauthManager.refreshFromRefreshToken(refreshToken)
+            secretStore.storeSecret(CODEX_OAUTH_TOKEN_KEY, refreshed.accessToken, SecretCategory.LLM_API_KEY)
+            secretStore.storeSecret(
+                CODEX_OAUTH_REFRESH_TOKEN_KEY,
+                (refreshed.refreshToken ?: refreshToken),
+                SecretCategory.LLM_API_KEY,
+            )
+            if (refreshed.expiresAtMs != null && refreshed.expiresAtMs > 0L) {
+                secretStore.storeSecret(
+                    CODEX_OAUTH_EXPIRES_AT_MS_KEY,
+                    refreshed.expiresAtMs.toString(),
+                    SecretCategory.LLM_API_KEY,
+                )
+            }
+            val refreshedAccountId = refreshed.accountId?.trim().orEmpty()
+            if (refreshedAccountId.isBlank()) {
+                secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
+            } else {
+                secretStore.storeSecret(CODEX_ACCOUNT_ID_KEY, refreshedAccountId, SecretCategory.LLM_API_KEY)
+            }
+            val refreshedEmail = refreshed.email?.trim().orEmpty()
+            if (refreshedEmail.isBlank()) {
+                secretStore.deleteSecret(CODEX_EMAIL_KEY)
+            } else {
+                secretStore.storeSecret(CODEX_EMAIL_KEY, refreshedEmail, SecretCategory.LLM_API_KEY)
+            }
+            _codexOauthEvents.tryEmit("Codex OAuth token refreshed.")
+            refreshed.accessToken
+        }.getOrElse {
+            currentToken
+        }
+    }
+
+    private fun shouldUseCodexOauth(providerConfig: ModelProviderConfig?): Boolean {
+        if (providerConfig?.auth == ModelProviderAuthMode.OAUTH) {
+            return true
+        }
+        return config.auth?.profiles
+            .orEmpty()
+            .values
+            .any { canonicalProvider(it.provider) == "openai" && it.mode.equals("oauth", ignoreCase = true) }
+    }
+
+    private suspend fun resolveOpenAiHeaders(providerConfig: ModelProviderConfig?): Map<String, String> {
+        val headers = providerConfig?.headers
+            .orEmpty()
+            .filterValues { it.isNotBlank() }
+            .toMutableMap()
+
+        secretStore.getSecret(CODEX_ACCOUNT_ID_KEY)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { accountId ->
+                headers.putIfAbsent("ChatGPT-Account-ID", accountId)
+            }
+
+        return headers
+    }
+
     private suspend fun resolveProfileApiKey(profile: AuthProfileConfig): String? {
         val canonical = canonicalProvider(profile.provider)
         for (key in secretKeysForProvider(canonical) + "api_key_${profile.provider}") {
@@ -515,8 +746,9 @@ class AgentEngine(private val context: Context) {
     private suspend fun resolveSecretInput(input: SecretInput?): String? {
         if (input == null) return null
         if (!input.value.isNullOrBlank()) return input.value
-        if (!input.env.isNullOrBlank()) {
-            System.getenv(input.env)?.takeIf { it.isNotBlank() }?.let { return it }
+        val envName = input.env
+        if (!envName.isNullOrBlank()) {
+            System.getenv(envName)?.takeIf { it.isNotBlank() }?.let { return it }
         }
         return null
     }
@@ -671,6 +903,12 @@ class AgentEngine(private val context: Context) {
     companion object {
         private const val DEFAULT_GATEWAY_PORT = 18789
         private const val DEFAULT_GATEWAY_HOST = "127.0.0.1"
+        private const val CODEX_OAUTH_TOKEN_KEY = "codex_oauth_access_token"
+        private const val CODEX_OAUTH_REFRESH_TOKEN_KEY = "codex_oauth_refresh_token"
+        private const val CODEX_OAUTH_EXPIRES_AT_MS_KEY = "codex_oauth_expires_at_ms"
+        private const val CODEX_ACCOUNT_ID_KEY = "codex_account_id"
+        private const val CODEX_EMAIL_KEY = "codex_email"
+        private const val CODEX_EXPIRY_MARGIN_MS = 60_000L
 
         private val DEFAULT_MODEL_CANDIDATES = listOf(
             "anthropic/claude-sonnet-4-5-20250514",

@@ -32,6 +32,7 @@ private val settingsGroups = listOf(
         header = "Configuration",
         items = listOf(
             SettingsItem("API Keys", "Manage LLM provider API keys", Icons.Default.Key, Routes.API_KEYS),
+            SettingsItem("Codex OAuth", "Connect OpenAI/Codex via OAuth token", Icons.Default.LockOpen, Routes.CODEX_OAUTH),
             SettingsItem("Models", "Configure default and available models", Icons.Default.ModelTraining, Routes.MODELS),
             SettingsItem("Agents", "View and configure agents", Icons.Default.SmartToy, Routes.AGENTS_LIST),
         ),

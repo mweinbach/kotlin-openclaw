@@ -20,9 +20,6 @@ class OpenClawApp : Application() {
         super.onCreate()
         instance = this
 
-        // Start foreground runtime service.
-        runCatching { AgentForegroundService.start(this) }
-
         // Initialize engine asynchronously.
         appScope.launch {
             runCatching { engine.initialize() }

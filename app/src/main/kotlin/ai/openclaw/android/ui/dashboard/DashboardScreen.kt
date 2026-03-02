@@ -84,6 +84,19 @@ fun DashboardScreen(engine: AgentEngine) {
                     )
                 }
 
+                if (state.lastError != null) {
+                    SectionCard(
+                        title = "Last Error",
+                        subtitle = state.lastError ?: "",
+                    ) {
+                        Text(
+                            text = "Dashboard metrics may be incomplete until the next successful refresh.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
                 // Channels Card
                 SectionCard(
                     title = "Channels",

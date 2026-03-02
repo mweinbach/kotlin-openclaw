@@ -52,6 +52,7 @@ object Routes {
     // Settings
     const val SETTINGS = "settings"
     const val API_KEYS = "settings/apikeys"
+    const val CODEX_OAUTH = "settings/codex-oauth"
     const val MODELS = "settings/models"
     const val AGENTS_LIST = "settings/agents"
     const val AGENT_DETAIL = "settings/agents/{agentId}"

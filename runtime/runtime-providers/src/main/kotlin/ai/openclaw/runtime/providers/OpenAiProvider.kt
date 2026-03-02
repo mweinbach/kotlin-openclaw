@@ -21,6 +21,7 @@ class OpenAiProvider(
     private val baseUrl: String = "https://api.openai.com/v1",
     private val client: OkHttpClient = OkHttpClient(),
     private val orgId: String? = null,
+    private val extraHeaders: Map<String, String> = emptyMap(),
 ) : LlmProvider {
 
     override val id = "openai"
@@ -107,6 +108,11 @@ class OpenAiProvider(
 
         if (orgId != null) {
             requestBuilder.header("OpenAI-Organization", orgId)
+        }
+        for ((header, value) in extraHeaders) {
+            if (header.isNotBlank() && value.isNotBlank()) {
+                requestBuilder.header(header, value)
+            }
         }
 
         val response = client.newCall(requestBuilder.build()).execute()

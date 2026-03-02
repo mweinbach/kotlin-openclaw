@@ -549,7 +549,7 @@ class WebhookManager(
             }
         }
 
-        private val TEMPLATE_REGEX = Regex("""\{\{\s*([^}]+)\s*}}""")
+        private val TEMPLATE_REGEX = Regex("""\{\{\s*([^}]+)\s*\}\}""")
 
         private val BLOCKED_PATH_KEYS = setOf("__proto__", "prototype", "constructor")
 

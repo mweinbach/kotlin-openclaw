@@ -61,6 +61,6 @@ class ConfigLoader(
     }
 
     companion object {
-        private val ENV_VAR_PATTERN = Regex("""\$\{([A-Za-z_][A-Za-z0-9_]*)}""")
+        private val ENV_VAR_PATTERN = Regex("""\$\{([A-Za-z_][A-Za-z0-9_]*)\}""")
     }
 }

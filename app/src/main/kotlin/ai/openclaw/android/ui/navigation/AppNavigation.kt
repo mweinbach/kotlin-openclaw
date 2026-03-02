@@ -24,6 +24,7 @@ import ai.openclaw.android.ui.settings.about.AboutScreen
 import ai.openclaw.android.ui.settings.agents.AgentDetailScreen
 import ai.openclaw.android.ui.settings.agents.AgentsScreen
 import ai.openclaw.android.ui.settings.apikeys.ApiKeysScreen
+import ai.openclaw.android.ui.settings.codexoauth.CodexOauthScreen
 import ai.openclaw.android.ui.settings.gateway.GatewaySettingsScreen
 import ai.openclaw.android.ui.settings.logs.LogsScreen
 import ai.openclaw.android.ui.settings.models.ModelsScreen
@@ -199,6 +200,12 @@ fun AppNavigation(engine: AgentEngine) {
             }
             composable(Routes.API_KEYS) {
                 ApiKeysScreen(
+                    engine = engine,
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.CODEX_OAUTH) {
+                CodexOauthScreen(
                     engine = engine,
                     onBack = { navController.popBackStack() },
                 )

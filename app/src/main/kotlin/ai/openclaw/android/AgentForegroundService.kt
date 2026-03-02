@@ -8,6 +8,7 @@ import android.content.Context
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Log
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 
@@ -121,12 +122,12 @@ class AgentForegroundService : Service() {
             .setContentIntent(openIntent)
             .addAction(
                 Notification.Action.Builder(
-                    null, "Pause", pauseIntent,
+                    android.R.drawable.ic_media_pause, "Pause", pauseIntent,
                 ).build(),
             )
             .addAction(
                 Notification.Action.Builder(
-                    null, "Open", openIntent,
+                    android.R.drawable.ic_menu_view, "Open", openIntent,
                 ).build(),
             )
             .build()
@@ -142,12 +143,18 @@ class AgentForegroundService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val ACTION_START = "ai.openclaw.android.START"
         private const val ACTION_PAUSE = "ai.openclaw.android.PAUSE"
+        private const val TAG = "AgentFgService"
 
         fun start(context: Context) {
-            val intent = Intent(context, AgentForegroundService::class.java).apply {
+            val appContext = context.applicationContext
+            val intent = Intent(appContext, AgentForegroundService::class.java).apply {
                 action = ACTION_START
             }
-            ContextCompat.startForegroundService(context, intent)
+            runCatching {
+                ContextCompat.startForegroundService(appContext, intent)
+            }.onFailure {
+                Log.w(TAG, "Unable to start foreground service", it)
+            }
         }
     }
 }

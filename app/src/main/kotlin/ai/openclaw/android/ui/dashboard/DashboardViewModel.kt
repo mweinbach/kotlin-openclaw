@@ -24,6 +24,7 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
         val memoryEntries: Int = 0,
         val cronJobCount: Int = 0,
         val pluginCount: Int = 0,
+        val lastError: String? = null,
     )
 
     private val _state = MutableStateFlow(DashboardState())
@@ -35,30 +36,37 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
 
     fun refresh() {
         viewModelScope.launch(Dispatchers.IO) {
-            val snapshot = engine.channelManager.getSnapshot()
-            val running = snapshot.values.count {
-                it.status == ChannelManager.ChannelStatus.RUNNING.name.lowercase()
-            }
-            val errors = snapshot.values.count {
-                it.status == ChannelManager.ChannelStatus.ERROR.name.lowercase()
-            }
-            val sessions = engine.sessionPersistence.listSessionKeys()
-            val memorySize = engine.memoryManager.size()
-            val cronJobs = engine.cronScheduler.list()
-            val plugins = engine.pluginRegistry.allRecords()
+            runCatching {
+                val snapshot = engine.channelManager.getSnapshot()
+                val running = snapshot.values.count {
+                    it.status == ChannelManager.ChannelStatus.RUNNING.name.lowercase()
+                }
+                val errors = snapshot.values.count {
+                    it.status == ChannelManager.ChannelStatus.ERROR.name.lowercase()
+                }
+                val sessions = engine.sessionPersistence.listSessionKeys()
+                val memorySize = engine.memoryManager.size()
+                val cronJobs = engine.cronScheduler.list()
+                val plugins = engine.pluginRegistry.allRecords()
 
-            _state.value = DashboardState(
-                gatewayRunning = engine.gatewayServer.isRunning,
-                gatewayPort = engine.config.gateway?.port ?: 18789,
-                gatewayHost = engine.config.gateway?.customBindHost ?: "127.0.0.1",
-                channelCount = snapshot.size,
-                connectedChannels = running,
-                errorChannels = errors,
-                sessionCount = sessions.size,
-                memoryEntries = memorySize,
-                cronJobCount = cronJobs.size,
-                pluginCount = plugins.size,
-            )
+                DashboardState(
+                    gatewayRunning = engine.gatewayServer.isRunning,
+                    gatewayPort = engine.config.gateway?.port ?: 18789,
+                    gatewayHost = engine.config.gateway?.customBindHost ?: "127.0.0.1",
+                    channelCount = snapshot.size,
+                    connectedChannels = running,
+                    errorChannels = errors,
+                    sessionCount = sessions.size,
+                    memoryEntries = memorySize,
+                    cronJobCount = cronJobs.size,
+                    pluginCount = plugins.size,
+                    lastError = null,
+                )
+            }.onSuccess { freshState ->
+                _state.value = freshState
+            }.onFailure { error ->
+                _state.value = _state.value.copy(lastError = error.message ?: "Failed to refresh dashboard")
+            }
         }
     }
 
