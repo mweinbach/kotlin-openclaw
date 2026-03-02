@@ -107,27 +107,29 @@ class AnthropicProvider(
             .build()
 
         val response = client.newCall(httpRequest).execute()
-
-        if (!response.isSuccessful) {
-            val errorBody = response.body?.string() ?: "Unknown error"
-            emit(LlmStreamEvent.Error(
-                message = "Anthropic API error ${response.code}: $errorBody",
-                code = response.code.toString(),
-                retryable = response.code in listOf(429, 500, 502, 503),
-            ))
-            return@flow
-        }
-
-        val reader = response.body?.charStream()?.buffered()
-            ?: run {
-                emit(LlmStreamEvent.Error(message = "Empty response body"))
+        try {
+            if (!response.isSuccessful) {
+                val errorBody = response.body?.string() ?: "Unknown error"
+                emit(LlmStreamEvent.Error(
+                    message = "Anthropic API error ${response.code}: $errorBody",
+                    code = response.code.toString(),
+                    retryable = response.code in listOf(429, 500, 502, 503),
+                ))
                 return@flow
             }
 
-        try {
-            parseSseStream(reader)
+            val reader = response.body?.charStream()?.buffered()
+                ?: run {
+                    emit(LlmStreamEvent.Error(message = "Empty response body"))
+                    return@flow
+                }
+
+            try {
+                parseSseStream(reader)
+            } finally {
+                reader.close()
+            }
         } finally {
-            reader.close()
             response.close()
         }
     }.flowOn(Dispatchers.IO)

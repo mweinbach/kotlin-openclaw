@@ -60,10 +60,10 @@ data class PluginRecord(
  * Registry for managing plugins.
  */
 class PluginRegistry {
-    private val plugins = mutableMapOf<String, OpenClawPlugin>()
-    private val records = mutableListOf<PluginRecord>()
-    private val hookRegistrations = mutableListOf<PluginHookRegistration<*>>()
-    private val diagnostics = mutableListOf<PluginDiagnostic>()
+    private val plugins = java.util.concurrent.ConcurrentHashMap<String, OpenClawPlugin>()
+    private val records = java.util.concurrent.CopyOnWriteArrayList<PluginRecord>()
+    private val hookRegistrations = java.util.concurrent.CopyOnWriteArrayList<PluginHookRegistration<*>>()
+    private val diagnostics = java.util.concurrent.CopyOnWriteArrayList<PluginDiagnostic>()
 
     fun register(plugin: OpenClawPlugin) {
         plugins[plugin.id] = plugin

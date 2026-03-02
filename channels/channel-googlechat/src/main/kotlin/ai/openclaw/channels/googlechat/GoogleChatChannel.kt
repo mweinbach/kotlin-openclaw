@@ -87,11 +87,13 @@ class GoogleChatChannel(
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string() ?: return emptyList()
-        if (!response.isSuccessful) return emptyList()
+        val parsedResponse = client.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string() ?: return emptyList()
+            if (!response.isSuccessful) return emptyList()
+            json.parseToJsonElement(responseBody).jsonObject
+        }
 
-        val obj = json.parseToJsonElement(responseBody).jsonObject
+        val obj = parsedResponse
         val receivedMessages = obj["receivedMessages"]?.jsonArray ?: return emptyList()
 
         val result = mutableListOf<PubSubMessage>()
@@ -137,7 +139,7 @@ class GoogleChatChannel(
             .post(body.toString().toRequestBody(jsonMediaType))
             .build()
         try {
-            client.newCall(request).execute().close()
+            client.newCall(request).execute().use { }
         } catch (_: Exception) {
             // Best effort
         }
@@ -209,11 +211,6 @@ class GoogleChatChannel(
         val spaceName = message.targetId
         val text = message.text
 
-        val body = buildJsonObject {
-            putJsonObject("text") { }
-            put("text", text)
-        }
-
         val urlBuilder = StringBuilder("$chatApiBase/$spaceName/messages")
         val threadName = message.threadId
         if (threadName != null) {
@@ -235,8 +232,9 @@ class GoogleChatChannel(
             .post(requestBody.toString().toRequestBody(jsonMediaType))
             .build()
         try {
-            val response = client.newCall(request).execute()
-            response.isSuccessful
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }

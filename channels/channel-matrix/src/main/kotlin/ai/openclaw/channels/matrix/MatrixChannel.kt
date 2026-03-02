@@ -85,11 +85,12 @@ class MatrixChannel(
             .url(url)
             .header("Authorization", "Bearer $accessToken")
             .build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return null
-        if (!response.isSuccessful) return null
-        val obj = json.parseToJsonElement(body).jsonObject
-        return obj["next_batch"]?.jsonPrimitive?.contentOrNull
+        return client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: return@use null
+            if (!response.isSuccessful) return@use null
+            val obj = json.parseToJsonElement(body).jsonObject
+            obj["next_batch"]?.jsonPrimitive?.contentOrNull
+        }
     }
 
     private fun sync(since: String?, timeout: Int): JsonObject {
@@ -100,10 +101,11 @@ class MatrixChannel(
             .url(urlBuilder.toString())
             .header("Authorization", "Bearer $accessToken")
             .build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return JsonObject(emptyMap())
-        if (!response.isSuccessful) return JsonObject(emptyMap())
-        return json.parseToJsonElement(body).jsonObject
+        return client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: return@use JsonObject(emptyMap())
+            if (!response.isSuccessful) return@use JsonObject(emptyMap())
+            json.parseToJsonElement(body).jsonObject
+        }
     }
 
     // --- Inbound processing ---
@@ -191,8 +193,9 @@ class MatrixChannel(
             .put(content.toString().toRequestBody(jsonMediaType))
             .build()
         try {
-            val response = client.newCall(request).execute()
-            response.isSuccessful
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }
@@ -213,8 +216,9 @@ class MatrixChannel(
             .put(body.toString().toRequestBody(jsonMediaType))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            response.isSuccessful
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }

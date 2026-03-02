@@ -141,8 +141,9 @@ data class DeliveryContext(
 @Serializable
 enum class TtsAutoMode {
     @SerialName("off") OFF,
-    @SerialName("dm") DM,
-    @SerialName("all") ALL,
+    @SerialName("always") ALWAYS,
+    @SerialName("inbound") INBOUND,
+    @SerialName("tagged") TAGGED,
 }
 
 @Serializable

@@ -97,8 +97,9 @@ class RpcDispatcher {
 
         // Check scope requirements
         val requiredScope = scopeRequirements[request.method]
-        if (requiredScope != null && context.authContext != null) {
-            if (!context.authContext.hasScope(requiredScope)) {
+        if (requiredScope != null) {
+            val auth = context.authContext
+            if (auth == null || !auth.hasScope(requiredScope)) {
                 return JsonRpcResponse(
                     id = request.id,
                     error = JsonRpcError(

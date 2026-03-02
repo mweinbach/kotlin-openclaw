@@ -232,7 +232,7 @@ class EmbeddedAcpRuntime(
         var runner: AgentRunner,
     )
 
-    private val sessions = mutableMapOf<String, SessionState>()
+    private val sessions = java.util.concurrent.ConcurrentHashMap<String, SessionState>()
 
     override suspend fun ensureSession(input: AcpRuntimeEnsureInput): AcpRuntimeHandle {
         val runner = runnerFactory(input.agent)

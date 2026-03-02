@@ -4,6 +4,8 @@ import ai.openclaw.core.agent.LlmMessage
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /**
  * Session persistence manager — saves/loads conversation history as JSONL files.
@@ -130,7 +132,7 @@ class SessionPersistence(
                 writer.newLine()
             }
         }
-        tmpFile.renameTo(file)
+        Files.move(tmpFile.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
     }
 
     private fun sessionFile(sessionKey: String): File {

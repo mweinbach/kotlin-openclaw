@@ -401,7 +401,7 @@ class DiscordChannel(
             .post("".toRequestBody(null))
             .build()
         try {
-            client.newCall(request).execute().close()
+            client.newCall(request).execute().use { }
         } catch (_: Exception) {
             // Best-effort
         }
@@ -415,10 +415,9 @@ class DiscordChannel(
             .put("".toRequestBody(null))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val ok = response.isSuccessful
-            response.close()
-            ok
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }
@@ -450,13 +449,13 @@ class DiscordChannel(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val responseBody = response.body?.string()
-            response.close()
-            if (response.isSuccessful && responseBody != null) {
-                json.parseToJsonElement(responseBody).jsonObject["id"]
-                    ?.jsonPrimitive?.contentOrNull
-            } else null
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string()
+                if (response.isSuccessful && responseBody != null) {
+                    json.parseToJsonElement(responseBody).jsonObject["id"]
+                        ?.jsonPrimitive?.contentOrNull
+                } else null
+            }
         } catch (_: Exception) {
             null
         }
@@ -470,11 +469,10 @@ class DiscordChannel(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val responseBody = response.body?.string()
-            val ok = response.isSuccessful
-            response.close()
-            ok
+            client.newCall(request).execute().use { response ->
+                response.body?.string() // consume body
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }

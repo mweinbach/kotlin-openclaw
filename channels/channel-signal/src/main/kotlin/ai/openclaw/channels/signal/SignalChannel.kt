@@ -68,13 +68,14 @@ class SignalChannel(
     private fun receive(): List<JsonObject> {
         val url = "${apiUrl.trimEnd('/')}/v1/receive/$number"
         val request = Request.Builder().url(url).build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return emptyList()
-        if (!response.isSuccessful) return emptyList()
-        return try {
-            json.parseToJsonElement(body).jsonArray.map { it.jsonObject }
-        } catch (_: Exception) {
-            emptyList()
+        return client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: return@use emptyList()
+            if (!response.isSuccessful) return@use emptyList()
+            try {
+                json.parseToJsonElement(body).jsonArray.map { it.jsonObject }
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
     }
 
@@ -146,8 +147,9 @@ class SignalChannel(
             .header("Content-Type", "application/json")
             .build()
         try {
-            val response = client.newCall(request).execute()
-            response.isSuccessful
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
         } catch (_: Exception) {
             false
         }

@@ -191,11 +191,20 @@ data class DiagnosticsOtelConfig(
     val protocol: String? = null,
     val headers: Map<String, String>? = null,
     val serviceName: String? = null,
-    val services: Boolean? = null,
+    val traces: Boolean? = null,
     val metrics: Boolean? = null,
     val logs: Boolean? = null,
     val sampleRate: Double? = null,
     val flushIntervalMs: Long? = null,
+)
+
+@Serializable
+data class DiagnosticsCacheTraceConfig(
+    val enabled: Boolean? = null,
+    val filePath: String? = null,
+    val includeMessages: Boolean? = null,
+    val includePrompt: Boolean? = null,
+    val includeSystem: Boolean? = null,
 )
 
 @Serializable
@@ -204,6 +213,7 @@ data class DiagnosticsConfig(
     val flags: List<String>? = null,
     val stuckSessionWarnMs: Long? = null,
     val otel: DiagnosticsOtelConfig? = null,
+    val cacheTrace: DiagnosticsCacheTraceConfig? = null,
 )
 
 @Serializable

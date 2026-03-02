@@ -68,11 +68,12 @@ class TelegramChannel(
         val url = "$baseUrl/bot$botToken/getUpdates?offset=$offset&timeout=$timeout" +
             "&allowed_updates=${allowedUpdates()}"
         val request = Request.Builder().url(url).build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return emptyList()
-        if (!response.isSuccessful) return emptyList()
-        val result = json.parseToJsonElement(body).jsonObject
-        return result["result"]?.jsonArray?.map { it.jsonObject } ?: emptyList()
+        return client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: return@use emptyList()
+            if (!response.isSuccessful) return@use emptyList()
+            val result = json.parseToJsonElement(body).jsonObject
+            result["result"]?.jsonArray?.map { it.jsonObject } ?: emptyList()
+        }
     }
 
     private fun allowedUpdates(): String =
@@ -263,9 +264,10 @@ class TelegramChannel(
             .post(params.toString().toRequestBody("application/json".toMediaType()))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string()
-            response.isSuccessful && body?.contains("\"ok\":true") == true
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string()
+                response.isSuccessful && body?.contains("\"ok\":true") == true
+            }
         } catch (_: Exception) {
             false
         }

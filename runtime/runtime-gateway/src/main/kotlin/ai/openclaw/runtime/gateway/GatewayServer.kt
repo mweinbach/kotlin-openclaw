@@ -69,6 +69,9 @@ class GatewayServer(
         val requestId: String,
     )
 
+    // Managed coroutine scope for background work (chat streaming, etc.)
+    private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     init {
         registerCoreMethods()
     }
@@ -91,6 +94,7 @@ class GatewayServer(
     }
 
     fun stop() {
+        serverScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
         connections.clear()
         server?.stop(1000, 5000)
         server = null
@@ -200,7 +204,12 @@ class GatewayServer(
                 )
             } catch (e: Exception) {
                 call.respondText(
-                    """{"error":{"message":"${e.message?.replace("\"", "'")}","type":"server_error"}}""",
+                    json.encodeToString(JsonObject.serializer(), buildJsonObject {
+                        putJsonObject("error") {
+                            put("message", e.message ?: "Internal error")
+                            put("type", "server_error")
+                        }
+                    }),
                     ContentType.Application.Json,
                     HttpStatusCode.InternalServerError,
                 )
@@ -382,8 +391,7 @@ class GatewayServer(
             val deliver = obj["deliver"]?.jsonPrimitive?.booleanOrNull ?: true
 
             // Stream events to the requesting connection
-            val scope = CoroutineScope(Dispatchers.IO)
-            scope.launch {
+            serverScope.launch {
                 try {
                     chatHandler(ChatSendParams(
                         sessionKey = sessionKey,

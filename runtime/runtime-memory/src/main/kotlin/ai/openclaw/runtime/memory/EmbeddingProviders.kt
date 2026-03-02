@@ -37,24 +37,25 @@ class OpenAiEmbeddingProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string()
-            ?: throw RuntimeException("Empty embedding response")
+        client.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string()
+                ?: throw RuntimeException("Empty embedding response")
 
-        if (!response.isSuccessful) {
-            throw RuntimeException("Embedding API error ${response.code}: $responseBody")
-        }
+            if (!response.isSuccessful) {
+                throw RuntimeException("Embedding API error ${response.code}: $responseBody")
+            }
 
-        val json = Json { ignoreUnknownKeys = true }
-        val result = json.parseToJsonElement(responseBody).jsonObject
-        val data = result["data"]?.jsonArray
-            ?: throw RuntimeException("No data in embedding response")
+            val json = Json { ignoreUnknownKeys = true }
+            val result = json.parseToJsonElement(responseBody).jsonObject
+            val data = result["data"]?.jsonArray
+                ?: throw RuntimeException("No data in embedding response")
 
-        data.map { item ->
-            val embedding = item.jsonObject["embedding"]?.jsonArray
-                ?: throw RuntimeException("No embedding in data item")
-            FloatArray(embedding.size) { i ->
-                embedding[i].jsonPrimitive.float
+            data.map { item ->
+                val embedding = item.jsonObject["embedding"]?.jsonArray
+                    ?: throw RuntimeException("No embedding in data item")
+                FloatArray(embedding.size) { i ->
+                    embedding[i].jsonPrimitive.float
+                }
             }
         }
     }
@@ -92,20 +93,21 @@ class GeminiEmbeddingProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string()
-            ?: throw RuntimeException("Empty embedding response")
+        return client.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string()
+                ?: throw RuntimeException("Empty embedding response")
 
-        if (!response.isSuccessful) {
-            throw RuntimeException("Gemini embedding error ${response.code}: $responseBody")
+            if (!response.isSuccessful) {
+                throw RuntimeException("Gemini embedding error ${response.code}: $responseBody")
+            }
+
+            val json = Json { ignoreUnknownKeys = true }
+            val result = json.parseToJsonElement(responseBody).jsonObject
+            val embedding = result["embedding"]?.jsonObject
+                ?.get("values")?.jsonArray
+                ?: throw RuntimeException("No embedding values in response")
+
+            FloatArray(embedding.size) { i -> embedding[i].jsonPrimitive.float }
         }
-
-        val json = Json { ignoreUnknownKeys = true }
-        val result = json.parseToJsonElement(responseBody).jsonObject
-        val embedding = result["embedding"]?.jsonObject
-            ?.get("values")?.jsonArray
-            ?: throw RuntimeException("No embedding values in response")
-
-        return FloatArray(embedding.size) { i -> embedding[i].jsonPrimitive.float }
     }
 }

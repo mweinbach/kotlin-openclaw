@@ -36,6 +36,7 @@ class SlackChannel(
     private var socketJob: Job? = null
     private var webSocket: WebSocket? = null
     private var botUserId: String = ""
+    private val userNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // --- Lifecycle ---
 
@@ -84,12 +85,13 @@ class SlackChannel(
             .header("Content-Type", "application/x-www-form-urlencoded")
             .post("".toRequestBody("application/x-www-form-urlencoded".toMediaType()))
             .build()
-        val response = client.newCall(request).execute()
-        val body = response.body?.string() ?: return null
-        if (!response.isSuccessful) return null
-        val result = json.parseToJsonElement(body).jsonObject
-        if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) return null
-        return result["url"]?.jsonPrimitive?.contentOrNull
+        return client.newCall(request).execute().use { response ->
+            val body = response.body?.string() ?: return@use null
+            if (!response.isSuccessful) return@use null
+            val result = json.parseToJsonElement(body).jsonObject
+            if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) return@use null
+            result["url"]?.jsonPrimitive?.contentOrNull
+        }
     }
 
     /**
@@ -366,11 +368,12 @@ class SlackChannel(
             .post("{}".toRequestBody("application/json".toMediaType()))
             .build()
         try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: return
-            val result = json.parseToJsonElement(body).jsonObject
-            if (result["ok"]?.jsonPrimitive?.booleanOrNull == true) {
-                botUserId = result["user_id"]?.jsonPrimitive?.contentOrNull ?: ""
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return
+                val result = json.parseToJsonElement(body).jsonObject
+                if (result["ok"]?.jsonPrimitive?.booleanOrNull == true) {
+                    botUserId = result["user_id"]?.jsonPrimitive?.contentOrNull ?: ""
+                }
             }
         } catch (_: Exception) {
             // Non-fatal; we will fall back to not filtering our own messages by user id
@@ -378,22 +381,26 @@ class SlackChannel(
     }
 
     private fun resolveUserName(userId: String): String? {
+        userNameCache[userId]?.let { return it }
+
         val request = Request.Builder()
             .url("https://slack.com/api/users.info?user=$userId")
             .header("Authorization", "Bearer $botToken")
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string() ?: return null
-            val result = json.parseToJsonElement(body).jsonObject
-            if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) return null
-            val user = result["user"]?.jsonObject ?: return null
-            val profile = user["profile"]?.jsonObject
-            val realName = profile?.get("real_name")?.jsonPrimitive?.contentOrNull
-            val displayName = profile?.get("display_name")?.jsonPrimitive?.contentOrNull
-            displayName?.takeIf { it.isNotBlank() }
-                ?: realName?.takeIf { it.isNotBlank() }
-                ?: user["name"]?.jsonPrimitive?.contentOrNull
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: return@use null
+                val result = json.parseToJsonElement(body).jsonObject
+                if (result["ok"]?.jsonPrimitive?.booleanOrNull != true) return@use null
+                val user = result["user"]?.jsonObject ?: return@use null
+                val profile = user["profile"]?.jsonObject
+                val realName = profile?.get("real_name")?.jsonPrimitive?.contentOrNull
+                val displayName = profile?.get("display_name")?.jsonPrimitive?.contentOrNull
+                val name = displayName?.takeIf { it.isNotBlank() }
+                    ?: realName?.takeIf { it.isNotBlank() }
+                    ?: user["name"]?.jsonPrimitive?.contentOrNull
+                name?.also { userNameCache[userId] = it }
+            }
         } catch (_: Exception) {
             null
         }
@@ -407,11 +414,12 @@ class SlackChannel(
             .post(params.toString().toRequestBody("application/json".toMediaType()))
             .build()
         return try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string()
-            response.isSuccessful && body?.let {
-                json.parseToJsonElement(it).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull
-            } == true
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string()
+                response.isSuccessful && body?.let {
+                    json.parseToJsonElement(it).jsonObject["ok"]?.jsonPrimitive?.booleanOrNull
+                } == true
+            }
         } catch (_: Exception) {
             false
         }

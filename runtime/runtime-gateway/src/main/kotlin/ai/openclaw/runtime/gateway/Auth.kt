@@ -166,7 +166,7 @@ class AuthRateLimiter(
 ) {
     private data class IpState(
         val failures: MutableList<Long> = mutableListOf(),
-        var lockedUntil: Long = 0,
+        @Volatile var lockedUntil: Long = 0,
     )
 
     private val ipStates = ConcurrentHashMap<String, IpState>()
@@ -177,22 +177,24 @@ class AuthRateLimiter(
 
         if (state.lockedUntil > now) return true
 
-        // Clean old failures outside window
-        state.failures.removeIf { now - it > windowMs }
+        synchronized(state) {
+            state.failures.removeIf { now - it > windowMs }
+        }
         return false
     }
 
     fun recordFailure(ip: String) {
         val now = System.currentTimeMillis()
         val state = ipStates.getOrPut(ip) { IpState() }
-        state.failures.add(now)
 
-        // Clean old failures
-        state.failures.removeIf { now - it > windowMs }
+        synchronized(state) {
+            state.failures.add(now)
+            state.failures.removeIf { now - it > windowMs }
 
-        if (state.failures.size >= maxAttempts) {
-            state.lockedUntil = now + lockoutMs
-            state.failures.clear()
+            if (state.failures.size >= maxAttempts) {
+                state.lockedUntil = now + lockoutMs
+                state.failures.clear()
+            }
         }
     }
 }

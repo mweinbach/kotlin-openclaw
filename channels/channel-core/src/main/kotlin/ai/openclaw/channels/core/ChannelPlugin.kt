@@ -45,8 +45,8 @@ interface ChannelPlugin {
  * Base adapter providing common functionality for channel implementations.
  */
 abstract class BaseChannelAdapter : ChannelPlugin {
-    protected var messageHandler: InboundMessageHandler? = null
-    protected var connected = false
+    @Volatile protected var messageHandler: InboundMessageHandler? = null
+    @Volatile protected var connected = false
 
     override suspend fun start(handler: InboundMessageHandler) {
         messageHandler = handler

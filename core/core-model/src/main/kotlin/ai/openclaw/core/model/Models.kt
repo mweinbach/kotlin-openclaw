@@ -1,7 +1,13 @@
 package ai.openclaw.core.model
 
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.*
 
 // --- Model Provider Types (ported from src/config/types.models.ts) ---
 
@@ -62,11 +68,66 @@ data class ModelDefinitionConfig(
     val compat: ModelCompatConfig? = null,
 )
 
-@Serializable
+/**
+ * Secret input that can be either a plain string (env var reference like "$MY_KEY")
+ * or a structured object with env/value/source fields.
+ * In TypeScript: `type SecretInput = string | SecretRef`
+ */
+@Serializable(with = SecretInputSerializer::class)
 data class SecretInput(
     val env: String? = null,
     val value: String? = null,
-)
+    val source: String? = null,
+    val provider: String? = null,
+    val id: String? = null,
+) {
+    companion object {
+        fun ofString(s: String): SecretInput = SecretInput(value = s)
+        fun ofEnv(envVar: String): SecretInput = SecretInput(env = envVar)
+    }
+}
+
+object SecretInputSerializer : KSerializer<SecretInput> {
+    override val descriptor: SerialDescriptor = buildClassSerialDescriptor("SecretInput")
+
+    override fun serialize(encoder: Encoder, value: SecretInput) {
+        val jsonEncoder = encoder as JsonEncoder
+        // If it's a simple value with no structured fields, serialize as string
+        if (value.env == null && value.source == null && value.provider == null && value.id == null && value.value != null) {
+            jsonEncoder.encodeJsonElement(JsonPrimitive(value.value))
+        } else {
+            jsonEncoder.encodeJsonElement(buildJsonObject {
+                value.env?.let { put("env", it) }
+                value.value?.let { put("value", it) }
+                value.source?.let { put("source", it) }
+                value.provider?.let { put("provider", it) }
+                value.id?.let { put("id", it) }
+            })
+        }
+    }
+
+    override fun deserialize(decoder: Decoder): SecretInput {
+        val jsonDecoder = decoder as JsonDecoder
+        return when (val element = jsonDecoder.decodeJsonElement()) {
+            is JsonPrimitive -> {
+                val s = element.contentOrNull ?: ""
+                if (s.startsWith("\$")) {
+                    SecretInput(env = s.removePrefix("\$"))
+                } else {
+                    SecretInput(value = s)
+                }
+            }
+            is JsonObject -> SecretInput(
+                env = element["env"]?.jsonPrimitive?.contentOrNull,
+                value = element["value"]?.jsonPrimitive?.contentOrNull,
+                source = element["source"]?.jsonPrimitive?.contentOrNull,
+                provider = element["provider"]?.jsonPrimitive?.contentOrNull,
+                id = element["id"]?.jsonPrimitive?.contentOrNull,
+            )
+            else -> SecretInput()
+        }
+    }
+}
 
 @Serializable
 data class ModelProviderConfig(
