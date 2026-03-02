@@ -52,8 +52,9 @@ class AgentRunner(
     ): Flow<AcpRuntimeEvent> = flow {
         var currentMessages = messages.toMutableList()
         var round = 0
+        var aborted = false
 
-        while (round < maxToolRounds) {
+        while (round < maxToolRounds && !aborted) {
             round++
 
             val request = LlmRequest(
@@ -128,16 +129,18 @@ class AgentRunner(
                             code = event.code,
                             retryable = event.retryable,
                         ))
-                        return@flow
+                        aborted = true
                     }
                 }
             }
 
-            // If no tool use, we're done
-            if (!hasToolUse) return@flow
+            // If no tool use or error, we're done
+            if (!hasToolUse || aborted) return@flow
         }
 
         // Exceeded max tool rounds
-        emit(AcpRuntimeEvent.Error(message = "Exceeded maximum tool call rounds ($maxToolRounds)"))
+        if (!aborted) {
+            emit(AcpRuntimeEvent.Error(message = "Exceeded maximum tool call rounds ($maxToolRounds)"))
+        }
     }
 }

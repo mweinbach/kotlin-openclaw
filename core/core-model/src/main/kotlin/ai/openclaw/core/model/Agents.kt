@@ -52,6 +52,22 @@ data class SubagentsConfig(
 )
 
 @Serializable
+data class AgentContextPruningConfig(
+    val enabled: Boolean? = null,
+    val maxTokens: Int? = null,
+    val strategy: String? = null,
+)
+
+@Serializable
+data class AgentCompactionConfig(
+    val enabled: Boolean? = null,
+    val mode: String? = null,
+    val maxTurns: Int? = null,
+    val maxTokens: Int? = null,
+    val summaryModel: String? = null,
+)
+
+@Serializable
 data class AgentDefaultsConfig(
     val model: AgentModelConfig? = null,
     val skills: List<String>? = null,
@@ -63,6 +79,19 @@ data class AgentDefaultsConfig(
     val params: Map<String, String>? = null,
     val tools: AgentToolsConfig? = null,
     val heartbeat: HeartbeatConfig? = null,
+    val workspace: String? = null,
+    val contextTokens: Int? = null,
+    val contextPruning: AgentContextPruningConfig? = null,
+    val compaction: AgentCompactionConfig? = null,
+    val thinkingDefault: Boolean? = null,
+    val verboseDefault: Boolean? = null,
+    val maxConcurrent: Int? = null,
+    val subagents: SubagentsConfig? = null,
+    val blockStreamingDefault: Boolean? = null,
+    val blockStreamingChunk: BlockStreamingChunkConfig? = null,
+    val blockStreamingCoalesce: BlockStreamingCoalesceConfig? = null,
+    val mediaMaxMb: Int? = null,
+    val imageMaxDimensionPx: Int? = null,
 )
 
 @Serializable
@@ -121,4 +150,6 @@ data class PeerMatch(
     val id: String,
 )
 
-const val DEFAULT_AGENT_ID = "default"
+const val DEFAULT_AGENT_ID = "main"
+const val DEFAULT_MAIN_KEY = "main"
+const val DEFAULT_ACCOUNT_ID = "default"

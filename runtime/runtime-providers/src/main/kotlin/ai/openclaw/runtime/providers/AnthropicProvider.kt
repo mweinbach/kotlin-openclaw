@@ -5,7 +5,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -36,17 +35,36 @@ class AnthropicProvider(
                 if (msg.role == LlmMessage.Role.SYSTEM) continue
                 addJsonObject {
                     put("role", when (msg.role) {
-                        LlmMessage.Role.USER -> "user"
                         LlmMessage.Role.ASSISTANT -> "assistant"
-                        LlmMessage.Role.TOOL -> "user" // Tool results sent as user
                         else -> "user"
                     })
+                    // Build content blocks
+                    val toolCalls = msg.toolCalls
                     if (msg.toolCallId != null) {
+                        // Tool result message
                         putJsonArray("content") {
                             addJsonObject {
                                 put("type", "tool_result")
                                 put("tool_use_id", msg.toolCallId)
                                 put("content", msg.content)
+                            }
+                        }
+                    } else if (!toolCalls.isNullOrEmpty()) {
+                        // Assistant message with tool calls
+                        putJsonArray("content") {
+                            if (msg.content.isNotEmpty()) {
+                                addJsonObject {
+                                    put("type", "text")
+                                    put("text", msg.content)
+                                }
+                            }
+                            for (tc in toolCalls) {
+                                addJsonObject {
+                                    put("type", "tool_use")
+                                    put("id", tc.id)
+                                    put("name", tc.name)
+                                    put("input", Json.parseToJsonElement(tc.arguments))
+                                }
                             }
                         }
                     } else {
@@ -121,20 +139,25 @@ class AnthropicProvider(
         var currentToolId = ""
         var currentToolName = ""
         val toolInputBuffer = StringBuilder()
+        var stopReason: String? = null
 
-        reader.forEachLine { line ->
-            if (!line.startsWith("data: ")) return@forEachLine
+        var line = reader.readLine()
+        while (line != null) {
+            if (!line.startsWith("data: ")) {
+                line = reader.readLine()
+                continue
+            }
             val data = line.removePrefix("data: ").trim()
-            if (data == "[DONE]") return@forEachLine
+            if (data == "[DONE]") break
 
             try {
                 val event = json.parseToJsonElement(data).jsonObject
-                val type = event["type"]?.jsonPrimitive?.contentOrNull ?: return@forEachLine
+                val type = event["type"]?.jsonPrimitive?.contentOrNull
 
                 when (type) {
                     "content_block_start" -> {
-                        val contentBlock = event["content_block"]?.jsonObject ?: return@forEachLine
-                        val blockType = contentBlock["type"]?.jsonPrimitive?.contentOrNull
+                        val contentBlock = event["content_block"]?.jsonObject
+                        val blockType = contentBlock?.get("type")?.jsonPrimitive?.contentOrNull
                         if (blockType == "tool_use") {
                             currentToolId = contentBlock["id"]?.jsonPrimitive?.contentOrNull ?: ""
                             currentToolName = contentBlock["name"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -142,12 +165,14 @@ class AnthropicProvider(
                         }
                     }
                     "content_block_delta" -> {
-                        val delta = event["delta"]?.jsonObject ?: return@forEachLine
-                        val deltaType = delta["type"]?.jsonPrimitive?.contentOrNull
+                        val delta = event["delta"]?.jsonObject
+                        val deltaType = delta?.get("type")?.jsonPrimitive?.contentOrNull
                         when (deltaType) {
                             "text_delta" -> {
                                 val text = delta["text"]?.jsonPrimitive?.contentOrNull ?: ""
-                                // Cannot emit from forEachLine - collect events
+                                if (text.isNotEmpty()) {
+                                    emit(LlmStreamEvent.TextDelta(text))
+                                }
                             }
                             "input_json_delta" -> {
                                 val partial = delta["partial_json"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -155,31 +180,69 @@ class AnthropicProvider(
                             }
                             "thinking" -> {
                                 val thinking = delta["thinking"]?.jsonPrimitive?.contentOrNull ?: ""
-                                // Thinking content
+                                if (thinking.isNotEmpty()) {
+                                    emit(LlmStreamEvent.ThinkingDelta(thinking))
+                                }
                             }
                         }
                     }
                     "content_block_stop" -> {
                         if (currentToolName.isNotEmpty()) {
-                            // Tool use complete - handled after stream
+                            emit(LlmStreamEvent.ToolUse(
+                                id = currentToolId,
+                                name = currentToolName,
+                                input = toolInputBuffer.toString().ifEmpty { "{}" },
+                            ))
+                            currentToolId = ""
+                            currentToolName = ""
+                            toolInputBuffer.clear()
+                        }
+                    }
+                    "message_start" -> {
+                        val message = event["message"]?.jsonObject
+                        val usage = message?.get("usage")?.jsonObject
+                        if (usage != null) {
+                            emit(LlmStreamEvent.Usage(
+                                inputTokens = usage["input_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
+                                outputTokens = usage["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
+                                cacheRead = usage["cache_read_input_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
+                                cacheWrite = usage["cache_creation_input_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
+                            ))
                         }
                     }
                     "message_delta" -> {
                         val delta = event["delta"]?.jsonObject
-                        val stopReason = delta?.get("stop_reason")?.jsonPrimitive?.contentOrNull
-                        if (stopReason != null) {
-                            // Done
+                        stopReason = delta?.get("stop_reason")?.jsonPrimitive?.contentOrNull
+                        val usage = event["usage"]?.jsonObject
+                        if (usage != null) {
+                            emit(LlmStreamEvent.Usage(
+                                inputTokens = 0,
+                                outputTokens = usage["output_tokens"]?.jsonPrimitive?.intOrNull ?: 0,
+                            ))
                         }
                     }
                     "message_stop" -> {
-                        // Message complete
+                        // Final event
+                    }
+                    "error" -> {
+                        val error = event["error"]?.jsonObject
+                        val errMsg = error?.get("message")?.jsonPrimitive?.contentOrNull ?: "Unknown error"
+                        val errType = error?.get("type")?.jsonPrimitive?.contentOrNull
+                        emit(LlmStreamEvent.Error(
+                            message = errMsg,
+                            code = errType,
+                            retryable = errType == "overloaded_error",
+                        ))
+                        return
                     }
                 }
             } catch (_: Exception) {
-                // Skip malformed events
+                // Skip malformed SSE events
             }
+
+            line = reader.readLine()
         }
 
-        emit(LlmStreamEvent.Done(stopReason = "end_turn"))
+        emit(LlmStreamEvent.Done(stopReason = stopReason ?: "end_turn"))
     }
 }

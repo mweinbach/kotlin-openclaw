@@ -24,3 +24,12 @@
 
 # BouncyCastle
 -keep class org.bouncycastle.** { *; }
+
+# Netty optional dependencies (not available on Android)
+-dontwarn io.netty.internal.tcnative.**
+-dontwarn org.apache.log4j.**
+-dontwarn org.apache.logging.log4j.**
+-dontwarn org.eclipse.jetty.npn.**
+-dontwarn reactor.blockhound.**
+-dontwarn java.lang.management.**
+-dontwarn com.sun.nio.file.**
