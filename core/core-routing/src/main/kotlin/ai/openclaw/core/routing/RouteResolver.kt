@@ -126,7 +126,7 @@ fun resolveAgentRoute(
         }
 
         // Tier 6: Channel match (lowest binding priority - no other match criteria)
-        if (guildId == null && teamId == null && peer == null) {
+        if (guildId == null && teamId == null) {
             val sessionKey = buildRouteSessionKey(binding.agentId, input)
             return ResolvedAgentRoute(
                 agentId = binding.agentId,
