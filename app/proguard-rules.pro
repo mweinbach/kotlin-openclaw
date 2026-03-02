@@ -33,3 +33,6 @@
 -dontwarn reactor.blockhound.**
 -dontwarn java.lang.management.**
 -dontwarn com.sun.nio.file.**
+
+# Java 9+ APIs not available on Android
+-dontwarn java.lang.ProcessHandle
