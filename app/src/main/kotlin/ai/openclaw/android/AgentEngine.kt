@@ -7,6 +7,9 @@ import ai.openclaw.android.security.SharedPreferencesSecretStore
 import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.model.AcpRuntimeEvent
 import ai.openclaw.core.model.AgentConfig
+import ai.openclaw.core.model.AgentDefaultsConfig
+import ai.openclaw.core.model.AgentModelConfig
+import ai.openclaw.core.model.AgentsConfig
 import ai.openclaw.core.model.AuthProfileConfig
 import ai.openclaw.core.model.ModelProviderAuthMode
 import ai.openclaw.core.model.ModelProviderConfig
@@ -386,6 +389,65 @@ class AgentEngine(private val context: Context) {
             ?: resolveConfiguredDefaultModel()
     }
 
+    fun availableModelIdsForEnabledProviders(): List<String> {
+        val configuredProviders = config.models?.providers.orEmpty()
+        val enabledProviders = resolveEnabledProviders(configuredProviders.keys)
+        val available = mutableListOf<String>()
+
+        for ((providerId, providerConfig) in configuredProviders) {
+            val canonical = canonicalProvider(providerId)
+            if (canonical !in enabledProviders) continue
+            for (model in providerConfig.models) {
+                val modelId = model.id.trim()
+                if (modelId.isEmpty()) continue
+                available += routeModelToProvider(
+                    if ('/' in modelId) modelId else "$canonical/$modelId",
+                )
+            }
+        }
+
+        for (provider in enabledProviders) {
+            val hasConfiguredModels = configuredProviders.entries.any { (providerId, providerConfig) ->
+                canonicalProvider(providerId) == provider && providerConfig.models.isNotEmpty()
+            }
+            if (!hasConfiguredModels) {
+                defaultModelForProvider(provider)?.let(available::add)
+            }
+        }
+
+        if (available.isEmpty()) {
+            val defaults = enabledProviders.mapNotNull(::defaultModelForProvider)
+            if (defaults.isNotEmpty()) {
+                available += defaults
+            } else {
+                available += DEFAULT_MODEL_CANDIDATES
+            }
+        }
+
+        return available
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+    }
+
+    fun setDefaultModel(modelId: String) {
+        val normalized = modelId.trim()
+        require(normalized.isNotEmpty()) { "Model ID cannot be blank" }
+
+        val currentAgents = config.agents ?: AgentsConfig()
+        val currentDefaults = currentAgents.defaults ?: AgentDefaultsConfig()
+        val currentModel = currentDefaults.model ?: AgentModelConfig()
+
+        val updatedConfig = config.copy(
+            agents = currentAgents.copy(
+                defaults = currentDefaults.copy(
+                    model = currentModel.copy(primary = normalized),
+                ),
+            ),
+        )
+        saveConfig(updatedConfig)
+    }
+
     fun currentToolNames(): List<String> = toolRegistry.names().sorted()
 
     fun terminalWorkingDirectory(): String = context.filesDir.absolutePath
@@ -431,9 +493,6 @@ class AgentEngine(private val context: Context) {
             content = userMessage,
         )
 
-        val effectiveSystemPrompt = systemPrompt
-            ?: resolveSystemPrompt(resolvedAgentId)
-
         var lastRetryableError: AcpRuntimeEvent.Error? = null
 
         for ((index, candidateModel) in modelChain.withIndex()) {
@@ -460,7 +519,7 @@ class AgentEngine(private val context: Context) {
             runner.runTurn(
                 messages = messages,
                 model = routedModel,
-                systemPrompt = effectiveSystemPrompt,
+                systemPrompt = systemPrompt,
                 sessionKey = sessionKey,
                 agentId = resolvedAgentId,
                 agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
@@ -810,34 +869,49 @@ class AgentEngine(private val context: Context) {
         )
     }
 
-    private fun resolveSystemPrompt(agentId: String): String {
-        val agentIdentityName = resolveAgentConfig(agentId)?.identity?.name
-        return when {
-            !agentIdentityName.isNullOrBlank() -> "You are $agentIdentityName."
-            else -> "You are a helpful assistant."
-        }
-    }
-
     private fun resolveModelChain(
         agentId: String,
         requestedModel: String?,
     ): List<String> {
         val agentConfig = resolveAgentConfig(agentId)
-        val defaults = config.agents?.defaults?.model
+        val defaultsModel = config.agents?.defaults?.model
+        val configuredPrimary = agentConfig?.model?.primary
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: defaultsModel?.primary
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            ?: resolveConfiguredDefaultModel()
+        val agentFallbackOverride = agentConfig?.model?.fallbacks?.let { it.toList() }
+        val configuredFallbacks = agentFallbackOverride ?: defaultsModel?.fallbacks.orEmpty()
+        val requested = requestedModel?.trim()?.takeIf { it.isNotEmpty() }
 
         val chain = mutableListOf<String>()
 
-        if (!requestedModel.isNullOrBlank()) {
-            chain += requestedModel
+        if (requested != null) {
+            chain += requested
+            if (agentFallbackOverride != null) {
+                chain += configuredFallbacks
+            } else {
+                val sameProviderAsConfigured = configuredPrimary?.let {
+                    sharesProvider(requested, it)
+                } ?: false
+                val requestedInFallbacks = configuredFallbacks.any {
+                    sameResolvedModel(requested, it)
+                }
+                if (sameProviderAsConfigured || requestedInFallbacks || configuredPrimary == null) {
+                    chain += configuredFallbacks
+                }
+                configuredPrimary?.let(chain::add)
+            }
         } else {
-            agentConfig?.model?.primary?.let(chain::add)
-            defaults?.primary?.let(chain::add)
-            resolveConfiguredDefaultModel()?.let(chain::add)
-            chain += DEFAULT_MODEL_CANDIDATES
+            configuredPrimary?.let(chain::add)
+            chain += configuredFallbacks
         }
 
-        chain += agentConfig?.model?.fallbacks.orEmpty()
-        chain += defaults?.fallbacks.orEmpty()
+        if (chain.isEmpty()) {
+            chain += availableModelIdsForEnabledProviders()
+        }
 
         return chain
             .map { it.trim() }
@@ -846,24 +920,66 @@ class AgentEngine(private val context: Context) {
     }
 
     private fun resolveConfiguredDefaultModel(): String? {
-        val providers = config.models?.providers.orEmpty()
-        for ((providerId, providerConfig) in providers) {
-            val firstModel = providerConfig.models.firstOrNull()?.id ?: continue
-            val canonical = canonicalProvider(providerId)
-            return if ('/' in firstModel) firstModel else "$canonical/$firstModel"
-        }
-        return null
+        return availableModelIdsForEnabledProviders().firstOrNull()
     }
 
     private fun routeModelToProvider(modelId: String): String {
-        if ('/' in modelId) return modelId
+        val trimmed = modelId.trim()
+        if (trimmed.isEmpty()) return trimmed
+        val slash = trimmed.indexOf('/')
+        if (slash > 0) {
+            val provider = canonicalProvider(trimmed.substring(0, slash))
+            val model = trimmed.substring(slash + 1).trim()
+            return if (model.isEmpty()) provider else "$provider/$model"
+        }
+
         val providers = config.models?.providers.orEmpty()
         for ((providerId, providerConfig) in providers) {
-            if (providerConfig.models.any { it.id == modelId }) {
-                return "${canonicalProvider(providerId)}/$modelId"
+            if (providerConfig.models.any { it.id.equals(trimmed, ignoreCase = true) }) {
+                return "${canonicalProvider(providerId)}/$trimmed"
             }
         }
-        return modelId
+        return trimmed
+    }
+
+    private fun resolveEnabledProviders(configuredProviderIds: Set<String>): List<String> {
+        val configured = configuredProviderIds.map(::canonicalProvider).toSet()
+        val registered = providerRegistry.ids().map(::canonicalProvider).toSet()
+        val enabled = when {
+            registered.isNotEmpty() -> registered
+            configured.isNotEmpty() -> configured
+            else -> DEFAULT_PROVIDER_ORDER.toSet()
+        }
+        return enabled.sortedWith(compareBy({ providerSortKey(it) }, { it }))
+    }
+
+    private fun defaultModelForProvider(providerId: String): String? {
+        return DEFAULT_MODELS_BY_PROVIDER[canonicalProvider(providerId)]
+    }
+
+    private fun providerSortKey(providerId: String): Int {
+        val idx = DEFAULT_PROVIDER_ORDER.indexOf(providerId)
+        return if (idx == -1) Int.MAX_VALUE else idx
+    }
+
+    private fun resolveProviderFromModel(modelId: String): String? {
+        val routed = routeModelToProvider(modelId)
+        val slash = routed.indexOf('/')
+        if (slash <= 0) return null
+        return canonicalProvider(routed.substring(0, slash))
+    }
+
+    private fun sharesProvider(modelA: String, modelB: String): Boolean {
+        val providerA = resolveProviderFromModel(modelA) ?: return false
+        val providerB = resolveProviderFromModel(modelB) ?: return false
+        return providerA == providerB
+    }
+
+    private fun sameResolvedModel(modelA: String, modelB: String): Boolean {
+        return routeModelToProvider(modelA).equals(
+            routeModelToProvider(modelB),
+            ignoreCase = true,
+        )
     }
 
     private fun resolveAgentConfig(agentId: String): AgentConfig? {
@@ -909,6 +1025,18 @@ class AgentEngine(private val context: Context) {
         private const val CODEX_ACCOUNT_ID_KEY = "codex_account_id"
         private const val CODEX_EMAIL_KEY = "codex_email"
         private const val CODEX_EXPIRY_MARGIN_MS = 60_000L
+        private val DEFAULT_PROVIDER_ORDER = listOf(
+            "anthropic",
+            "openai",
+            "gemini",
+            "ollama",
+        )
+        private val DEFAULT_MODELS_BY_PROVIDER = mapOf(
+            "anthropic" to "anthropic/claude-sonnet-4-5-20250514",
+            "openai" to "openai/gpt-4o-mini",
+            "gemini" to "gemini/gemini-2.0-flash",
+            "ollama" to "ollama/llama3",
+        )
 
         private val DEFAULT_MODEL_CANDIDATES = listOf(
             "anthropic/claude-sonnet-4-5-20250514",

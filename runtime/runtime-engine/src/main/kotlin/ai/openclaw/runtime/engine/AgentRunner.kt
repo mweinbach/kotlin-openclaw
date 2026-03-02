@@ -52,7 +52,7 @@ class ToolRegistry {
 class AgentRunner(
     private val provider: LlmProvider,
     private val toolRegistry: ToolRegistry = ToolRegistry(),
-    private val maxToolRounds: Int = 25,
+    private val maxToolRounds: Int = 30,
     private val contextGuard: ContextGuard = ContextGuard(),
     private val sessionPersistence: SessionPersistence? = null,
     private val systemPromptBuilder: SystemPromptBuilder = SystemPromptBuilder(),
