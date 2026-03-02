@@ -65,6 +65,7 @@ dependencies {
     implementation(project(":runtime:runtime-providers"))
     implementation(project(":runtime:runtime-memory"))
     implementation(project(":runtime:runtime-gateway"))
+    implementation(project(":runtime:runtime-devices"))
 
     // Channel modules
     implementation(project(":channels:channel-core"))
@@ -76,6 +77,12 @@ dependencies {
     implementation(project(":channels:channel-googlechat"))
     implementation(project(":channels:channel-irc"))
     implementation(project(":channels:channel-sms"))
+    implementation(project(":channels:channel-whatsapp"))
+    implementation(project(":channels:channel-line"))
+    implementation(project(":channels:channel-msteams"))
+    implementation(project(":channels:channel-mattermost"))
+    implementation(project(":channels:channel-nostr"))
+    implementation(project(":channels:channel-webchat"))
 
     // AndroidX + Compose
     implementation(libs.androidx.core.ktx)
