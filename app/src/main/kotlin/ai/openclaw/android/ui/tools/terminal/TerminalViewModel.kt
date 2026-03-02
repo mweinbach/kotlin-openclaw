@@ -27,8 +27,12 @@ class TerminalViewModel : ViewModel() {
         output.add("$ $command")
 
         currentJob = viewModelScope.launch {
-            executor.execute(command).collect { line ->
-                output.add(line)
+            try {
+                executor.execute(command).collect { line ->
+                    output.add(line)
+                }
+            } catch (e: java.io.IOException) {
+                output.add("Error: ${e.message}")
             }
         }
     }
