@@ -25,6 +25,9 @@ data class ResolveAgentRouteInput(
     val teamId: String? = null,
     val threadId: String? = null,
     val parentSessionKey: String? = null,
+    val identityLinks: Map<String, List<String>>? = null,
+    val dmScope: DmScope? = null,
+    val mainKey: String? = null,
 )
 
 /**
@@ -52,86 +55,90 @@ fun resolveAgentRoute(
         val match = binding.match
         if (match.channel != input.channel) continue
 
-        // Peer match (highest priority)
+        // Tier 1: Peer match (highest priority)
         val peer = match.peer
         if (peer != null) {
             if (peer.kind == input.chatType && peer.id == input.from) {
-                val sessionKey = buildSessionKey(binding.agentId, input)
+                val sessionKey = buildRouteSessionKey(binding.agentId, input)
                 return ResolvedAgentRoute(
                     agentId = binding.agentId,
                     sessionKey = sessionKey,
-                    matchDescription = "peer:${input.from}",
+                    matchDescription = "binding.peer",
                     binding = binding,
                 )
             }
             continue
         }
 
-        // Guild + roles match
+        // Tier 2: Guild + roles match
         val guildId = match.guildId
         if (guildId != null && guildId == input.guildId) {
             val roles = match.roles
             if (!roles.isNullOrEmpty()) {
                 val hasRole = input.roles?.any { it in roles } == true
                 if (hasRole) {
-                    val sessionKey = buildSessionKey(binding.agentId, input)
+                    val sessionKey = buildRouteSessionKey(binding.agentId, input)
                     return ResolvedAgentRoute(
                         agentId = binding.agentId,
                         sessionKey = sessionKey,
-                        matchDescription = "guild+roles:$guildId",
+                        matchDescription = "binding.guild+roles",
                         binding = binding,
                     )
                 }
                 continue
             }
-            // Guild-only match
-            val sessionKey = buildSessionKey(binding.agentId, input)
+            // Tier 3: Guild-only match
+            val sessionKey = buildRouteSessionKey(binding.agentId, input)
             return ResolvedAgentRoute(
                 agentId = binding.agentId,
                 sessionKey = sessionKey,
-                matchDescription = "guild:$guildId",
+                matchDescription = "binding.guild",
                 binding = binding,
             )
         }
 
-        // Team match
+        // Tier 4: Team match
         val teamId = match.teamId
         if (teamId != null && teamId == input.teamId) {
-            val sessionKey = buildSessionKey(binding.agentId, input)
+            val sessionKey = buildRouteSessionKey(binding.agentId, input)
             return ResolvedAgentRoute(
                 agentId = binding.agentId,
                 sessionKey = sessionKey,
-                matchDescription = "team:$teamId",
+                matchDescription = "binding.team",
                 binding = binding,
             )
         }
 
-        // Account match
+        // Tier 5: Account match
         val accountId = match.accountId
-        if (accountId != null && accountId == input.accountId) {
-            val sessionKey = buildSessionKey(binding.agentId, input)
-            return ResolvedAgentRoute(
-                agentId = binding.agentId,
-                sessionKey = sessionKey,
-                matchDescription = "account:$accountId",
-                binding = binding,
-            )
+        if (accountId != null) {
+            // "*" matches any account, specific value matches exact
+            if (accountId == "*" || accountId == input.accountId) {
+                val sessionKey = buildRouteSessionKey(binding.agentId, input)
+                return ResolvedAgentRoute(
+                    agentId = binding.agentId,
+                    sessionKey = sessionKey,
+                    matchDescription = "binding.account",
+                    binding = binding,
+                )
+            }
+            continue
         }
 
-        // Channel match (lowest binding priority)
-        if (match.accountId == null && match.guildId == null && match.teamId == null && match.peer == null) {
-            val sessionKey = buildSessionKey(binding.agentId, input)
+        // Tier 6: Channel match (lowest binding priority - no other match criteria)
+        if (guildId == null && teamId == null && peer == null) {
+            val sessionKey = buildRouteSessionKey(binding.agentId, input)
             return ResolvedAgentRoute(
                 agentId = binding.agentId,
                 sessionKey = sessionKey,
-                matchDescription = "channel:${match.channel}",
+                matchDescription = "binding.channel",
                 binding = binding,
             )
         }
     }
 
-    // Default agent fallback
-    val sessionKey = buildSessionKey(defaultAgentId, input)
+    // Tier 7: Default agent fallback
+    val sessionKey = buildRouteSessionKey(defaultAgentId, input)
     return ResolvedAgentRoute(
         agentId = defaultAgentId,
         sessionKey = sessionKey,
@@ -139,13 +146,76 @@ fun resolveAgentRoute(
     )
 }
 
-private fun buildSessionKey(agentId: String, input: ResolveAgentRouteInput): String {
-    val normalizedAgentId = agentId.lowercase().replace(Regex("[^a-z0-9_-]"), "_")
-    val chatTypeStr = when (input.chatType) {
-        ChatType.DIRECT -> "direct"
-        ChatType.GROUP -> "group"
-        ChatType.CHANNEL -> "channel"
+/**
+ * Build a full session key from route resolution input using the proper peer session key builder.
+ */
+private fun buildRouteSessionKey(agentId: String, input: ResolveAgentRouteInput): String {
+    val baseKey = buildAgentPeerSessionKey(
+        agentId = agentId,
+        channel = input.channel,
+        mainKey = input.mainKey,
+        accountId = input.accountId,
+        peerKind = input.chatType,
+        peerId = input.from,
+        identityLinks = input.identityLinks,
+        dmScope = input.dmScope,
+    )
+
+    // Apply thread suffix if needed
+    val threadId = input.threadId
+    if (threadId != null) {
+        val (sessionKey, _) = resolveThreadSessionKeys(
+            baseSessionKey = baseKey,
+            threadId = threadId,
+            parentSessionKey = input.parentSessionKey,
+        )
+        return sessionKey
     }
-    val base = "agent:$normalizedAgentId:${input.channel}:$chatTypeStr:${input.from}"
-    return if (input.threadId != null) "$base:thread:${input.threadId}" else base
+    return baseKey
+}
+
+// --- Binding utilities ---
+
+/**
+ * List all bindings from config.
+ */
+fun listBindings(config: OpenClawConfig): List<AgentBinding> {
+    return config.bindings.orEmpty()
+}
+
+/**
+ * List bound account IDs for a given channel.
+ */
+fun listBoundAccountIds(config: OpenClawConfig, channelId: String): List<String> {
+    val normalizedChannel = channelId.trim().lowercase()
+    if (normalizedChannel.isEmpty()) return emptyList()
+    val ids = mutableSetOf<String>()
+    for (binding in listBindings(config)) {
+        val match = binding.match
+        if (match.channel.trim().lowercase() != normalizedChannel) continue
+        val accountId = match.accountId?.trim() ?: continue
+        if (accountId.isEmpty() || accountId == "*") continue
+        ids.add(normalizeAccountId(accountId))
+    }
+    return ids.sorted()
+}
+
+/**
+ * Resolve default agent's bound account ID for a channel.
+ */
+fun resolveDefaultAgentBoundAccountId(config: OpenClawConfig, channelId: String): String? {
+    val normalizedChannel = channelId.trim().lowercase()
+    if (normalizedChannel.isEmpty()) return null
+    val defaultAgentId = normalizeAgentId(
+        config.agents?.list?.firstOrNull { it.default == true }?.id ?: DEFAULT_AGENT_ID
+    )
+    for (binding in listBindings(config)) {
+        val match = binding.match
+        if (match.channel.trim().lowercase() != normalizedChannel) continue
+        if (normalizeAgentId(binding.agentId) != defaultAgentId) continue
+        val accountId = match.accountId?.trim() ?: continue
+        if (accountId.isEmpty() || accountId == "*") continue
+        return normalizeAccountId(accountId)
+    }
+    return null
 }

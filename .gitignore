@@ -28,3 +28,5 @@ out/
 # Agent scratch/reference work
 tmp/
 java_pid2296.hprof
+.kotlin/sessions/kotlin-compiler-640923741429959695.salive
+.kotlin/sessions/kotlin-compiler-14797752964697265528.salive
