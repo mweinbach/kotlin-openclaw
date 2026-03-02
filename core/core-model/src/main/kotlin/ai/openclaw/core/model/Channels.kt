@@ -32,6 +32,10 @@ data class ChannelsConfig(
     val msteams: MSTeamsConfig? = null,
     val imessage: IMessageConfig? = null,
     val matrix: MatrixConfig? = null,
+    val line: LineConfig? = null,
+    val mattermost: MattermostConfig? = null,
+    val nostr: NostrConfig? = null,
+    val webchat: WebChatConfig? = null,
 )
 
 // --- Telegram Config ---
@@ -161,6 +165,63 @@ data class MatrixAccountConfig(
 data class MatrixConfig(
     val enabled: Boolean? = null,
     val accounts: Map<String, MatrixAccountConfig>? = null,
+)
+
+// --- LINE Config ---
+
+@Serializable
+data class LineAccountConfig(
+    val channelAccessToken: SecretInput? = null,
+    val channelSecret: SecretInput? = null,
+    val allowFrom: List<String>? = null,
+    val dmPolicy: DmPolicy? = null,
+    val groupPolicy: GroupPolicy? = null,
+)
+
+@Serializable
+data class LineConfig(
+    val enabled: Boolean? = null,
+    val accounts: Map<String, LineAccountConfig>? = null,
+)
+
+// --- Mattermost Config ---
+
+@Serializable
+data class MattermostAccountConfig(
+    val serverUrl: String? = null,
+    val accessToken: SecretInput? = null,
+    val allowFrom: List<String>? = null,
+    val dmPolicy: DmPolicy? = null,
+    val groupPolicy: GroupPolicy? = null,
+)
+
+@Serializable
+data class MattermostConfig(
+    val enabled: Boolean? = null,
+    val accounts: Map<String, MattermostAccountConfig>? = null,
+)
+
+// --- Nostr Config ---
+
+@Serializable
+data class NostrAccountConfig(
+    val privateKey: SecretInput? = null,
+    val relayUrls: List<String>? = null,
+)
+
+@Serializable
+data class NostrConfig(
+    val enabled: Boolean? = null,
+    val accounts: Map<String, NostrAccountConfig>? = null,
+)
+
+// --- WebChat Config ---
+
+@Serializable
+data class WebChatConfig(
+    val enabled: Boolean? = null,
+    val path: String? = null,
+    val requireAuth: Boolean? = null,
 )
 
 // --- Channel Plugin Types ---
