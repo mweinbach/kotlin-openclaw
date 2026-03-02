@@ -42,6 +42,7 @@ class GatewayServer(
     val authenticator = GatewayAuthenticator(config?.gateway?.auth)
     val channelManager = ChannelManager()
     val auditLog = AuditLog()
+    val webhookManager = WebhookManager(config?.hooks, config, auditLog, json)
 
     // Connected WebSocket sessions
     private val connections = ConcurrentHashMap<String, WsConnection>()
@@ -88,6 +89,7 @@ class GatewayServer(
             routing {
                 configureRestRoutes()
                 configureWebSocketRoute()
+                with(webhookManager) { configureWebhookRoutes() }
             }
         }
         server?.start(wait = false)
