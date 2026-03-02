@@ -59,20 +59,24 @@ fun cosineSimilarity(a: FloatArray, b: FloatArray): Double {
 class InMemoryVectorStore {
     private val entries = mutableListOf<MemoryEntry>()
 
+    @Synchronized
     fun add(entry: MemoryEntry) {
         entries.removeAll { it.id == entry.id }
         entries.add(entry)
     }
 
+    @Synchronized
     fun remove(id: String) {
         entries.removeAll { it.id == id }
     }
 
+    @Synchronized
     fun size(): Int = entries.size
 
     /**
      * Search using brute-force cosine similarity.
      */
+    @Synchronized
     fun search(
         queryEmbedding: FloatArray,
         topK: Int = 10,
@@ -94,6 +98,7 @@ class InMemoryVectorStore {
     /**
      * MMR (Maximal Marginal Relevance) search for diversity.
      */
+    @Synchronized
     fun searchMmr(
         queryEmbedding: FloatArray,
         topK: Int = 10,

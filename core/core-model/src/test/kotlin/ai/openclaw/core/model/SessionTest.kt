@@ -76,4 +76,35 @@ class SessionTest {
         val decoded = json.decodeFromString<OpenClawConfig>(encoded)
         assertEquals(config, decoded)
     }
+
+    @Test
+    fun `serialize OpenClawConfig with expanded fields`() {
+        val config = OpenClawConfig(
+            meta = ConfigMetadata(lastTouchedVersion = "1.0.0"),
+            browser = BrowserConfig(enabled = true, headless = false),
+            approvals = ApprovalsConfig(
+                exec = ExecApprovalForwardingConfig(enabled = true, mode = ExecApprovalForwardingMode.SESSION),
+            ),
+            tools = ExpandedToolsConfig(
+                profile = ToolProfileId.FULL,
+                allow = listOf("exec", "read"),
+                exec = ExecToolConfig(host = "sandbox"),
+            ),
+            messages = ExpandedMessagesConfig(
+                responsePrefix = "[bot]",
+                tts = TtsConfig(provider = TtsProvider.ELEVENLABS),
+            ),
+            memory = ExpandedMemoryConfig(
+                backend = MemoryBackend.BUILTIN,
+                citations = MemoryCitationsMode.AUTO,
+            ),
+            channels = ChannelsConfig(
+                whatsapp = WhatsAppConfig(enabled = true),
+                msteams = MSTeamsConfig(enabled = false),
+            ),
+        )
+        val encoded = json.encodeToString(config)
+        val decoded = json.decodeFromString<OpenClawConfig>(encoded)
+        assertEquals(config, decoded)
+    }
 }

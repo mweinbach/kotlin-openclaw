@@ -28,6 +28,10 @@ data class ChannelsConfig(
     val signal: SignalConfig? = null,
     val irc: IrcConfig? = null,
     val googlechat: GoogleChatConfig? = null,
+    val whatsapp: WhatsAppConfig? = null,
+    val msteams: MSTeamsConfig? = null,
+    val imessage: IMessageConfig? = null,
+    val matrix: MatrixConfig? = null,
 )
 
 // --- Telegram Config ---
@@ -191,30 +195,33 @@ data class ChannelCapabilities(
 
 @Serializable
 data class InboundMessage(
-    val channel: ChannelId,
-    val accountId: String,
-    val from: String,
-    val to: String? = null,
-    val text: String,
+    val channelId: ChannelId,
+    val accountId: String = "default",
     val chatType: ChatType,
+    val senderId: String,
+    val senderName: String = "",
+    val targetId: String,
+    val text: String,
     val threadId: String? = null,
     val guildId: String? = null,
     val roles: List<String>? = null,
     val replyToMessageId: String? = null,
-    val attachments: List<MessageAttachment>? = null,
-    val timestamp: Long = System.currentTimeMillis(),
     val messageId: String? = null,
+    val attachments: List<MessageAttachment>? = null,
+    val metadata: Map<String, String> = emptyMap(),
+    val timestamp: Long = System.currentTimeMillis(),
 )
 
 @Serializable
 data class OutboundMessage(
-    val channel: ChannelId,
-    val accountId: String,
-    val to: String,
+    val channelId: ChannelId,
+    val accountId: String = "default",
+    val targetId: String,
     val text: String,
     val threadId: String? = null,
     val replyToMessageId: String? = null,
     val attachments: List<MessageAttachment>? = null,
+    val metadata: Map<String, String> = emptyMap(),
 )
 
 @Serializable

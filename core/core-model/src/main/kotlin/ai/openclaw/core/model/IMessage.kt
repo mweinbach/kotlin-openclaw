@@ -1,0 +1,70 @@
+package ai.openclaw.core.model
+
+import kotlinx.serialization.Serializable
+
+// --- iMessage Config (ported from src/config/types.imessage.ts) ---
+
+@Serializable
+data class IMessageAccountConfig(
+    val name: String? = null,
+    val capabilities: List<String>? = null,
+    val markdown: MarkdownConfig? = null,
+    val configWrites: Boolean? = null,
+    val enabled: Boolean? = null,
+    val cliPath: String? = null,
+    val dbPath: String? = null,
+    val remoteHost: String? = null,
+    val service: String? = null,
+    val region: String? = null,
+    val dmPolicy: DmPolicy? = null,
+    val allowFrom: List<String>? = null,
+    val defaultTo: String? = null,
+    val groupAllowFrom: List<String>? = null,
+    val groupPolicy: GroupPolicy? = null,
+    val historyLimit: Int? = null,
+    val dmHistoryLimit: Int? = null,
+    val includeAttachments: Boolean? = null,
+    val attachmentRoots: List<String>? = null,
+    val remoteAttachmentRoots: List<String>? = null,
+    val mediaMaxMb: Int? = null,
+    val probeTimeoutMs: Int? = null,
+    val textChunkLimit: Int? = null,
+    val chunkMode: String? = null,
+    val blockStreaming: Boolean? = null,
+    val blockStreamingCoalesce: BlockStreamingCoalesceConfig? = null,
+    val heartbeat: ChannelHeartbeatVisibilityConfig? = null,
+    val responsePrefix: String? = null,
+)
+
+@Serializable
+data class IMessageConfig(
+    val name: String? = null,
+    val capabilities: List<String>? = null,
+    val markdown: MarkdownConfig? = null,
+    val configWrites: Boolean? = null,
+    val enabled: Boolean? = null,
+    val cliPath: String? = null,
+    val dbPath: String? = null,
+    val remoteHost: String? = null,
+    val service: String? = null,
+    val region: String? = null,
+    val dmPolicy: DmPolicy? = null,
+    val allowFrom: List<String>? = null,
+    val defaultTo: String? = null,
+    val groupAllowFrom: List<String>? = null,
+    val groupPolicy: GroupPolicy? = null,
+    val historyLimit: Int? = null,
+    val dmHistoryLimit: Int? = null,
+    val includeAttachments: Boolean? = null,
+    val attachmentRoots: List<String>? = null,
+    val remoteAttachmentRoots: List<String>? = null,
+    val mediaMaxMb: Int? = null,
+    val probeTimeoutMs: Int? = null,
+    val textChunkLimit: Int? = null,
+    val chunkMode: String? = null,
+    val blockStreaming: Boolean? = null,
+    val blockStreamingCoalesce: BlockStreamingCoalesceConfig? = null,
+    val heartbeat: ChannelHeartbeatVisibilityConfig? = null,
+    val responsePrefix: String? = null,
+    val accounts: Map<String, IMessageAccountConfig>? = null,
+)
