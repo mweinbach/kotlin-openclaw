@@ -5,8 +5,19 @@ import ai.openclaw.core.agent.*
 import ai.openclaw.core.config.ConfigLoader
 import ai.openclaw.core.model.*
 import ai.openclaw.core.plugins.PluginRegistry
+import ai.openclaw.core.security.ApprovalManager
+import ai.openclaw.core.security.AuditLog
+import ai.openclaw.core.security.ConfigBasedApprovalPolicy
+import ai.openclaw.core.security.InMemorySecretStore
+import ai.openclaw.core.security.SecretStore
+import ai.openclaw.runtime.cron.CronScheduler
+import ai.openclaw.runtime.cron.CronStore
 import ai.openclaw.runtime.engine.AgentRunner
+import ai.openclaw.runtime.engine.SessionPersistence
 import ai.openclaw.runtime.engine.ToolRegistry
+import ai.openclaw.runtime.gateway.ChannelManager
+import ai.openclaw.runtime.gateway.GatewayServer
+import ai.openclaw.runtime.memory.MemoryManager
 import ai.openclaw.runtime.providers.AnthropicProvider
 import ai.openclaw.runtime.providers.GeminiProvider
 import ai.openclaw.runtime.providers.OllamaProvider
@@ -31,6 +42,54 @@ class AgentEngine(private val context: Context) {
     var config: OpenClawConfig = OpenClawConfig()
         private set
 
+    val configManager: ConfigManager by lazy { ConfigManager(context) }
+
+    val sessionPersistence: SessionPersistence by lazy {
+        SessionPersistence(context.filesDir.resolve("sessions").absolutePath)
+    }
+
+    val channelManager: ChannelManager by lazy { ChannelManager(scope) }
+
+    val gatewayServer: GatewayServer by lazy {
+        GatewayServer(
+            port = config.gateway?.port ?: 18789,
+            host = config.gateway?.customBindHost ?: "127.0.0.1",
+            config = config,
+        )
+    }
+
+    val secretStore: SecretStore by lazy {
+        SecretStore(
+            delegate = InMemorySecretStore(),
+            auditLog = AuditLog(),
+        )
+    }
+
+    val approvalManager: ApprovalManager by lazy {
+        ApprovalManager(
+            policy = ConfigBasedApprovalPolicy(config.approvals),
+        )
+    }
+
+    val memoryManager: MemoryManager by lazy { MemoryManager() }
+
+    val cronScheduler: CronScheduler by lazy {
+        val cronDir = context.filesDir.resolve("cron")
+        cronDir.mkdirs()
+        CronScheduler(
+            store = CronStore(cronDir.resolve("cron-store.json").absolutePath),
+            executor = { job ->
+                // Execute cron job as an agent turn
+                val message = when (val p = job.payload) {
+                    is ai.openclaw.runtime.cron.CronPayload.AgentTurn -> p.message
+                    is ai.openclaw.runtime.cron.CronPayload.SystemEvent -> p.text
+                }
+                sendMessage(userMessage = message).collect { /* fire and forget */ }
+            },
+            scope = scope,
+        )
+    }
+
     /**
      * Load configuration from the app's files directory.
      */
@@ -50,8 +109,26 @@ class AgentEngine(private val context: Context) {
      */
     suspend fun initialize() {
         loadConfig()
+        configManager.load()
         registerProviders()
         pluginRegistry.startAll()
+
+        // Ensure sessions directory exists
+        context.filesDir.resolve("sessions").mkdirs()
+
+        // Start gateway server
+        try {
+            gatewayServer
+        } catch (_: Exception) {
+            // Gateway start is best-effort
+        }
+
+        // Start cron scheduler
+        try {
+            cronScheduler.start()
+        } catch (_: Exception) {
+            // Cron start is best-effort
+        }
     }
 
     /**
@@ -92,8 +169,27 @@ class AgentEngine(private val context: Context) {
     }
 
     private fun resolveApiKey(profile: AuthProfileConfig): String? {
-        // In a full implementation, this would decrypt from EncryptedSharedPreferences
-        return null
+        // Try to read from SecretStore
+        return kotlinx.coroutines.runBlocking {
+            secretStore.getSecret("api_key_${profile.provider}")
+        }
+    }
+
+    /**
+     * Re-read config and notify all subsystems.
+     */
+    fun reloadConfig() {
+        loadConfig()
+        configManager.load()
+        scope.launch { pluginRegistry.notifyConfigReload() }
+    }
+
+    /**
+     * Serialize and write config file.
+     */
+    fun saveConfig(newConfig: OpenClawConfig) {
+        configManager.save(newConfig)
+        config = newConfig
     }
 
     /**
@@ -149,6 +245,8 @@ class AgentEngine(private val context: Context) {
      * Shut down the engine gracefully.
      */
     suspend fun shutdown() {
+        cronScheduler.stop()
+        channelManager.stopAll()
         pluginRegistry.stopAll()
         scope.cancel()
     }

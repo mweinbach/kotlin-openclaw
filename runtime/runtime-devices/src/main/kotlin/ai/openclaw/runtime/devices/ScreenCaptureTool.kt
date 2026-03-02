@@ -102,6 +102,7 @@ class ScreenCaptureTool(
     private suspend fun captureScreen(format: String, quality: Int): File {
         val projectionManager = this.context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val projection = projectionManager.getMediaProjection(projectionResultCode, projectionData!!)
+            ?: throw IllegalStateException("Failed to obtain MediaProjection")
 
         val windowManager = this.context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
         val metrics = DisplayMetrics()

@@ -7,14 +7,19 @@ okhttp = "5.0.0-alpha.14"
 ktor = "3.1.2"
 room = "2.7.1"
 composeBom = "2026.02.00"
+material3 = "1.5.0-alpha15"
+material3AdaptiveNavSuite = "1.5.0-alpha15"
+graphicsShapes = "1.0.1"
 activityCompose = "1.10.1"
 lifecycleRuntime = "2.9.0"
+navigationCompose = "2.9.0"
 coreKtx = "1.16.0"
 junit = "4.13.2"
 junitExt = "1.2.1"
 espresso = "3.6.1"
 mockwebserver = "5.0.0-alpha.14"
 turbine = "1.2.0"
+robolectric = "4.14.1"
 bouncycastle = "1.79"
 kaml = "0.67.0"
 
@@ -55,7 +60,14 @@ compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
 compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-material3-explicit = { module = "androidx.compose.material3:material3", version.ref = "material3" }
+compose-material3-adaptive-nav-suite = { module = "androidx.compose.material3:material3-adaptive-navigation-suite", version.ref = "material3AdaptiveNavSuite" }
+androidx-graphics-shapes = { module = "androidx.graphics:graphics-shapes", version.ref = "graphicsShapes" }
+compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
 compose-runtime = { module = "androidx.compose.runtime:runtime" }
+
+# Navigation
+navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigationCompose" }
 
 # AndroidX
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -76,6 +88,9 @@ junit-ext = { module = "androidx.test.ext:junit", version.ref = "junitExt" }
 espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso" }
 turbine = { module = "app.cash.turbine:turbine", version.ref = "turbine" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
+compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
