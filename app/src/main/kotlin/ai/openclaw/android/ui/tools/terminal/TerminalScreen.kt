@@ -1,5 +1,6 @@
 package ai.openclaw.android.ui.tools.terminal
 
+import ai.openclaw.android.AgentEngine
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,8 +22,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TerminalScreen(onBack: () -> Unit) {
-    val viewModel: TerminalViewModel = viewModel()
+fun TerminalScreen(
+    engine: AgentEngine,
+    onBack: () -> Unit,
+) {
+    val viewModel: TerminalViewModel = viewModel(factory = TerminalViewModelFactory(engine))
     var commandText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 

@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 /**
  * Main Application class for OpenClaw.
@@ -19,10 +20,20 @@ class OpenClawApp : Application() {
         super.onCreate()
         instance = this
 
-        // Initialize engine asynchronously
+        // Start foreground runtime service.
+        runCatching { AgentForegroundService.start(this) }
+
+        // Initialize engine asynchronously.
         appScope.launch {
-            engine.initialize()
+            runCatching { engine.initialize() }
         }
+    }
+
+    override fun onTerminate() {
+        runBlocking {
+            runCatching { engine.shutdown() }
+        }
+        super.onTerminate()
     }
 
     companion object {

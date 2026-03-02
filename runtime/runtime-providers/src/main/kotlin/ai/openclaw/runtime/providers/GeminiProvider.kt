@@ -1,6 +1,7 @@
 package ai.openclaw.runtime.providers
 
 import ai.openclaw.core.agent.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -195,7 +196,8 @@ class GeminiProvider(
                         outputTokens = usageMeta["candidatesTokenCount"]?.jsonPrimitive?.intOrNull ?: 0,
                     ))
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 // Skip malformed events
             }
 

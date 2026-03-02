@@ -1,16 +1,39 @@
 package ai.openclaw.android.ui.settings.apikeys
 
 import ai.openclaw.android.AgentEngine
-import ai.openclaw.core.security.SecretCategory
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -19,15 +42,15 @@ import kotlinx.coroutines.launch
 
 private data class ApiKeyProvider(
     val name: String,
-    val key: String,
+    val providerId: String,
     val requiresKey: Boolean = true,
 )
 
 private val providers = listOf(
-    ApiKeyProvider("Anthropic", "api_key_anthropic"),
-    ApiKeyProvider("OpenAI", "api_key_openai"),
-    ApiKeyProvider("Gemini", "api_key_gemini"),
-    ApiKeyProvider("Ollama", "api_key_ollama", requiresKey = false),
+    ApiKeyProvider("Anthropic", "anthropic"),
+    ApiKeyProvider("OpenAI", "openai"),
+    ApiKeyProvider("Gemini", "gemini"),
+    ApiKeyProvider("Ollama", "ollama", requiresKey = false),
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -38,12 +61,21 @@ fun ApiKeysScreen(engine: AgentEngine, onBack: () -> Unit) {
     var editingProvider by remember { mutableStateOf<ApiKeyProvider?>(null) }
     var editValue by remember { mutableStateOf("") }
 
-    LaunchedEffect(Unit) {
+    suspend fun refreshStatus() {
         val status = mutableMapOf<String, Boolean>()
         providers.forEach { provider ->
-            status[provider.key] = engine.secretStore.hasSecret(provider.key)
+            status[provider.providerId] = when (provider.providerId) {
+                "gemini" -> {
+                    engine.secretStore.hasSecret("api_key_gemini") || engine.secretStore.hasSecret("api_key_google")
+                }
+                else -> engine.secretStore.hasSecret("api_key_${provider.providerId}")
+            }
         }
         keyStatus = status
+    }
+
+    LaunchedEffect(Unit) {
+        refreshStatus()
     }
 
     Scaffold(
@@ -64,10 +96,10 @@ fun ApiKeysScreen(engine: AgentEngine, onBack: () -> Unit) {
                 .padding(padding)
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
-            contentPadding = PaddingValues(vertical = 12.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 12.dp),
         ) {
             items(providers) { provider ->
-                val isSet = keyStatus[provider.key] == true
+                val isSet = keyStatus[provider.providerId] == true
 
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Row(
@@ -122,10 +154,8 @@ fun ApiKeysScreen(engine: AgentEngine, onBack: () -> Unit) {
                                 if (isSet) {
                                     IconButton(onClick = {
                                         scope.launch {
-                                            engine.secretStore.deleteSecret(provider.key)
-                                            keyStatus = keyStatus.toMutableMap().apply {
-                                                put(provider.key, false)
-                                            }
+                                            engine.clearApiKey(provider.providerId)
+                                            refreshStatus()
                                         }
                                     }) {
                                         Icon(
@@ -143,7 +173,6 @@ fun ApiKeysScreen(engine: AgentEngine, onBack: () -> Unit) {
         }
     }
 
-    // Edit dialog
     if (editingProvider != null) {
         val provider = editingProvider!!
         AlertDialog(
@@ -163,14 +192,8 @@ fun ApiKeysScreen(engine: AgentEngine, onBack: () -> Unit) {
                 TextButton(
                     onClick = {
                         scope.launch {
-                            engine.secretStore.storeSecret(
-                                provider.key,
-                                editValue,
-                                SecretCategory.LLM_API_KEY,
-                            )
-                            keyStatus = keyStatus.toMutableMap().apply {
-                                put(provider.key, true)
-                            }
+                            engine.setApiKey(provider.providerId, editValue)
+                            refreshStatus()
                             editingProvider = null
                         }
                     },

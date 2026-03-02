@@ -12,7 +12,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -20,7 +19,7 @@ import androidx.compose.ui.unit.dp
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeviceToolsScreen(engine: AgentEngine, onBack: () -> Unit) {
-    val tools = remember { engine.toolRegistry.all() }
+    val tools = engine.toolRegistry.all()
 
     Scaffold(
         topBar = {

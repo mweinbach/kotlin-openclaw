@@ -26,6 +26,10 @@ class ToolRegistry {
 
     fun names(): Set<String> = tools.keys.toSet()
 
+    fun clear() {
+        tools.clear()
+    }
+
     fun toDefinitions(): List<LlmToolDefinition> = tools.values.map {
         LlmToolDefinition(
             name = it.name,

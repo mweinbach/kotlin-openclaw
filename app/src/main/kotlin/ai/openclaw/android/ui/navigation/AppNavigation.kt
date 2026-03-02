@@ -143,7 +143,10 @@ fun AppNavigation(engine: AgentEngine) {
                 )
             }
             composable(Routes.TERMINAL) {
-                TerminalScreen(onBack = { navController.popBackStack() })
+                TerminalScreen(
+                    engine = engine,
+                    onBack = { navController.popBackStack() },
+                )
             }
             composable(Routes.SKILLS) {
                 SkillsScreen(

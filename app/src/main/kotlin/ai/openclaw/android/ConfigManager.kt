@@ -29,9 +29,13 @@ class ConfigManager(private val context: Context) {
     val config: StateFlow<OpenClawConfig> = _config.asStateFlow()
 
     fun load(): OpenClawConfig {
-        val cfg = if (configFile.exists()) {
-            loader.parse(configFile.readText())
-        } else {
+        val cfg = runCatching {
+            if (configFile.exists()) {
+                loader.parse(configFile.readText())
+            } else {
+                OpenClawConfig()
+            }
+        }.getOrElse {
             OpenClawConfig()
         }
         _config.value = cfg

@@ -40,6 +40,9 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
     var currentSessionId: String? = null
         private set
 
+    private var currentAgentId: String = DEFAULT_AGENT_ID
+    private var currentModelId: String? = null
+
     private val conversationHistory = mutableListOf<LlmMessage>()
 
     private val _sessions = MutableStateFlow<List<String>>(emptyList())
@@ -49,6 +52,8 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
     val sessionHeaders: StateFlow<Map<String, SessionPersistence.SessionHeader?>> = _sessionHeaders.asStateFlow()
 
     init {
+        currentAgentId = engine.defaultAgentId()
+        currentModelId = engine.preferredModelForAgent(currentAgentId)
         refreshSessions()
     }
 
@@ -68,7 +73,9 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
     fun loadSession(sessionId: String) {
         viewModelScope.launch(Dispatchers.IO) {
             currentSessionId = sessionId
-            val (_, loadedMessages) = engine.sessionPersistence.load(sessionId)
+            val (header, loadedMessages) = engine.sessionPersistence.load(sessionId)
+            currentAgentId = header?.agentId ?: engine.defaultAgentId()
+            currentModelId = header?.model ?: engine.preferredModelForAgent(currentAgentId)
             conversationHistory.clear()
             conversationHistory.addAll(loadedMessages)
             messages = loadedMessages.mapNotNull { msg ->
@@ -94,11 +101,14 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
         if (currentSessionId == null) {
             val sessionId = UUID.randomUUID().toString()
             currentSessionId = sessionId
+            currentAgentId = engine.defaultAgentId()
+            currentModelId = engine.preferredModelForAgent(currentAgentId)
             engine.sessionPersistence.initSession(
                 sessionId,
                 SessionPersistence.SessionHeader(
                     sessionId = sessionId,
-                    agentId = DEFAULT_AGENT_ID,
+                    agentId = currentAgentId,
+                    model = currentModelId,
                 ),
             )
         }
@@ -126,6 +136,9 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                 val flow = engine.sendMessage(
                     userMessage = text,
                     conversationHistory = conversationHistory.dropLast(1),
+                    model = currentModelId,
+                    agentId = currentAgentId,
+                    sessionKey = currentSessionId ?: "",
                 )
                 flow.collect { event ->
                     when (event) {
@@ -235,6 +248,8 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
 
     fun startNewSession() {
         currentSessionId = null
+        currentAgentId = engine.defaultAgentId()
+        currentModelId = engine.preferredModelForAgent(currentAgentId)
         conversationHistory.clear()
         messages = emptyList()
         errorMessage = null

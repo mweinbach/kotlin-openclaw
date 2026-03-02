@@ -17,8 +17,8 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun SkillsScreen(engine: AgentEngine, onBack: () -> Unit) {
     var searchQuery by remember { mutableStateOf("") }
-    val allTools = remember { engine.toolRegistry.all() }
-    val filteredTools = remember(searchQuery) {
+    val allTools = engine.toolRegistry.all()
+    val filteredTools = remember(searchQuery, allTools) {
         if (searchQuery.isBlank()) allTools
         else allTools.filter { it.name.contains(searchQuery, ignoreCase = true) }
     }

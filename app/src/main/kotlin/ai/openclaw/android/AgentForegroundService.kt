@@ -4,9 +4,11 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 
 /**
@@ -15,6 +17,7 @@ import kotlinx.coroutines.*
  */
 class AgentForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var statusJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -25,22 +28,29 @@ class AgentForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_PAUSE -> {
+                statusJob?.cancel()
+                statusJob = null
                 scope.launch {
                     val app = application as OpenClawApp
-                    app.engine.channelManager.stopAll()
+                    runCatching { app.engine.channelManager.stopAll() }
                     updateNotification("Paused", "Channels stopped")
                 }
             }
             else -> {
-                scope.launch {
+                statusJob?.cancel()
+                statusJob = scope.launch {
                     val app = application as OpenClawApp
-                    app.engine.initialize()
-                    updateStatusNotification(app.engine)
-
-                    // Periodically update notification with live stats
-                    while (isActive) {
-                        delay(30_000)
+                    try {
+                        app.engine.initialize()
                         updateStatusNotification(app.engine)
+
+                        // Periodically update notification with live stats.
+                        while (isActive) {
+                            delay(30_000)
+                            updateStatusNotification(app.engine)
+                        }
+                    } catch (t: Throwable) {
+                        updateNotification("Error", t.message ?: "Initialization failed")
                     }
                 }
             }
@@ -49,6 +59,7 @@ class AgentForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        statusJob?.cancel()
         scope.cancel()
         super.onDestroy()
     }
@@ -129,6 +140,14 @@ class AgentForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "openclaw_agent"
         private const val NOTIFICATION_ID = 1
+        private const val ACTION_START = "ai.openclaw.android.START"
         private const val ACTION_PAUSE = "ai.openclaw.android.PAUSE"
+
+        fun start(context: Context) {
+            val intent = Intent(context, AgentForegroundService::class.java).apply {
+                action = ACTION_START
+            }
+            ContextCompat.startForegroundService(context, intent)
+        }
     }
 }

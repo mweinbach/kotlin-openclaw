@@ -1,19 +1,35 @@
 package ai.openclaw.android
 
 import android.content.Context
-import ai.openclaw.core.agent.*
-import ai.openclaw.core.config.ConfigLoader
-import ai.openclaw.core.model.*
+import ai.openclaw.android.security.SharedPreferencesSecretStore
+import ai.openclaw.core.agent.LlmMessage
+import ai.openclaw.core.model.AcpRuntimeEvent
+import ai.openclaw.core.model.AgentConfig
+import ai.openclaw.core.model.AuthProfileConfig
+import ai.openclaw.core.model.ModelProviderConfig
+import ai.openclaw.core.model.OpenClawConfig
+import ai.openclaw.core.model.SecretInput
+import ai.openclaw.core.model.DEFAULT_AGENT_ID
 import ai.openclaw.core.plugins.PluginRegistry
+import ai.openclaw.core.security.ApprovalDecision
 import ai.openclaw.core.security.ApprovalManager
 import ai.openclaw.core.security.AuditLog
 import ai.openclaw.core.security.ConfigBasedApprovalPolicy
-import ai.openclaw.core.security.InMemorySecretStore
+import ai.openclaw.core.security.SecretCategory
 import ai.openclaw.core.security.SecretStore
+import ai.openclaw.core.security.ToolAuditor
+import ai.openclaw.core.security.ToolPolicyEnforcer
+import ai.openclaw.runtime.cron.CronPayload
 import ai.openclaw.runtime.cron.CronScheduler
 import ai.openclaw.runtime.cron.CronStore
+import ai.openclaw.runtime.cron.CronTool
+import ai.openclaw.runtime.devices.DeviceToolsConfig
+import ai.openclaw.runtime.devices.DeviceToolsModule
 import ai.openclaw.runtime.engine.AgentRunner
 import ai.openclaw.runtime.engine.SessionPersistence
+import ai.openclaw.runtime.engine.SkillDefinition
+import ai.openclaw.runtime.engine.SkillExecutor
+import ai.openclaw.runtime.engine.SkillsTool
 import ai.openclaw.runtime.engine.ToolRegistry
 import ai.openclaw.runtime.gateway.ChannelManager
 import ai.openclaw.runtime.gateway.GatewayServer
@@ -23,21 +39,33 @@ import ai.openclaw.runtime.providers.GeminiProvider
 import ai.openclaw.runtime.providers.OllamaProvider
 import ai.openclaw.runtime.providers.OpenAiProvider
 import ai.openclaw.runtime.providers.ProviderRegistry
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Central engine wiring all OpenClaw subsystems together.
  */
 class AgentEngine(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val initMutex = Mutex()
 
-    val configLoader = ConfigLoader()
+    private var initialized = false
+    private var pluginsStarted = false
+    private var cronStarted = false
+
+    private var gatewayHost: String = DEFAULT_GATEWAY_HOST
+    private var gatewayPort: Int = DEFAULT_GATEWAY_PORT
+    private var gatewayServerInternal: GatewayServer? = null
+
     val providerRegistry = ProviderRegistry()
     val pluginRegistry = PluginRegistry()
     val toolRegistry = ToolRegistry()
-
-    private var agentRunner: AgentRunner? = null
 
     var config: OpenClawConfig = OpenClawConfig()
         private set
@@ -50,28 +78,31 @@ class AgentEngine(private val context: Context) {
 
     val channelManager: ChannelManager by lazy { ChannelManager(scope) }
 
-    val gatewayServer: GatewayServer by lazy {
-        GatewayServer(
-            port = config.gateway?.port ?: 18789,
-            host = config.gateway?.customBindHost ?: "127.0.0.1",
-            config = config,
-        )
-    }
+    val gatewayServer: GatewayServer
+        get() = gatewayServerInternal ?: buildGatewayServer().also { gatewayServerInternal = it }
 
     val secretStore: SecretStore by lazy {
         SecretStore(
-            delegate = InMemorySecretStore(),
+            delegate = SharedPreferencesSecretStore(context.applicationContext),
             auditLog = AuditLog(),
         )
     }
 
+    // Approval policy reads the latest config at check-time.
     val approvalManager: ApprovalManager by lazy {
         ApprovalManager(
-            policy = ConfigBasedApprovalPolicy(config.approvals),
+            policy = object : ai.openclaw.core.security.ApprovalPolicy {
+                override fun requiresApproval(toolName: String, agentId: String, sessionKey: String): Boolean {
+                    return ConfigBasedApprovalPolicy(config.approvals)
+                        .requiresApproval(toolName, agentId, sessionKey)
+                }
+            },
         )
     }
 
     val memoryManager: MemoryManager by lazy { MemoryManager() }
+
+    private val toolAuditor = ToolAuditor()
 
     val cronScheduler: CronScheduler by lazy {
         val cronDir = context.filesDir.resolve("cron")
@@ -79,99 +110,38 @@ class AgentEngine(private val context: Context) {
         CronScheduler(
             store = CronStore(cronDir.resolve("cron-store.json").absolutePath),
             executor = { job ->
-                // Execute cron job as an agent turn
-                val message = when (val p = job.payload) {
-                    is ai.openclaw.runtime.cron.CronPayload.AgentTurn -> p.message
-                    is ai.openclaw.runtime.cron.CronPayload.SystemEvent -> p.text
+                val message = when (val payload = job.payload) {
+                    is CronPayload.AgentTurn -> payload.message
+                    is CronPayload.SystemEvent -> payload.text
                 }
-                sendMessage(userMessage = message).collect { /* fire and forget */ }
+                sendMessage(
+                    userMessage = message,
+                    model = (job.payload as? CronPayload.AgentTurn)?.model,
+                    agentId = job.agentId ?: defaultAgentId(),
+                    sessionKey = job.sessionKey ?: "cron:${job.id}",
+                ).collect { /* fire-and-forget */ }
             },
             scope = scope,
         )
     }
 
     /**
-     * Load configuration from the app's files directory.
+     * Load configuration from disk with parse-failure fallback.
      */
     fun loadConfig(): OpenClawConfig {
-        val configDir = context.filesDir.resolve("config")
-        val configFile = configDir.resolve("openclaw.json")
-        config = if (configFile.exists()) {
-            configLoader.parse(configFile.readText())
-        } else {
-            OpenClawConfig()
-        }
+        config = configManager.load()
         return config
     }
 
     /**
-     * Initialize the engine with loaded config.
+     * Initialize the engine and background subsystems.
      */
     suspend fun initialize() {
-        loadConfig()
-        configManager.load()
-        registerProviders()
-        pluginRegistry.startAll()
-
-        // Ensure sessions directory exists
-        context.filesDir.resolve("sessions").mkdirs()
-
-        // Start gateway server
-        try {
-            gatewayServer
-        } catch (_: Exception) {
-            // Gateway start is best-effort
-        }
-
-        // Start cron scheduler
-        try {
-            cronScheduler.start()
-        } catch (_: Exception) {
-            // Cron start is best-effort
-        }
-    }
-
-    /**
-     * Register LLM providers from config.
-     */
-    private fun registerProviders() {
-        val profiles = config.auth?.profiles.orEmpty()
-
-        // Register Anthropic if configured
-        val anthropicKey = profiles.values
-            .firstOrNull { it.provider == "anthropic" }
-            ?.let { resolveApiKey(it) }
-            ?: System.getenv("ANTHROPIC_API_KEY")
-        if (anthropicKey != null) {
-            providerRegistry.register(AnthropicProvider(apiKey = anthropicKey))
-        }
-
-        // Register OpenAI if configured
-        val openaiKey = profiles.values
-            .firstOrNull { it.provider == "openai" }
-            ?.let { resolveApiKey(it) }
-            ?: System.getenv("OPENAI_API_KEY")
-        if (openaiKey != null) {
-            providerRegistry.register(OpenAiProvider(apiKey = openaiKey))
-        }
-
-        // Register Gemini if configured
-        val geminiKey = profiles.values
-            .firstOrNull { it.provider == "gemini" || it.provider == "google" }
-            ?.let { resolveApiKey(it) }
-            ?: System.getenv("GEMINI_API_KEY")
-        if (geminiKey != null) {
-            providerRegistry.register(GeminiProvider(apiKey = geminiKey))
-        }
-
-        // Always register Ollama (no key needed for local)
-        providerRegistry.register(OllamaProvider())
-    }
-
-    private fun resolveApiKey(profile: AuthProfileConfig): String? {
-        // Try to read from SecretStore
-        return kotlinx.coroutines.runBlocking {
-            secretStore.getSecret("api_key_${profile.provider}")
+        initMutex.withLock {
+            if (initialized) return
+            loadConfig()
+            applyRuntimeConfiguration(notifyPluginReload = false, startGateway = true)
+            initialized = true
         }
     }
 
@@ -179,9 +149,13 @@ class AgentEngine(private val context: Context) {
      * Re-read config and notify all subsystems.
      */
     fun reloadConfig() {
-        loadConfig()
-        configManager.load()
-        scope.launch { pluginRegistry.notifyConfigReload() }
+        scope.launch {
+            initMutex.withLock {
+                loadConfig()
+                applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
+                initialized = true
+            }
+        }
     }
 
     /**
@@ -190,6 +164,97 @@ class AgentEngine(private val context: Context) {
     fun saveConfig(newConfig: OpenClawConfig) {
         configManager.save(newConfig)
         config = newConfig
+        scope.launch {
+            initMutex.withLock {
+                applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
+                initialized = true
+            }
+        }
+    }
+
+    suspend fun setApiKey(providerId: String, apiKey: String) {
+        val canonical = canonicalProvider(providerId)
+        secretStore.storeSecret(secretKeyForProvider(canonical), apiKey, SecretCategory.LLM_API_KEY)
+
+        val updatedProfiles = (config.auth?.profiles.orEmpty()).toMutableMap()
+        if (updatedProfiles.values.none { canonicalProvider(it.provider) == canonical }) {
+            updatedProfiles[canonical] = AuthProfileConfig(provider = canonical, mode = "api-key")
+        }
+
+        val updatedConfig = config.copy(
+            auth = (config.auth ?: ai.openclaw.core.model.AuthConfig()).copy(
+                profiles = updatedProfiles,
+            ),
+        )
+        configManager.save(updatedConfig)
+        config = updatedConfig
+
+        initMutex.withLock {
+            registerProviders()
+            ensureGatewayServer(startGateway = true)
+            initialized = true
+        }
+    }
+
+    suspend fun clearApiKey(providerId: String) {
+        val canonical = canonicalProvider(providerId)
+        for (key in secretKeysForProvider(canonical)) {
+            secretStore.deleteSecret(key)
+        }
+
+        val updatedProfiles = (config.auth?.profiles.orEmpty())
+            .filterValues { canonicalProvider(it.provider) != canonical }
+        val updatedAuth = if (updatedProfiles.isEmpty()) null else {
+            (config.auth ?: ai.openclaw.core.model.AuthConfig()).copy(profiles = updatedProfiles)
+        }
+        val updatedConfig = config.copy(auth = updatedAuth)
+
+        configManager.save(updatedConfig)
+        config = updatedConfig
+
+        initMutex.withLock {
+            registerProviders()
+            ensureGatewayServer(startGateway = true)
+            initialized = true
+        }
+    }
+
+    fun defaultAgentId(): String {
+        return config.agents?.list
+            ?.firstOrNull { it.default == true }
+            ?.id
+            ?: config.agents?.list?.firstOrNull()?.id
+            ?: DEFAULT_AGENT_ID
+    }
+
+    fun preferredModelForAgent(agentId: String = defaultAgentId()): String? {
+        val agent = resolveAgentConfig(agentId)
+        return agent?.model?.primary
+            ?: config.agents?.defaults?.model?.primary
+            ?: resolveConfiguredDefaultModel()
+    }
+
+    fun currentToolNames(): List<String> = toolRegistry.names().sorted()
+
+    fun terminalWorkingDirectory(): String = context.filesDir.absolutePath
+
+    suspend fun authorizeToolInvocation(
+        toolName: String,
+        input: String,
+        agentId: String = defaultAgentId(),
+        sessionKey: String = "local:terminal",
+    ): String? {
+        val enforcer = ToolPolicyEnforcer(config, toolAuditor)
+        val policy = enforcer.check(toolName = toolName, agentId = agentId, sessionKey = sessionKey)
+        if (!policy.allowed) {
+            return "Blocked by tool policy: ${policy.reason ?: "not allowed"}"
+        }
+
+        return when (approvalManager.checkApproval(toolName, input, agentId, sessionKey)) {
+            ApprovalDecision.APPROVED -> null
+            ApprovalDecision.DENIED -> "Blocked: shell command was denied by approval policy"
+            ApprovalDecision.TIMED_OUT -> "Blocked: shell command timed out waiting for approval"
+        }
     }
 
     /**
@@ -200,18 +265,13 @@ class AgentEngine(private val context: Context) {
         conversationHistory: List<LlmMessage> = emptyList(),
         model: String? = null,
         systemPrompt: String? = null,
-    ): Flow<AcpRuntimeEvent> {
-        val effectiveModel = model
-            ?: resolveAgentEffectiveModelPrimary(config, DEFAULT_AGENT_ID)
-            ?: "claude-sonnet-4-5-20250514"
-
-        val provider = providerRegistry.resolveProvider(effectiveModel)
-            ?: providerRegistry.resolveProvider("anthropic/$effectiveModel")
-            ?: throw IllegalStateException("No provider found for model: $effectiveModel")
-
-        val runner = AgentRunner(
-            provider = provider,
-            toolRegistry = toolRegistry,
+        agentId: String? = null,
+        sessionKey: String = "",
+    ): Flow<AcpRuntimeEvent> = channelFlow {
+        val resolvedAgentId = agentId ?: defaultAgentId()
+        val modelChain = resolveModelChain(
+            agentId = resolvedAgentId,
+            requestedModel = model,
         )
 
         val messages = conversationHistory + LlmMessage(
@@ -220,25 +280,87 @@ class AgentEngine(private val context: Context) {
         )
 
         val effectiveSystemPrompt = systemPrompt
-            ?: config.agents?.list
-                ?.firstOrNull { it.default == true }
-                ?.identity?.name?.let { "You are $it." }
-            ?: "You are a helpful assistant."
+            ?: resolveSystemPrompt(resolvedAgentId)
 
-        return runner.runTurn(
-            messages = messages,
-            model = effectiveModel,
-            systemPrompt = effectiveSystemPrompt,
+        var lastRetryableError: AcpRuntimeEvent.Error? = null
+
+        for ((index, candidateModel) in modelChain.withIndex()) {
+            val routedModel = routeModelToProvider(candidateModel)
+            val provider = providerRegistry.resolveProvider(routedModel)
+            if (provider == null) {
+                lastRetryableError = AcpRuntimeEvent.Error(
+                    message = "No provider found for model: $routedModel",
+                    retryable = index < modelChain.lastIndex,
+                )
+                continue
+            }
+
+            val runner = AgentRunner(
+                provider = provider,
+                toolRegistry = toolRegistry,
+                approvalManager = approvalManager,
+                toolPolicyEnforcer = ToolPolicyEnforcer(config, toolAuditor),
+            )
+
+            var retryableFailure: AcpRuntimeEvent.Error? = null
+            var completed = false
+
+            runner.runTurn(
+                messages = messages,
+                model = routedModel,
+                systemPrompt = effectiveSystemPrompt,
+                sessionKey = sessionKey,
+                agentId = resolvedAgentId,
+                agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
+            ).collect { event ->
+                when (event) {
+                    is AcpRuntimeEvent.Error -> {
+                        val canRetry = (event.retryable == true) && index < modelChain.lastIndex
+                        if (canRetry) {
+                            retryableFailure = event
+                        } else {
+                            send(event)
+                        }
+                    }
+                    is AcpRuntimeEvent.Done -> {
+                        completed = true
+                        send(event)
+                    }
+                    else -> {
+                        if (retryableFailure == null) {
+                            send(event)
+                        }
+                    }
+                }
+            }
+
+            if (completed) {
+                return@channelFlow
+            }
+
+            if (retryableFailure != null) {
+                lastRetryableError = retryableFailure
+                if (index < modelChain.lastIndex) {
+                    send(
+                        AcpRuntimeEvent.Status(
+                            text = "Model '$routedModel' failed, retrying fallback model",
+                            tag = "model_fallback",
+                        ),
+                    )
+                    continue
+                }
+                send(retryableFailure)
+                return@channelFlow
+            }
+
+            return@channelFlow
+        }
+
+        send(
+            lastRetryableError ?: AcpRuntimeEvent.Error(
+                message = "No provider found for model chain: ${modelChain.joinToString(" -> ")}",
+            ),
         )
-    }
-
-    /**
-     * Resolve effective primary model using agent scope logic.
-     */
-    private fun resolveAgentEffectiveModelPrimary(config: OpenClawConfig, agentId: String): String? {
-        val agentConfig = config.agents?.list?.firstOrNull { it.id == agentId }
-        return agentConfig?.model?.primary
-            ?: config.agents?.defaults?.model?.primary
     }
 
     /**
@@ -248,6 +370,313 @@ class AgentEngine(private val context: Context) {
         cronScheduler.stop()
         channelManager.stopAll()
         pluginRegistry.stopAll()
-        scope.cancel()
+        gatewayServerInternal?.stop()
+        scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+    }
+
+    private suspend fun applyRuntimeConfiguration(
+        notifyPluginReload: Boolean,
+        startGateway: Boolean,
+    ) {
+        registerProviders()
+        registerTools()
+
+        if (!pluginsStarted) {
+            runCatching { pluginRegistry.startAll() }
+            pluginsStarted = true
+        } else if (notifyPluginReload) {
+            runCatching { pluginRegistry.notifyConfigReload() }
+        }
+
+        ensureGatewayServer(startGateway = startGateway)
+
+        if (!cronStarted) {
+            runCatching { cronScheduler.start() }
+            cronStarted = true
+        }
+    }
+
+    private suspend fun registerProviders() {
+        providerRegistry.clear()
+
+        val configured = config.models?.providers.orEmpty()
+        val covered = mutableSetOf<String>()
+
+        for ((providerId, providerConfig) in configured) {
+            val canonical = canonicalProvider(providerId)
+            registerProvider(canonical, providerConfig)
+            covered += canonical
+        }
+
+        // Always consider built-ins even when models.providers is empty.
+        val defaults = listOf("anthropic", "openai", "gemini", "ollama")
+        for (providerId in defaults) {
+            if (providerId !in covered) {
+                registerProvider(providerId, null)
+            }
+        }
+    }
+
+    private suspend fun registerProvider(
+        providerId: String,
+        providerConfig: ModelProviderConfig?,
+    ) {
+        when (providerId) {
+            "anthropic" -> {
+                val apiKey = resolveProviderApiKey(
+                    aliases = listOf("anthropic"),
+                    providerConfig = providerConfig,
+                ) ?: return
+                providerRegistry.register(
+                    AnthropicProvider(
+                        apiKey = apiKey,
+                        baseUrl = providerConfig?.baseUrl ?: "https://api.anthropic.com",
+                    ),
+                )
+            }
+
+            "openai" -> {
+                val apiKey = resolveProviderApiKey(
+                    aliases = listOf("openai"),
+                    providerConfig = providerConfig,
+                ) ?: return
+                providerRegistry.register(
+                    OpenAiProvider(
+                        apiKey = apiKey,
+                        baseUrl = providerConfig?.baseUrl ?: "https://api.openai.com/v1",
+                    ),
+                )
+            }
+
+            "gemini" -> {
+                val apiKey = resolveProviderApiKey(
+                    aliases = listOf("gemini", "google"),
+                    providerConfig = providerConfig,
+                ) ?: return
+                providerRegistry.register(
+                    GeminiProvider(
+                        apiKey = apiKey,
+                        baseUrl = providerConfig?.baseUrl
+                            ?: "https://generativelanguage.googleapis.com/v1beta",
+                    ),
+                )
+            }
+
+            "ollama" -> {
+                providerRegistry.register(
+                    OllamaProvider(
+                        baseUrl = providerConfig?.baseUrl ?: "http://localhost:11434",
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun resolveProviderApiKey(
+        aliases: List<String>,
+        providerConfig: ModelProviderConfig?,
+    ): String? {
+        resolveSecretInput(providerConfig?.apiKey)?.let { return it }
+
+        for (provider in aliases) {
+            for (secretKey in secretKeysForProvider(provider)) {
+                secretStore.getSecret(secretKey)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { return it }
+            }
+        }
+
+        val profiles = config.auth?.profiles.orEmpty()
+        for ((_, profile) in profiles) {
+            if (canonicalProvider(profile.provider) in aliases.map { canonicalProvider(it) }) {
+                resolveProfileApiKey(profile)?.let { return it }
+            }
+        }
+
+        for (provider in aliases) {
+            providerEnvVars(provider)
+                .firstNotNullOfOrNull { key -> System.getenv(key)?.takeIf { it.isNotBlank() } }
+                ?.let { return it }
+        }
+
+        return null
+    }
+
+    private suspend fun resolveProfileApiKey(profile: AuthProfileConfig): String? {
+        val canonical = canonicalProvider(profile.provider)
+        for (key in secretKeysForProvider(canonical) + "api_key_${profile.provider}") {
+            secretStore.getSecret(key)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
+        return null
+    }
+
+    private suspend fun resolveSecretInput(input: SecretInput?): String? {
+        if (input == null) return null
+        if (!input.value.isNullOrBlank()) return input.value
+        if (!input.env.isNullOrBlank()) {
+            System.getenv(input.env)?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        return null
+    }
+
+    private fun registerTools() {
+        toolRegistry.clear()
+
+        DeviceToolsModule.registerAll(
+            registry = toolRegistry,
+            context = context,
+            config = DeviceToolsConfig(
+                launchActivityClass = MainActivity::class.java,
+            ),
+        )
+
+        toolRegistry.register(CronTool(cronScheduler))
+
+        val skillExecutor = SkillExecutor()
+        toolRegistry.register(
+            SkillsTool(
+                skillExecutor = skillExecutor,
+                availableSkills = { emptyList<SkillDefinition>() },
+            ),
+        )
+    }
+
+    private fun ensureGatewayServer(startGateway: Boolean) {
+        val desiredHost = config.gateway?.customBindHost ?: DEFAULT_GATEWAY_HOST
+        val desiredPort = config.gateway?.port ?: DEFAULT_GATEWAY_PORT
+
+        val shouldReplace = gatewayServerInternal == null || gatewayHost != desiredHost || gatewayPort != desiredPort
+        if (shouldReplace) {
+            gatewayServerInternal?.stop()
+            gatewayHost = desiredHost
+            gatewayPort = desiredPort
+            gatewayServerInternal = buildGatewayServer()
+        }
+
+        val server = gatewayServerInternal ?: return
+        server.onChatSend = { params ->
+            sendMessage(
+                userMessage = params.text,
+                model = params.model,
+                agentId = params.agentId ?: defaultAgentId(),
+                sessionKey = params.sessionKey,
+            )
+        }
+
+        if (startGateway && !server.isRunning) {
+            runCatching { server.start() }
+        }
+    }
+
+    private fun buildGatewayServer(): GatewayServer {
+        return GatewayServer(
+            port = gatewayPort,
+            host = gatewayHost,
+            config = config,
+        )
+    }
+
+    private fun resolveSystemPrompt(agentId: String): String {
+        val agentIdentityName = resolveAgentConfig(agentId)?.identity?.name
+        return when {
+            !agentIdentityName.isNullOrBlank() -> "You are $agentIdentityName."
+            else -> "You are a helpful assistant."
+        }
+    }
+
+    private fun resolveModelChain(
+        agentId: String,
+        requestedModel: String?,
+    ): List<String> {
+        val agentConfig = resolveAgentConfig(agentId)
+        val defaults = config.agents?.defaults?.model
+
+        val chain = mutableListOf<String>()
+
+        if (!requestedModel.isNullOrBlank()) {
+            chain += requestedModel
+        } else {
+            agentConfig?.model?.primary?.let(chain::add)
+            defaults?.primary?.let(chain::add)
+            resolveConfiguredDefaultModel()?.let(chain::add)
+            chain += DEFAULT_MODEL_CANDIDATES
+        }
+
+        chain += agentConfig?.model?.fallbacks.orEmpty()
+        chain += defaults?.fallbacks.orEmpty()
+
+        return chain
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+    }
+
+    private fun resolveConfiguredDefaultModel(): String? {
+        val providers = config.models?.providers.orEmpty()
+        for ((providerId, providerConfig) in providers) {
+            val firstModel = providerConfig.models.firstOrNull()?.id ?: continue
+            val canonical = canonicalProvider(providerId)
+            return if ('/' in firstModel) firstModel else "$canonical/$firstModel"
+        }
+        return null
+    }
+
+    private fun routeModelToProvider(modelId: String): String {
+        if ('/' in modelId) return modelId
+        val providers = config.models?.providers.orEmpty()
+        for ((providerId, providerConfig) in providers) {
+            if (providerConfig.models.any { it.id == modelId }) {
+                return "${canonicalProvider(providerId)}/$modelId"
+            }
+        }
+        return modelId
+    }
+
+    private fun resolveAgentConfig(agentId: String): AgentConfig? {
+        return config.agents?.list?.firstOrNull { it.id == agentId }
+    }
+
+    private fun canonicalProvider(providerId: String): String {
+        return when (providerId.lowercase()) {
+            "google" -> "gemini"
+            else -> providerId.lowercase()
+        }
+    }
+
+    private fun providerEnvVars(providerId: String): List<String> {
+        return when (canonicalProvider(providerId)) {
+            "anthropic" -> listOf("ANTHROPIC_API_KEY")
+            "openai" -> listOf("OPENAI_API_KEY")
+            "gemini" -> listOf("GEMINI_API_KEY", "GOOGLE_API_KEY")
+            else -> emptyList()
+        }
+    }
+
+    private fun secretKeyForProvider(providerId: String): String {
+        return when (canonicalProvider(providerId)) {
+            "gemini" -> "api_key_gemini"
+            else -> "api_key_${canonicalProvider(providerId)}"
+        }
+    }
+
+    private fun secretKeysForProvider(providerId: String): List<String> {
+        return when (canonicalProvider(providerId)) {
+            "gemini" -> listOf("api_key_gemini", "api_key_google")
+            else -> listOf("api_key_${canonicalProvider(providerId)}")
+        }
+    }
+
+    companion object {
+        private const val DEFAULT_GATEWAY_PORT = 18789
+        private const val DEFAULT_GATEWAY_HOST = "127.0.0.1"
+
+        private val DEFAULT_MODEL_CANDIDATES = listOf(
+            "anthropic/claude-sonnet-4-5-20250514",
+            "openai/gpt-4o-mini",
+            "gemini/gemini-2.0-flash",
+            "ollama/llama3",
+        )
     }
 }

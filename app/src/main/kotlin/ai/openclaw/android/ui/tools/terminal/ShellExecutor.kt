@@ -6,27 +6,23 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import kotlin.coroutines.coroutineContext
 
 /**
- * Executes shell commands via ProcessBuilder on the Android device.
+ * Executes shell commands via ProcessBuilder.
  */
-class ShellExecutor {
-
+class ShellExecutor(
+    defaultWorkingDir: String = detectDefaultWorkingDir(),
+) {
+    private val processLock = Any()
     private var process: Process? = null
-    var workingDir: String = defaultWorkingDir()
 
-    companion object {
-        private fun defaultWorkingDir(): String {
-            val androidTmp = java.io.File("/data/local/tmp")
-            return if (androidTmp.isDirectory) "/data/local/tmp" else System.getProperty("user.dir") ?: "/tmp"
-        }
-    }
+    var workingDir: String = defaultWorkingDir
 
     private val shellPath: String
         get() {
-            // Use /system/bin/sh on Android, /bin/sh on JVM (for testing)
             val androidSh = java.io.File("/system/bin/sh")
             return if (androidSh.exists()) "/system/bin/sh" else "/bin/sh"
         }
@@ -37,7 +33,7 @@ class ShellExecutor {
             .directory(java.io.File(workingDir))
 
         val proc = pb.start()
-        process = proc
+        reserveProcess(proc)
 
         val reader = BufferedReader(InputStreamReader(proc.inputStream))
         try {
@@ -47,16 +43,50 @@ class ShellExecutor {
                 line = reader.readLine()
             }
         } finally {
-            reader.close()
-            proc.waitFor()
-            process = null
+            runCatching { reader.close() }
+            if (!coroutineContext.isActive && proc.isAlive) {
+                proc.destroyForcibly()
+            }
+            runCatching { proc.waitFor() }
+            clearProcess(proc)
         }
     }.flowOn(Dispatchers.IO)
 
     fun kill() {
-        process?.destroyForcibly()
-        process = null
+        synchronized(processLock) {
+            process?.destroyForcibly()
+            process = null
+        }
     }
 
-    fun isRunning(): Boolean = process?.isAlive == true
+    fun isRunning(): Boolean = synchronized(processLock) {
+        process?.isAlive == true
+    }
+
+    @Throws(IOException::class)
+    private fun reserveProcess(proc: Process) {
+        synchronized(processLock) {
+            if (process?.isAlive == true) {
+                proc.destroyForcibly()
+                throw IOException("Another command is already running")
+            }
+            process = proc
+        }
+    }
+
+    private fun clearProcess(proc: Process) {
+        synchronized(processLock) {
+            if (process == proc) {
+                process = null
+            }
+        }
+    }
+
+    companion object {
+        private fun detectDefaultWorkingDir(): String {
+            return System.getProperty("user.home")
+                ?: System.getProperty("user.dir")
+                ?: "/tmp"
+        }
+    }
 }

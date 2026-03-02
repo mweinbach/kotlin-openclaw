@@ -3,6 +3,7 @@ package ai.openclaw.runtime.providers
 import ai.openclaw.core.agent.LlmProvider
 import ai.openclaw.core.agent.LlmRequest
 import ai.openclaw.core.agent.LlmStreamEvent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
@@ -15,6 +16,12 @@ class ProviderRegistry {
     fun register(provider: LlmProvider) {
         providers[provider.id] = provider
     }
+
+    fun clear() {
+        providers.clear()
+    }
+
+    fun ids(): Set<String> = providers.keys
 
     fun get(providerId: String): LlmProvider? = providers[providerId]
 
@@ -52,14 +59,29 @@ class ProviderRegistry {
             }
 
             try {
+                var retryableError: LlmStreamEvent.Error? = null
+                var completed = false
                 provider.streamCompletion(request.copy(model = model)).collect { event ->
                     if (event is LlmStreamEvent.Error && event.retryable && model != models.last()) {
-                        lastError = event
+                        retryableError = event
                         return@collect
                     }
                     emit(event)
+                    if (event is LlmStreamEvent.Done) {
+                        completed = true
+                    }
                 }
-                return@flow // Success
+
+                if (retryableError != null && model != models.last()) {
+                    lastError = retryableError
+                    continue
+                }
+
+                if (completed || retryableError == null) {
+                    return@flow
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastError = LlmStreamEvent.Error(
                     message = "Provider ${provider.id} failed: ${e.message}",
