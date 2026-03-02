@@ -17,6 +17,7 @@ kotlin {
 dependencies {
     api(project(":core:core-model"))
     api(project(":core:core-config"))
+    implementation(libs.kotlinx.coroutines.core)
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
