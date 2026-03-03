@@ -19,6 +19,8 @@ import ai.openclaw.android.ui.components.SearchTopBar
 import ai.openclaw.android.ui.components.Status
 import ai.openclaw.android.ui.components.StatusIndicator
 import ai.openclaw.runtime.gateway.ChannelManager
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -31,6 +33,7 @@ fun ChannelsScreen(
     val channels by vm.channels.collectAsState()
     var searchQuery by remember { mutableStateOf("") }
     var fabMenuExpanded by remember { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
 
     val filtered = if (searchQuery.isBlank()) {
         channels
@@ -66,6 +69,7 @@ fun ChannelsScreen(
             ) {
                 FloatingActionButtonMenuItem(
                     onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         fabMenuExpanded = false
                         onAddChannel()
                     },
@@ -95,7 +99,11 @@ fun ChannelsScreen(
                 items(filtered, key = { it.key }) { item ->
                     ChannelRow(
                         item = item,
-                        onClick = { onChannelClick(item.key) },
+                        onClick = { 
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onChannelClick(item.key) 
+                        },
+                        modifier = Modifier.animateItem()
                     )
                 }
             }
@@ -107,9 +115,10 @@ fun ChannelsScreen(
 private fun ChannelRow(
     item: ChannelsViewModel.ChannelUiItem,
     onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     ListItem(
-        modifier = Modifier.clickable(onClick = onClick),
+        modifier = modifier.clickable(onClick = onClick),
         headlineContent = {
             Text(
                 text = item.name,

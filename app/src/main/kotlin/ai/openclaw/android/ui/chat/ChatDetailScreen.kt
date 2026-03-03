@@ -14,6 +14,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import ai.openclaw.android.AgentEngine
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.foundation.shape.RoundedCornerShape
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -28,6 +32,7 @@ fun ChatDetailScreen(
     )
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val haptic = LocalHapticFeedback.current
 
     // Load session if existing
     LaunchedEffect(sessionId) {
@@ -99,8 +104,14 @@ fun ChatDetailScreen(
                     .fillMaxWidth(),
                 contentPadding = PaddingValues(vertical = 8.dp),
             ) {
-                items(viewModel.messages) { message ->
-                    MessageBubble(message = message)
+                items(
+                    items = viewModel.messages,
+                    key = { it.hashCode() }
+                ) { message ->
+                    MessageBubble(
+                        message = message,
+                        modifier = Modifier.animateItem()
+                    )
                 }
 
                 // Loading indicator when waiting for first token
@@ -122,41 +133,53 @@ fun ChatDetailScreen(
             HorizontalDivider()
 
             // Input row
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                tonalElevation = 2.dp,
+                shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
             ) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Type a message...") },
-                    singleLine = false,
-                    maxLines = 4,
-                    enabled = !viewModel.isLoading,
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                IconButton(
-                    onClick = {
-                        val text = inputText.trim()
-                        if (text.isNotEmpty()) {
-                            viewModel.sendMessage(text)
-                            inputText = ""
-                        }
-                    },
-                    enabled = inputText.isNotBlank() && !viewModel.isLoading,
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send",
-                        tint = if (inputText.isNotBlank() && !viewModel.isLoading) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                        },
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Type a message...") },
+                        singleLine = false,
+                        maxLines = 4,
+                        enabled = !viewModel.isLoading,
+                        shape = RoundedCornerShape(24.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f),
+                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        )
                     )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    
+                    val canSend = inputText.isNotBlank() && !viewModel.isLoading
+                    
+                    FilledIconButton(
+                        onClick = {
+                            val text = inputText.trim()
+                            if (text.isNotEmpty()) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                viewModel.sendMessage(text)
+                                inputText = ""
+                            }
+                        },
+                        enabled = canSend,
+                        shape = CircleShape,
+                        modifier = Modifier.size(52.dp)
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.Send,
+                            contentDescription = "Send",
+                        )
+                    }
                 }
             }
         }

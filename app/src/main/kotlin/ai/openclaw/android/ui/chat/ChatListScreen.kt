@@ -22,6 +22,9 @@ import ai.openclaw.runtime.engine.SessionPersistence
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.foundation.shape.RoundedCornerShape
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -34,6 +37,7 @@ fun ChatListScreen(
     val sessions by viewModel.sessions.collectAsState()
     val headers by viewModel.sessionHeaders.collectAsState()
     var fabMenuExpanded by remember { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
 
     LaunchedEffect(Unit) {
         viewModel.refreshSessions()
@@ -67,6 +71,7 @@ fun ChatListScreen(
             ) {
                 FloatingActionButtonMenuItem(
                     onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         fabMenuExpanded = false
                         onNewChat()
                     },
@@ -99,8 +104,15 @@ fun ChatListScreen(
                     SessionCard(
                         sessionId = sessionId,
                         header = header,
-                        onClick = { onSessionClick(sessionId) },
-                        onDelete = { viewModel.deleteSession(sessionId) },
+                        onClick = { 
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSessionClick(sessionId) 
+                        },
+                        onDelete = { 
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            viewModel.deleteSession(sessionId) 
+                        },
+                        modifier = Modifier.animateItem()
                     )
                 }
             }
@@ -115,10 +127,13 @@ private fun SessionCard(
     header: SessionPersistence.SessionHeader?,
     onClick: () -> Unit,
     onDelete: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
+    val haptic = LocalHapticFeedback.current
     val dismissState = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
             if (value == SwipeToDismissBoxValue.EndToStart) {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                 onDelete()
                 true
             } else {
@@ -129,6 +144,7 @@ private fun SessionCard(
 
     SwipeToDismissBox(
         state = dismissState,
+        modifier = modifier,
         backgroundContent = {
             Box(
                 modifier = Modifier
@@ -148,6 +164,10 @@ private fun SessionCard(
         Card(
             onClick = onClick,
             modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+            )
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(

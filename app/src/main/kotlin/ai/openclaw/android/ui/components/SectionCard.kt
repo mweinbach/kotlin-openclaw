@@ -7,6 +7,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.shape.RoundedCornerShape
 
 @Composable
 fun SectionCard(
@@ -20,7 +22,12 @@ fun SectionCard(
     Card(
         modifier = modifier
             .fillMaxWidth()
+            .animateContentSize()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainer
+        )
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(

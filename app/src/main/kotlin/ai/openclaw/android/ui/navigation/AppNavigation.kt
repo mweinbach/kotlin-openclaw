@@ -12,6 +12,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import ai.openclaw.android.AgentEngine
 import ai.openclaw.android.ui.chat.ChatDetailScreen
 import ai.openclaw.android.ui.chat.ChatListScreen
@@ -46,6 +48,7 @@ fun AppNavigation(engine: AgentEngine) {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
+    val haptic = LocalHapticFeedback.current
 
     NavigationSuiteScaffold(
         navigationSuiteItems = {
@@ -61,6 +64,7 @@ fun AppNavigation(engine: AgentEngine) {
                     label = { Text(item.label) },
                     selected = selected,
                     onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         navController.navigate(item.route) {
                             popUpTo(navController.graph.findStartDestination().id) {
                                 saveState = true

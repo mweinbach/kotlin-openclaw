@@ -22,6 +22,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.slideInVertically
 import androidx.lifecycle.viewmodel.compose.viewModel
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
@@ -33,6 +39,12 @@ fun DashboardScreen(engine: AgentEngine) {
     val state by viewModel.state.collectAsState()
     val scrollState = rememberScrollState()
     var toolbarExpanded by remember { mutableStateOf(true) }
+    var contentVisible by remember { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
+
+    LaunchedEffect(Unit) {
+        contentVisible = true
+    }
 
     LaunchedEffect(scrollState.isScrollInProgress) {
         toolbarExpanded = !scrollState.isScrollInProgress
@@ -43,7 +55,10 @@ fun DashboardScreen(engine: AgentEngine) {
             TopAppBar(
                 title = { Text("Dashboard") },
                 actions = {
-                    IconButton(onClick = { viewModel.refresh() }) {
+                    IconButton(onClick = { 
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        viewModel.refresh() 
+                    }) {
                         Icon(
                             imageVector = Icons.Default.Refresh,
                             contentDescription = "Refresh",
@@ -58,14 +73,18 @@ fun DashboardScreen(engine: AgentEngine) {
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp)
-                    .verticalScroll(scrollState),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+            AnimatedVisibility(
+                visible = contentVisible,
+                enter = fadeIn(tween(400)) + slideInVertically(tween(400), initialOffsetY = { it / 4 }),
             ) {
-                Spacer(modifier = Modifier.height(4.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 16.dp)
+                        .verticalScroll(scrollState),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Spacer(modifier = Modifier.height(4.dp))
 
                 // Gateway Card
                 SectionCard(
@@ -148,6 +167,7 @@ fun DashboardScreen(engine: AgentEngine) {
                 // Extra space for floating toolbar
                 Spacer(modifier = Modifier.height(72.dp))
             }
+            }
 
             HorizontalFloatingToolbar(
                 expanded = toolbarExpanded,
@@ -156,17 +176,26 @@ fun DashboardScreen(engine: AgentEngine) {
                     .padding(16.dp),
                 floatingActionButton = {
                     FloatingToolbarDefaults.VibrantFloatingActionButton(
-                        onClick = { viewModel.refresh() },
+                        onClick = { 
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            viewModel.refresh() 
+                        },
                     ) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh")
                     }
                 },
                 floatingActionButtonPosition = FloatingToolbarHorizontalFabPosition.End,
             ) {
-                IconButton(onClick = { viewModel.reloadConfig() }) {
+                IconButton(onClick = { 
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    viewModel.reloadConfig() 
+                }) {
                     Icon(Icons.Default.Sync, contentDescription = "Reload Config")
                 }
-                IconButton(onClick = { viewModel.clearSessions() }) {
+                IconButton(onClick = { 
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    viewModel.clearSessions() 
+                }) {
                     Icon(Icons.Default.DeleteSweep, contentDescription = "Clear Sessions")
                 }
             }
