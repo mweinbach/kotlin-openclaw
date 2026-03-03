@@ -1,6 +1,7 @@
 package ai.openclaw.runtime.engine
 
 import ai.openclaw.core.agent.LlmMessage
+import ai.openclaw.core.agent.LlmContentBlock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import java.io.File
@@ -35,6 +36,7 @@ class SessionPersistence(
         val name: String? = null,
         val toolCallId: String? = null,
         val toolCalls: List<ToolCallEntry>? = null,
+        val contentBlocks: List<ContentBlockEntry>? = null,
         val timestamp: Long = System.currentTimeMillis(),
     )
 
@@ -43,6 +45,14 @@ class SessionPersistence(
         val id: String,
         val name: String,
         val arguments: String,
+    )
+
+    @Serializable
+    data class ContentBlockEntry(
+        val type: String,
+        val text: String? = null,
+        val url: String? = null,
+        val mimeType: String? = null,
     )
 
     /**
@@ -157,18 +167,38 @@ class SessionPersistence(
             toolCalls = entry.toolCalls?.map {
                 ai.openclaw.core.agent.LlmToolCall(it.id, it.name, it.arguments)
             },
+            contentBlocks = entry.contentBlocks?.mapNotNull { block ->
+                when (block.type) {
+                    "text" -> block.text?.let { LlmContentBlock.Text(it) }
+                    "image_url" -> block.url?.let { LlmContentBlock.ImageUrl(url = it, mimeType = block.mimeType) }
+                    else -> null
+                }
+            }?.takeIf { it.isNotEmpty() },
         )
     }
 
     private fun messageToEntry(message: LlmMessage): SessionMessageEntry {
         return SessionMessageEntry(
             role = message.role.name.lowercase(),
-            content = message.content,
+            content = message.plainTextContent(),
             name = message.name,
             toolCallId = message.toolCallId,
             toolCalls = message.toolCalls?.map {
                 ToolCallEntry(it.id, it.name, it.arguments)
             },
+            contentBlocks = message.contentBlocks?.mapNotNull { block ->
+                when (block) {
+                    is LlmContentBlock.Text -> ContentBlockEntry(
+                        type = "text",
+                        text = block.text,
+                    )
+                    is LlmContentBlock.ImageUrl -> ContentBlockEntry(
+                        type = "image_url",
+                        url = block.url,
+                        mimeType = block.mimeType,
+                    )
+                }
+            }?.takeIf { it.isNotEmpty() },
         )
     }
 }

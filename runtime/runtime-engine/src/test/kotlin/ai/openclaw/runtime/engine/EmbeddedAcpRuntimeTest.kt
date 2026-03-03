@@ -2,6 +2,12 @@ package ai.openclaw.runtime.engine
 
 import ai.openclaw.core.agent.*
 import ai.openclaw.core.model.*
+import ai.openclaw.core.plugins.HookRunner
+import ai.openclaw.core.plugins.LlmInputEvent
+import ai.openclaw.core.plugins.PluginHookAgentContext
+import ai.openclaw.core.plugins.PluginHookName
+import ai.openclaw.core.plugins.PluginHookRegistration
+import ai.openclaw.core.plugins.PluginRegistry
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.runTest
@@ -19,8 +25,10 @@ class EmbeddedAcpRuntimeTest {
         private val response: String = "Hello",
     ) : LlmProvider {
         override val id = "fake"
+        val requestedModels = mutableListOf<String>()
 
         override fun streamCompletion(request: LlmRequest): Flow<LlmStreamEvent> = flow {
+            requestedModels += request.model
             if (delayMs > 0) delay(delayMs)
             emit(LlmStreamEvent.TextDelta(response))
             emit(LlmStreamEvent.Done("end_turn"))
@@ -200,5 +208,78 @@ class EmbeddedAcpRuntimeTest {
         assertTrue(events.any { it is AcpRuntimeEvent.Error })
         val error = events.filterIsInstance<AcpRuntimeEvent.Error>().first()
         assertTrue(error.message.contains("No session"))
+    }
+
+    @Test
+    fun `ensureSession uses model from env when provided`() = runTest {
+        val provider = FakeLlmProvider(response = "ok")
+        val runtime = EmbeddedAcpRuntime {
+            AgentRunner(provider = provider)
+        }
+
+        val handle = runtime.ensureSession(
+            AcpRuntimeEnsureInput(
+                sessionKey = "env-model-test",
+                agent = "main",
+                mode = AcpRuntimeSessionMode.PERSISTENT,
+                env = mapOf("model" to "openai/gpt-4o-mini"),
+            ),
+        )
+
+        runtime.runTurn(
+            AcpRuntimeTurnInput(
+                handle = handle,
+                text = "Hello",
+                mode = AcpRuntimePromptMode.PROMPT,
+                requestId = "req-env-model",
+            ),
+        ).toList()
+
+        assertTrue(provider.requestedModels.contains("openai/gpt-4o-mini"))
+    }
+
+    @Test
+    fun `runTurn forwards requestId as hook runId`() = runTest {
+        var capturedRunId: String? = null
+        val registry = PluginRegistry().apply {
+            registerHook(
+                PluginHookRegistration<suspend (LlmInputEvent, PluginHookAgentContext) -> Unit>(
+                    pluginId = "hook-llm-input-run-id",
+                    hookName = PluginHookName.LLM_INPUT,
+                    handler = { event, _ ->
+                        capturedRunId = event.runId
+                    },
+                ),
+            )
+        }
+        val runtime = EmbeddedAcpRuntime {
+            AgentRunner(
+                provider = FakeLlmProvider(response = "ok"),
+                hookRunner = HookRunner(registry),
+            )
+        }
+
+        val handle = runtime.ensureSession(
+            AcpRuntimeEnsureInput(
+                sessionKey = "run-id-forwarding",
+                agent = "main",
+                mode = AcpRuntimeSessionMode.PERSISTENT,
+            ),
+        )
+
+        runtime.runTurn(
+            AcpRuntimeTurnInput(
+                handle = handle,
+                text = "Hello",
+                mode = AcpRuntimePromptMode.PROMPT,
+                requestId = "req-forwarded-123",
+            ),
+        ).toList()
+
+        repeat(50) {
+            if (capturedRunId != null) return@repeat
+            delay(20)
+        }
+        assertEquals("req-forwarded-123", capturedRunId)
     }
 }

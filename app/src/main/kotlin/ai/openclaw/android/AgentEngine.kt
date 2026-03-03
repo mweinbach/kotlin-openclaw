@@ -16,6 +16,10 @@ import ai.openclaw.core.model.ModelProviderConfig
 import ai.openclaw.core.model.OpenClawConfig
 import ai.openclaw.core.model.SecretInput
 import ai.openclaw.core.model.DEFAULT_AGENT_ID
+import ai.openclaw.core.plugins.BeforeAgentStartEvent
+import ai.openclaw.core.plugins.BeforeModelResolveEvent
+import ai.openclaw.core.plugins.HookRunner
+import ai.openclaw.core.plugins.PluginHookAgentContext
 import ai.openclaw.core.plugins.PluginRegistry
 import ai.openclaw.core.security.ApprovalDecision
 import ai.openclaw.core.security.ApprovalManager
@@ -33,12 +37,15 @@ import ai.openclaw.runtime.devices.DeviceToolsConfig
 import ai.openclaw.runtime.devices.DeviceToolsModule
 import ai.openclaw.runtime.engine.AgentRunner
 import ai.openclaw.runtime.engine.ContextGuard
+import ai.openclaw.runtime.engine.EmbeddedRunParams
+import ai.openclaw.runtime.engine.EmbeddedTurnContext
 import ai.openclaw.runtime.engine.SessionPersistence
 import ai.openclaw.runtime.engine.SkillDefinition
 import ai.openclaw.runtime.engine.SkillExecutor
 import ai.openclaw.runtime.engine.SkillResolver
 import ai.openclaw.runtime.engine.SkillsTool
 import ai.openclaw.runtime.engine.SystemPromptBuilder
+import ai.openclaw.runtime.engine.ToolLoopDetector
 import ai.openclaw.runtime.engine.ToolRegistry
 import ai.openclaw.runtime.gateway.ChannelManager
 import ai.openclaw.runtime.gateway.GatewayServer
@@ -59,6 +66,7 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Central engine wiring all OpenClaw subsystems together.
@@ -79,6 +87,9 @@ class AgentEngine(private val context: Context) {
 
     val providerRegistry = ProviderRegistry()
     val pluginRegistry = PluginRegistry()
+    private val hookRunner: HookRunner by lazy { HookRunner(pluginRegistry) }
+    private val sessionToolLoopDetectors = ConcurrentHashMap<String, ToolLoopDetector>()
+    private val sessionHookSessionIds = ConcurrentHashMap<String, String>()
     val toolRegistry = ToolRegistry()
     val codexOauthEvents: SharedFlow<String> = _codexOauthEvents.asSharedFlow()
 
@@ -486,15 +497,65 @@ class AgentEngine(private val context: Context) {
         sessionKey: String = "",
     ): Flow<AcpRuntimeEvent> = channelFlow {
         val resolvedAgentId = agentId ?: defaultAgentId()
+        val channelContext = buildChannelContext(sessionKey)
+        val promptSkills = buildPromptSkillSummaries()
+        val hookSessionKey = sessionKey.trim().ifEmpty { "__default__" }
+        val hookSessionId = sessionHookSessionIds.computeIfAbsent(hookSessionKey) {
+            java.util.UUID.randomUUID().toString()
+        }
+        val hookContext = PluginHookAgentContext(
+            agentId = resolvedAgentId,
+            sessionKey = sessionKey.takeIf { it.isNotBlank() },
+            sessionId = hookSessionId,
+            workspaceDir = terminalWorkingDirectory(),
+            messageProvider = channelContext?.channelId,
+            trigger = "user",
+            channelId = channelContext?.channelId,
+        )
+        val modelResolve = try {
+            hookRunner.runBeforeModelResolve(
+                event = BeforeModelResolveEvent(prompt = userMessage),
+                ctx = hookContext,
+            )
+        } catch (err: Throwable) {
+            logHookWarning("before_model_resolve hook failed: ${err.message}")
+            null
+        }
+        val legacyModelResolve = try {
+            hookRunner.runBeforeAgentStart(
+                event = BeforeAgentStartEvent(prompt = userMessage),
+                ctx = hookContext,
+            )
+        } catch (err: Throwable) {
+            logHookWarning("before_agent_start hook (legacy model resolve path) failed: ${err.message}")
+            null
+        }
+        val mergedModelOverride = if (modelResolve?.modelOverride != null) {
+            modelResolve.modelOverride
+        } else {
+            legacyModelResolve?.modelOverride
+        }
+        val mergedProviderOverride = if (modelResolve?.providerOverride != null) {
+            modelResolve.providerOverride
+        } else {
+            legacyModelResolve?.providerOverride
+        }
+        val hookModelOverride = mergedModelOverride?.takeIf { it.isNotEmpty() }
+        val hookProviderOverride = mergedProviderOverride?.takeIf { it.isNotEmpty() }
+        val requestedModel = applyModelOverride(
+            baseModel = applyProviderOverride(model, hookProviderOverride) ?: model,
+            modelOverride = hookModelOverride,
+        )
         val modelChain = resolveModelChain(
             agentId = resolvedAgentId,
-            requestedModel = model,
+            requestedModel = requestedModel,
         )
 
         val messages = conversationHistory + LlmMessage(
             role = LlmMessage.Role.USER,
             content = userMessage,
         )
+        val turnRunId = java.util.UUID.randomUUID().toString()
 
         var lastRetryableError: AcpRuntimeEvent.Error? = null
 
@@ -516,20 +577,35 @@ class AgentEngine(private val context: Context) {
                 contextGuard = ContextGuard(),
                 approvalManager = approvalManager,
                 toolPolicyEnforcer = ToolPolicyEnforcer(config, toolAuditor),
+                toolLoopDetector = resolveToolLoopDetector(sessionKey),
+                hookRunner = hookRunner,
             )
 
             var retryableFailure: AcpRuntimeEvent.Error? = null
             var completed = false
 
             runner.runTurn(
-                messages = messages,
-                model = routedModel,
-                systemPrompt = systemPrompt,
-                sessionKey = sessionKey,
-                agentId = resolvedAgentId,
-                agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
-                runtimeInfo = buildRuntimeInfo(),
-                workspaceDir = terminalWorkingDirectory(),
+                EmbeddedRunParams(
+                    messages = messages,
+                    model = routedModel,
+                    runId = turnRunId,
+                    systemPrompt = systemPrompt,
+                    sessionKey = sessionKey,
+                    agentId = resolvedAgentId,
+                    agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
+                    channelContext = channelContext,
+                    skills = promptSkills,
+                    runtimeInfo = buildRuntimeInfo(),
+                    workspaceDir = terminalWorkingDirectory(),
+                    hookSessionId = hookSessionId,
+                    legacyBeforeAgentStartResult = legacyModelResolve,
+                    turnContext = EmbeddedTurnContext(
+                        trigger = "user",
+                        messageProvider = channelContext?.channelId,
+                        channelId = channelContext?.channelId,
+                        sessionId = hookSessionId,
+                    ),
+                ),
             ).collect { event ->
                 when (event) {
                     is AcpRuntimeEvent.Error -> {
@@ -596,6 +672,7 @@ class AgentEngine(private val context: Context) {
         notifyPluginReload: Boolean,
         startGateway: Boolean,
     ) {
+        sessionToolLoopDetectors.clear()
         registerProviders()
         registerTools()
 
@@ -930,6 +1007,57 @@ class AgentEngine(private val context: Context) {
 
     private fun resolveConfiguredDefaultModel(): String? {
         return availableModelIdsForEnabledProviders().firstOrNull()
+    }
+
+    private fun buildPromptSkillSummaries(): List<SystemPromptBuilder.SkillSummary> {
+        val resolver = SkillResolver(config = config.skills)
+        val resolved = resolver.resolveSkills()
+        return resolver.buildSkillSummaries(resolved)
+    }
+
+    private fun buildChannelContext(sessionKey: String): SystemPromptBuilder.ChannelContext? {
+        val channelId = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return null
+        return SystemPromptBuilder.ChannelContext(channelId = channelId)
+    }
+
+    private fun applyProviderOverride(requestedModel: String?, providerOverride: String?): String? {
+        val provider = providerOverride?.takeIf { it.isNotEmpty() } ?: return requestedModel
+        val normalizedProvider = canonicalProvider(provider)
+        val current = requestedModel?.trim()?.takeIf { it.isNotEmpty() }
+        if (current != null) {
+            val modelName = current.substringAfter("/", current)
+            return "$normalizedProvider/$modelName"
+        }
+        return availableModelIdsForEnabledProviders()
+            .firstOrNull { modelId ->
+                canonicalProvider(modelId.substringBefore("/", missingDelimiterValue = modelId)) == normalizedProvider
+            }
+    }
+
+    private fun applyModelOverride(baseModel: String?, modelOverride: String?): String? {
+        val override = modelOverride?.takeIf { it.isNotEmpty() } ?: return baseModel
+        if (override.contains("/")) {
+            return override
+        }
+        val current = baseModel?.trim()?.takeIf { it.isNotEmpty() } ?: return override
+        val providerPrefix = current.substringBefore("/", missingDelimiterValue = "").trim()
+        return if (providerPrefix.isNotEmpty()) {
+            "${canonicalProvider(providerPrefix)}/$override"
+        } else {
+            override
+        }
+    }
+
+    private fun resolveToolLoopDetector(sessionKey: String): ToolLoopDetector {
+        val loopConfig = config.tools?.loopDetection
+        val key = sessionKey.trim().ifEmpty { "__default__" }
+        return sessionToolLoopDetectors.computeIfAbsent(key) {
+            ToolLoopDetector(loopConfig)
+        }
+    }
+
+    private fun logHookWarning(message: String) {
+        System.err.println("[AgentEngine] $message")
     }
 
     private fun routeModelToProvider(modelId: String): String {

@@ -27,14 +27,44 @@ sealed class LlmStreamEvent {
 /**
  * A message in the conversation history sent to the LLM.
  */
+sealed interface LlmContentBlock {
+    data class Text(val text: String) : LlmContentBlock
+    data class ImageUrl(
+        val url: String,
+        val mimeType: String? = null,
+    ) : LlmContentBlock
+}
+
 data class LlmMessage(
     val role: Role,
-    val content: String,
+    val content: String = "",
     val name: String? = null,
     val toolCallId: String? = null,
     val toolCalls: List<LlmToolCall>? = null,
+    val contentBlocks: List<LlmContentBlock>? = null,
 ) {
     enum class Role { SYSTEM, USER, ASSISTANT, TOOL }
+
+    fun normalizedContentBlocks(): List<LlmContentBlock> {
+        if (!contentBlocks.isNullOrEmpty()) return contentBlocks
+        return if (content.isNotEmpty()) {
+            listOf(LlmContentBlock.Text(content))
+        } else {
+            emptyList()
+        }
+    }
+
+    fun plainTextContent(): String {
+        if (!contentBlocks.isNullOrEmpty()) {
+            return contentBlocks.joinToString("\n") { block ->
+                when (block) {
+                    is LlmContentBlock.Text -> block.text
+                    is LlmContentBlock.ImageUrl -> "[image] ${block.url}"
+                }
+            }.trim()
+        }
+        return content
+    }
 }
 
 data class LlmToolCall(

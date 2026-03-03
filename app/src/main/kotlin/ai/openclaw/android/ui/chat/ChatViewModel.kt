@@ -78,17 +78,17 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
             currentModelId = header?.model ?: engine.preferredModelForAgent(currentAgentId)
             conversationHistory.clear()
             conversationHistory.addAll(loadedMessages)
-            messages = loadedMessages.mapNotNull { msg ->
-                when (msg.role) {
-                    LlmMessage.Role.USER -> ChatMessage(role = "user", content = msg.content)
-                    LlmMessage.Role.ASSISTANT -> ChatMessage(
-                        role = "assistant",
-                        content = msg.content,
-                        toolCalls = msg.toolCalls?.map { it.name } ?: emptyList(),
-                    )
-                    else -> null
+                messages = loadedMessages.mapNotNull { msg ->
+                    when (msg.role) {
+                        LlmMessage.Role.USER -> ChatMessage(role = "user", content = msg.plainTextContent())
+                        LlmMessage.Role.ASSISTANT -> ChatMessage(
+                            role = "assistant",
+                            content = msg.plainTextContent(),
+                            toolCalls = msg.toolCalls?.map { it.name } ?: emptyList(),
+                        )
+                        else -> null
+                    }
                 }
-            }
         }
     }
 
@@ -179,11 +179,6 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                                 content = finalContent,
                             )
                             conversationHistory.add(assistantMessage)
-                            currentSessionId?.let { sid ->
-                                withContext(Dispatchers.IO) {
-                                    engine.sessionPersistence.appendMessage(sid, assistantMessage)
-                                }
-                            }
                             isLoading = false
                         }
                         is AcpRuntimeEvent.Error -> {

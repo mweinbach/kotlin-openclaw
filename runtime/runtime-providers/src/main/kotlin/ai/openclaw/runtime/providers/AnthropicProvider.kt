@@ -39,6 +39,7 @@ class AnthropicProvider(
                         LlmMessage.Role.ASSISTANT -> "assistant"
                         else -> "user"
                     })
+                    val blocks = msg.normalizedContentBlocks()
                     // Build content blocks
                     val toolCalls = msg.toolCalls
                     if (msg.toolCallId != null) {
@@ -47,13 +48,30 @@ class AnthropicProvider(
                             addJsonObject {
                                 put("type", "tool_result")
                                 put("tool_use_id", msg.toolCallId)
-                                put("content", msg.content)
+                                put("content", msg.plainTextContent())
                             }
                         }
                     } else if (!toolCalls.isNullOrEmpty()) {
                         // Assistant message with tool calls
                         putJsonArray("content") {
-                            if (msg.content.isNotEmpty()) {
+                            if (blocks.isNotEmpty()) {
+                                for (block in blocks) {
+                                    when (block) {
+                                        is LlmContentBlock.Text -> {
+                                            addJsonObject {
+                                                put("type", "text")
+                                                put("text", block.text)
+                                            }
+                                        }
+                                        is LlmContentBlock.ImageUrl -> {
+                                            addJsonObject {
+                                                put("type", "text")
+                                                put("text", "[image] ${block.url}")
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if (msg.content.isNotEmpty()) {
                                 addJsonObject {
                                     put("type", "text")
                                     put("text", msg.content)
@@ -69,7 +87,24 @@ class AnthropicProvider(
                             }
                         }
                     } else {
-                        put("content", msg.content)
+                        if (blocks.isNotEmpty()) {
+                            putJsonArray("content") {
+                                for (block in blocks) {
+                                    when (block) {
+                                        is LlmContentBlock.Text -> addJsonObject {
+                                            put("type", "text")
+                                            put("text", block.text)
+                                        }
+                                        is LlmContentBlock.ImageUrl -> addJsonObject {
+                                            put("type", "text")
+                                            put("text", "[image] ${block.url}")
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            put("content", msg.content)
+                        }
                     }
                 }
             }

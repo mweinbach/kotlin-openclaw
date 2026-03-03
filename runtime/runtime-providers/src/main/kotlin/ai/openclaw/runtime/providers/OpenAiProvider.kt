@@ -50,7 +50,31 @@ class OpenAiProvider(
                         LlmMessage.Role.TOOL -> "tool"
                         else -> "user"
                     })
-                    put("content", msg.content)
+                    val blocks = msg.normalizedContentBlocks()
+                    if (msg.role == LlmMessage.Role.USER && blocks.isNotEmpty()) {
+                        putJsonArray("content") {
+                            for (block in blocks) {
+                                when (block) {
+                                    is LlmContentBlock.Text -> {
+                                        addJsonObject {
+                                            put("type", "text")
+                                            put("text", block.text)
+                                        }
+                                    }
+                                    is LlmContentBlock.ImageUrl -> {
+                                        addJsonObject {
+                                            put("type", "image_url")
+                                            putJsonObject("image_url") {
+                                                put("url", block.url)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        put("content", msg.plainTextContent())
+                    }
                     if (msg.toolCallId != null) {
                         put("tool_call_id", msg.toolCallId)
                     }
@@ -202,10 +226,10 @@ class OpenAiProvider(
         }
 
         // Emit accumulated tool calls
-        for ((_, builder) in toolCallBuilders.entries.sortedBy { it.key }) {
+        for ((index, builder) in toolCallBuilders.entries.sortedBy { it.key }) {
             if (builder.name.isNotEmpty()) {
                 emit(LlmStreamEvent.ToolUse(
-                    id = builder.id,
+                    id = builder.id.ifBlank { "call_auto_${index + 1}" },
                     name = builder.name,
                     input = builder.arguments.toString().ifEmpty { "{}" },
                 ))

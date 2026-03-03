@@ -127,6 +127,7 @@ class AcpSessionManager(
         text: String,
         mode: AcpRuntimePromptMode = AcpRuntimePromptMode.PROMPT,
         requestId: String = java.util.UUID.randomUUID().toString(),
+        context: AcpRuntimeTurnContext? = null,
     ): Flow<AcpRuntimeEvent> = flow {
         val handle = sessionStore.get(sessionKey)
             ?: throw IllegalStateException("No session found for key: $sessionKey")
@@ -136,6 +137,7 @@ class AcpSessionManager(
             text = text,
             mode = mode,
             requestId = requestId,
+            context = context,
         )
 
         runtime.runTurn(input).collect { event ->

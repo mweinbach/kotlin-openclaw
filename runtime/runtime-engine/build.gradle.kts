@@ -1,6 +1,5 @@
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.serialization)
 }
 
@@ -29,6 +28,7 @@ dependencies {
     api(project(":core:core-config"))
     api(project(":core:core-session"))
     api(project(":core:core-security"))
+    api(project(":core:core-plugins"))
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)

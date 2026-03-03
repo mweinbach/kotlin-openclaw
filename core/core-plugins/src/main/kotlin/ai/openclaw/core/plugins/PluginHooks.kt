@@ -63,6 +63,8 @@ data class PluginHookAgentContext(
     val sessionId: String? = null,
     val workspaceDir: String? = null,
     val messageProvider: String? = null,
+    val trigger: String? = null,
+    val channelId: String? = null,
 )
 
 data class PluginHookMessageContext(
@@ -74,7 +76,10 @@ data class PluginHookMessageContext(
 data class PluginHookToolContext(
     val agentId: String? = null,
     val sessionKey: String? = null,
+    val sessionId: String? = null,
+    val runId: String? = null,
     val toolName: String,
+    val toolCallId: String? = null,
 )
 
 data class PluginHookSessionContext(
@@ -105,6 +110,7 @@ data class BeforeModelResolveResult(
 
 data class BeforePromptBuildEvent(
     val prompt: String,
+    val messages: List<Any?> = emptyList(),
 )
 
 data class BeforePromptBuildResult(
@@ -114,6 +120,7 @@ data class BeforePromptBuildResult(
 
 data class BeforeAgentStartEvent(
     val prompt: String,
+    val messages: List<Any?>? = null,
 )
 
 data class BeforeAgentStartResult(
@@ -130,6 +137,7 @@ data class LlmInputEvent(
     val model: String,
     val systemPrompt: String? = null,
     val prompt: String,
+    val historyMessages: List<Any?> = emptyList(),
     val imagesCount: Int = 0,
 )
 
@@ -139,6 +147,7 @@ data class LlmOutputEvent(
     val provider: String,
     val model: String,
     val assistantTexts: List<String>,
+    val lastAssistant: Any? = null,
     val usage: LlmUsage? = null,
 )
 
@@ -154,6 +163,7 @@ data class AgentEndEvent(
     val success: Boolean,
     val error: String? = null,
     val durationMs: Long? = null,
+    val messages: List<Any?> = emptyList(),
 )
 
 data class BeforeCompactionEvent(
@@ -203,6 +213,8 @@ data class MessageSentEvent(
 data class BeforeToolCallEvent(
     val toolName: String,
     val params: Map<String, Any?>,
+    val runId: String? = null,
+    val toolCallId: String? = null,
 )
 
 data class BeforeToolCallResult(
@@ -214,6 +226,8 @@ data class BeforeToolCallResult(
 data class AfterToolCallEvent(
     val toolName: String,
     val params: Map<String, Any?>,
+    val runId: String? = null,
+    val toolCallId: String? = null,
     val result: Any? = null,
     val error: String? = null,
     val durationMs: Long? = null,

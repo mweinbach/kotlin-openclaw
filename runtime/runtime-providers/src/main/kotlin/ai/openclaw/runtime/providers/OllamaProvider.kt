@@ -46,7 +46,7 @@ class OllamaProvider(
                         LlmMessage.Role.TOOL -> "tool"
                         else -> "user"
                     })
-                    put("content", msg.content)
+                    put("content", msg.plainTextContent())
                     if (msg.toolCallId != null) {
                         put("tool_call_id", msg.toolCallId)
                     }
@@ -122,6 +122,7 @@ class OllamaProvider(
         // Ollama's /v1/chat/completions endpoint is OpenAI-compatible
         val json = Json { ignoreUnknownKeys = true }
         var stopReason: String? = null
+        val toolCallBuilders = mutableMapOf<Int, ToolCallBuilder>()
 
         for (data in reader.sseEvents()) {
             try {
@@ -136,6 +137,18 @@ class OllamaProvider(
                         val content = delta["content"]?.jsonPrimitive?.contentOrNull
                         if (content != null) {
                             emit(LlmStreamEvent.TextDelta(content))
+                        }
+                        val toolCalls = delta["tool_calls"]?.jsonArray
+                        if (toolCalls != null) {
+                            for (tc in toolCalls) {
+                                val tcObj = tc.jsonObject
+                                val index = tcObj["index"]?.jsonPrimitive?.intOrNull ?: 0
+                                val builder = toolCallBuilders.getOrPut(index) { ToolCallBuilder() }
+                                tcObj["id"]?.jsonPrimitive?.contentOrNull?.let { builder.id = it }
+                                val fn = tcObj["function"]?.jsonObject
+                                fn?.get("name")?.jsonPrimitive?.contentOrNull?.let { builder.name = it }
+                                fn?.get("arguments")?.jsonPrimitive?.contentOrNull?.let { builder.arguments.append(it) }
+                            }
                         }
                     }
 
@@ -157,6 +170,22 @@ class OllamaProvider(
             }
         }
 
+        for ((index, builder) in toolCallBuilders.entries.sortedBy { it.key }) {
+            if (builder.name.isNotEmpty()) {
+                emit(LlmStreamEvent.ToolUse(
+                    id = builder.id.ifBlank { "call_auto_${index + 1}" },
+                    name = builder.name,
+                    input = builder.arguments.toString().ifEmpty { "{}" },
+                ))
+            }
+        }
+
         emit(LlmStreamEvent.Done(stopReason = stopReason ?: "stop"))
+    }
+
+    private class ToolCallBuilder {
+        var id: String = ""
+        var name: String = ""
+        val arguments = StringBuilder()
     }
 }

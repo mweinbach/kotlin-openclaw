@@ -41,6 +41,7 @@ class GeminiProvider(
                         LlmMessage.Role.ASSISTANT -> "model"
                         else -> "user"
                     })
+                    val blocks = msg.normalizedContentBlocks()
                     putJsonArray("parts") {
                         if (msg.toolCallId != null) {
                             // Function response — use the stored tool name, fall back to toolCallId
@@ -48,7 +49,7 @@ class GeminiProvider(
                                 putJsonObject("functionResponse") {
                                     put("name", msg.name ?: msg.toolCallId ?: "tool_result")
                                     putJsonObject("response") {
-                                        put("result", msg.content)
+                                        put("result", msg.plainTextContent())
                                     }
                                 }
                             }
@@ -64,7 +65,18 @@ class GeminiProvider(
                                     }
                                 }
                             }
-                            if (msg.content.isNotEmpty()) {
+                            if (blocks.isNotEmpty()) {
+                                for (block in blocks) {
+                                    when (block) {
+                                        is LlmContentBlock.Text -> {
+                                            addJsonObject { put("text", block.text) }
+                                        }
+                                        is LlmContentBlock.ImageUrl -> {
+                                            addJsonObject { put("text", "[image] ${block.url}") }
+                                        }
+                                    }
+                                }
+                            } else if (msg.content.isNotEmpty()) {
                                 addJsonObject { put("text", msg.content) }
                             }
                         }
@@ -147,6 +159,8 @@ class GeminiProvider(
     ) {
         val json = Json { ignoreUnknownKeys = true }
         var stopReason = "stop"
+        var emittedText = ""
+        val collectedToolCalls = mutableListOf<ToolCallSnapshot>()
 
         for (data in reader.sseEvents()) {
             try {
@@ -157,22 +171,52 @@ class GeminiProvider(
                     val content = candidate["content"]?.jsonObject
                     val parts = content?.get("parts")?.jsonArray
 
+                    val chunkTextBuilder = StringBuilder()
+                    val chunkToolCalls = mutableListOf<ToolCallSnapshot>()
+
                     if (parts != null) {
                         for (part in parts) {
                             val partObj = part.jsonObject
                             val text = partObj["text"]?.jsonPrimitive?.contentOrNull
                             if (text != null) {
-                                emit(LlmStreamEvent.TextDelta(text))
+                                chunkTextBuilder.append(text)
                             }
                             val functionCall = partObj["functionCall"]?.jsonObject
                             if (functionCall != null) {
                                 val name = functionCall["name"]?.jsonPrimitive?.contentOrNull ?: ""
                                 val args = functionCall["args"]?.toString() ?: "{}"
-                                emit(LlmStreamEvent.ToolUse(
-                                    id = "gemini_${name}_${toolCallCounter.incrementAndGet()}",
-                                    name = name,
-                                    input = args,
-                                ))
+                                if (name.isNotBlank()) {
+                                    chunkToolCalls += ToolCallSnapshot(name = name, args = args)
+                                }
+                            }
+                        }
+                    }
+
+                    val chunkText = chunkTextBuilder.toString()
+                    if (chunkText.isNotEmpty()) {
+                        if (chunkText.startsWith(emittedText)) {
+                            val delta = chunkText.substring(emittedText.length)
+                            if (delta.isNotEmpty()) emit(LlmStreamEvent.TextDelta(delta))
+                            emittedText = chunkText
+                        } else {
+                            emit(LlmStreamEvent.TextDelta(chunkText))
+                            emittedText += chunkText
+                        }
+                    }
+
+                    if (chunkToolCalls.isNotEmpty()) {
+                        if (
+                            chunkToolCalls.size >= collectedToolCalls.size &&
+                            chunkToolCalls.take(collectedToolCalls.size) == collectedToolCalls
+                        ) {
+                            collectedToolCalls += chunkToolCalls.drop(collectedToolCalls.size)
+                        } else if (collectedToolCalls.isEmpty()) {
+                            collectedToolCalls += chunkToolCalls
+                        } else {
+                            for (call in chunkToolCalls) {
+                                if (call !in collectedToolCalls) {
+                                    collectedToolCalls += call
+                                }
                             }
                         }
                     }
@@ -196,8 +240,23 @@ class GeminiProvider(
             }
         }
 
+        for (toolCall in collectedToolCalls) {
+            emit(
+                LlmStreamEvent.ToolUse(
+                    id = "gemini_${toolCall.name}_${toolCallCounter.incrementAndGet()}",
+                    name = toolCall.name,
+                    input = toolCall.args,
+                ),
+            )
+        }
+
         emit(LlmStreamEvent.Done(stopReason = stopReason))
     }
+
+    private data class ToolCallSnapshot(
+        val name: String,
+        val args: String,
+    )
 
     companion object {
         /** Atomic counter for generating unique tool call IDs across all Gemini requests. */

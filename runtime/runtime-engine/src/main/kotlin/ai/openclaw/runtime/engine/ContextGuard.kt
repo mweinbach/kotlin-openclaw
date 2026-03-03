@@ -20,7 +20,7 @@ class ContextGuard(
         var total = 0
         for (msg in messages) {
             val charsPerToken = if (msg.role == LlmMessage.Role.TOOL) TOOL_CHARS_PER_TOKEN else GENERAL_CHARS_PER_TOKEN
-            total += (msg.content.length / charsPerToken).toInt()
+            total += (msg.plainTextContent().length / charsPerToken).toInt()
             // Tool calls add schema overhead
             msg.toolCalls?.forEach { tc ->
                 total += (tc.arguments.length / TOOL_CHARS_PER_TOKEN).toInt() + 20

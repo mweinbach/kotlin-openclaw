@@ -64,6 +64,15 @@ data class AcpRuntimeTurnInput(
     val text: String,
     val mode: AcpRuntimePromptMode,
     val requestId: String,
+    val context: AcpRuntimeTurnContext? = null,
+)
+
+@Serializable
+data class AcpRuntimeTurnContext(
+    val trigger: String? = null,
+    val messageProvider: String? = null,
+    val channelId: String? = null,
+    val sessionId: String? = null,
 )
 
 @Serializable
