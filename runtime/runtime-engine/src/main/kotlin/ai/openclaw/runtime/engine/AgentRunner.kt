@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 import java.util.UUID
 
@@ -226,6 +227,12 @@ class AgentRunner(
             currentMessages = contextGuard.limitHistoryTurns(currentMessages, maxHistoryTurns).toMutableList()
             currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
 
+            val latestUserMessage = currentMessages.lastOrNull { it.role == LlmMessage.Role.USER }
+            val promptImageCount = latestUserMessage
+                ?.normalizedContentBlocks()
+                ?.count { it is LlmContentBlock.ImageUrl }
+                ?: 0
+
             hookDispatchScope.launch(start = CoroutineStart.UNDISPATCHED) {
                 runCatching {
                     hookRunner?.runLlmInput(
@@ -235,9 +242,9 @@ class AgentRunner(
                             provider = provider.id,
                             model = effectiveModel,
                             systemPrompt = effectiveSystemPrompt,
-                            prompt = currentMessages.lastOrNull { it.role == LlmMessage.Role.USER }?.plainTextContent().orEmpty(),
+                            prompt = latestUserMessage?.plainTextContent().orEmpty(),
                             historyMessages = currentMessages.map { it.toHookMessagePayload() },
-                            imagesCount = 0,
+                            imagesCount = promptImageCount,
                         ),
                         ctx = PluginHookAgentContext(
                             agentId = agentId,
@@ -861,8 +868,8 @@ class AgentRunner(
     private fun LlmMessage.toHookMessagePayload(): Map<String, Any?> = buildMap {
         put("role", role.name.lowercase())
         put("content", plainTextContent())
-        val blocks = contentBlocks
-        if (!blocks.isNullOrEmpty()) {
+        val blocks = normalizedContentBlocks()
+        if (blocks.isNotEmpty()) {
             put(
                 "contentBlocks",
                 blocks.map { block ->
@@ -943,6 +950,7 @@ class EmbeddedAcpRuntime(
         val model: String,
         val hookSessionId: String = UUID.randomUUID().toString(),
         var runner: AgentRunner,
+        val turnMutex: kotlinx.coroutines.sync.Mutex = kotlinx.coroutines.sync.Mutex(),
         @Volatile var activeJob: kotlinx.coroutines.Job? = null,
     )
 
@@ -977,9 +985,6 @@ class EmbeddedAcpRuntime(
                 emit(AcpRuntimeEvent.Error(message = "No session: ${input.handle.sessionKey}"))
             }
 
-        // Cancel any in-flight turn for this session (supports new message during processing)
-        session.activeJob?.cancel()
-
         val userMessage = LlmMessage(
             role = LlmMessage.Role.USER,
             content = input.text,
@@ -987,23 +992,25 @@ class EmbeddedAcpRuntime(
 
         return kotlinx.coroutines.flow.channelFlow {
             val job = runtimeScope.launch {
-                session.runner.runTurn(
-                    EmbeddedRunParams(
-                        messages = listOf(userMessage),
-                        model = session.model,
-                        runId = input.requestId,
-                        sessionKey = session.sessionKey,
-                        agentId = session.agentId,
-                        hookSessionId = input.context?.sessionId ?: session.hookSessionId,
-                        turnContext = EmbeddedTurnContext(
-                            trigger = input.context?.trigger,
-                            messageProvider = input.context?.messageProvider,
-                            channelId = input.context?.channelId,
-                            sessionId = input.context?.sessionId,
+                session.turnMutex.withLock {
+                    session.runner.runTurn(
+                        EmbeddedRunParams(
+                            messages = listOf(userMessage),
+                            model = session.model,
+                            runId = input.requestId,
+                            sessionKey = session.sessionKey,
+                            agentId = session.agentId,
+                            hookSessionId = input.context?.sessionId ?: session.hookSessionId,
+                            turnContext = EmbeddedTurnContext(
+                                trigger = input.context?.trigger,
+                                messageProvider = input.context?.messageProvider,
+                                channelId = input.context?.channelId,
+                                sessionId = input.context?.sessionId,
+                            ),
                         ),
-                    ),
-                ).collect { event ->
-                    send(event)
+                    ).collect { event ->
+                        send(event)
+                    }
                 }
             }
             session.activeJob = job

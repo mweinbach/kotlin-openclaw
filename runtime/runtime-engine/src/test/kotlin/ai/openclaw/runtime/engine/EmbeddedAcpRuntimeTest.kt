@@ -11,6 +11,7 @@ import ai.openclaw.core.plugins.PluginRegistry
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.test.runTest
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -35,6 +36,28 @@ class EmbeddedAcpRuntimeTest {
         }
 
         override fun supportsModel(modelId: String) = true
+    }
+
+    private class ConcurrencyTrackingProvider(
+        private val delayMs: Long = 200,
+    ) : LlmProvider {
+        override val id: String = "concurrency"
+        private val activeCalls = AtomicInteger(0)
+        val maxConcurrentCalls = AtomicInteger(0)
+
+        override fun streamCompletion(request: LlmRequest): Flow<LlmStreamEvent> = flow {
+            val inFlight = activeCalls.incrementAndGet()
+            maxConcurrentCalls.updateAndGet { current -> maxOf(current, inFlight) }
+            try {
+                delay(delayMs)
+                emit(LlmStreamEvent.TextDelta("ok"))
+                emit(LlmStreamEvent.Done("end_turn"))
+            } finally {
+                activeCalls.decrementAndGet()
+            }
+        }
+
+        override fun supportsModel(modelId: String): Boolean = true
     }
 
     private fun createRuntime(
@@ -281,5 +304,62 @@ class EmbeddedAcpRuntimeTest {
             delay(20)
         }
         assertEquals("req-forwarded-123", capturedRunId)
+    }
+
+    @Test
+    fun `runTurn calls are serialized per session and do not implicitly cancel active turn`() = runTest {
+        val provider = ConcurrencyTrackingProvider(delayMs = 250)
+        val runtime = EmbeddedAcpRuntime {
+            AgentRunner(provider = provider)
+        }
+
+        val handle = runtime.ensureSession(
+            AcpRuntimeEnsureInput(
+                sessionKey = "serialized-turns",
+                agent = "main",
+                mode = AcpRuntimeSessionMode.PERSISTENT,
+            ),
+        )
+
+        val firstEvents = mutableListOf<AcpRuntimeEvent>()
+        val secondEvents = mutableListOf<AcpRuntimeEvent>()
+
+        val firstJob = launch(Dispatchers.Default) {
+            runtime.runTurn(
+                AcpRuntimeTurnInput(
+                    handle = handle,
+                    text = "first",
+                    mode = AcpRuntimePromptMode.PROMPT,
+                    requestId = "req-serialized-1",
+                ),
+            ).toList(firstEvents)
+        }
+
+        delay(25)
+
+        val secondJob = launch(Dispatchers.Default) {
+            runtime.runTurn(
+                AcpRuntimeTurnInput(
+                    handle = handle,
+                    text = "second",
+                    mode = AcpRuntimePromptMode.PROMPT,
+                    requestId = "req-serialized-2",
+                ),
+            ).toList(secondEvents)
+        }
+
+        withContext(Dispatchers.Default) {
+            withTimeout(10_000) {
+                firstJob.join()
+                secondJob.join()
+            }
+        }
+
+        assertEquals(1, provider.maxConcurrentCalls.get())
+        assertTrue(firstEvents.any { it is AcpRuntimeEvent.TextDelta })
+        assertTrue(secondEvents.any { it is AcpRuntimeEvent.TextDelta })
+        assertTrue(
+            firstEvents.filterIsInstance<AcpRuntimeEvent.Done>().none { it.stopReason == "cancelled" },
+        )
     }
 }

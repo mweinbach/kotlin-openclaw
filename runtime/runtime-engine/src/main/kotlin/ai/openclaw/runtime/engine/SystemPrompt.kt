@@ -82,6 +82,9 @@ class SystemPromptBuilder {
     }
 
     fun build(config: PromptConfig): String {
+        if (config.mode == PromptMode.NONE) {
+            return "You are a personal assistant running inside OpenClaw."
+        }
         val sectionPlan = listOf(
             PromptSection("identity", render = { cfg -> buildIdentitySection(cfg.agentIdentity) }),
             PromptSection(
@@ -97,7 +100,7 @@ class SystemPromptBuilder {
             PromptSection(
                 "skills",
                 enabled = { cfg -> cfg.mode != PromptMode.NONE && cfg.skills.isNotEmpty() },
-                render = { cfg -> buildSkillsSection(cfg.skills) },
+                render = { cfg -> buildSkillsSection(cfg.skills, resolveReadToolName(cfg.tools)) },
             ),
             PromptSection(
                 "channel",
@@ -123,6 +126,10 @@ class SystemPromptBuilder {
             ),
         )
         return renderSections(config, sectionPlan)
+    }
+
+    private fun resolveReadToolName(tools: List<ToolSummary>): String {
+        return tools.firstOrNull { it.name.equals("read", ignoreCase = true) }?.name ?: "read"
     }
 
     fun buildEmbedded(config: EmbeddedPromptConfig): String {
@@ -211,15 +218,25 @@ class SystemPromptBuilder {
         }
     }
 
-    private fun buildSkillsSection(skills: List<SkillSummary>): String {
+    private fun buildSkillsSection(
+        skills: List<SkillSummary>,
+        readToolName: String,
+    ): String {
         return buildString {
             append("# Skills\n")
-            append("You have access to the following skills. Follow their instructions when the user invokes them.\n\n")
+            append("## Skills (mandatory)\n")
+            append("Before replying: scan <available_skills> <description> entries.\n")
+            append("- If exactly one skill clearly applies: read its SKILL.md with `$readToolName`, then follow it.\n")
+            append("- If multiple could apply: choose the most specific one, then read/follow it.\n")
+            append("- If none clearly apply: do not read any SKILL.md.\n")
+            append("Constraints: never read more than one skill up front; only read after selecting.\n\n")
+            append("<available_skills>\n")
             for (skill in skills) {
                 append("## ${skill.name}\n")
-                append("${skill.description}\n\n")
+                append("<description>${skill.description}</description>\n")
                 append("${skill.prompt}\n\n")
             }
+            append("</available_skills>")
         }
     }
 

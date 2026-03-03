@@ -1,6 +1,7 @@
 package ai.openclaw.runtime.engine
 
 import ai.openclaw.core.agent.AgentTool
+import ai.openclaw.core.agent.LlmContentBlock
 import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.agent.LlmProvider
 import ai.openclaw.core.agent.LlmRequest
@@ -185,5 +186,46 @@ class AgentRunnerLifecycleHookParityTest {
         }
 
         assertEquals(1, llmInputCalls)
+    }
+
+    @Test
+    fun `llm input hook receives prompt image count from latest user blocks`() = runTest {
+        var capturedImagesCount: Int? = null
+        val registry = PluginRegistry().apply {
+            registerHook(
+                PluginHookRegistration<suspend (LlmInputEvent, PluginHookAgentContext) -> Unit>(
+                    pluginId = "hook-llm-input-images",
+                    hookName = PluginHookName.LLM_INPUT,
+                    handler = { event, _ ->
+                        capturedImagesCount = event.imagesCount
+                    },
+                ),
+            )
+        }
+
+        val runner = AgentRunner(
+            provider = OneShotProvider(),
+            hookRunner = HookRunner(registry),
+        )
+
+        runner.runTurn(
+            messages = listOf(
+                LlmMessage(
+                    role = LlmMessage.Role.USER,
+                    contentBlocks = listOf(
+                        LlmContentBlock.Text("describe this image"),
+                        LlmContentBlock.ImageUrl("https://example.com/demo.png"),
+                    ),
+                ),
+            ),
+            model = "test-model",
+            sessionKey = "agent:main:direct:user-hooks",
+        ).toList()
+
+        repeat(50) {
+            if (capturedImagesCount != null) return@repeat
+            delay(20)
+        }
+        assertEquals(1, capturedImagesCount)
     }
 }

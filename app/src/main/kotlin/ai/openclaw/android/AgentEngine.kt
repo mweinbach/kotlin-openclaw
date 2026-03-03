@@ -495,9 +495,18 @@ class AgentEngine(private val context: Context) {
         systemPrompt: String? = null,
         agentId: String? = null,
         sessionKey: String = "",
+        messageProvider: String? = null,
+        messageChannelId: String? = null,
+        messageAccountId: String? = null,
     ): Flow<AcpRuntimeEvent> = channelFlow {
         val resolvedAgentId = agentId ?: defaultAgentId()
-        val channelContext = buildChannelContext(sessionKey)
+        val effectiveMessageProvider = messageProvider?.trim()?.takeIf { it.isNotEmpty() }
+        val effectiveChannelId = messageChannelId?.trim()?.takeIf { it.isNotEmpty() } ?: effectiveMessageProvider
+        val effectiveAccountId = messageAccountId?.trim()?.takeIf { it.isNotEmpty() }
+        val channelContext = buildChannelContext(
+            channelId = effectiveChannelId,
+            accountId = effectiveAccountId,
+        )
         val promptSkills = buildPromptSkillSummaries()
         val hookSessionKey = sessionKey.trim().ifEmpty { "__default__" }
         val hookSessionId = sessionHookSessionIds.computeIfAbsent(hookSessionKey) {
@@ -508,9 +517,9 @@ class AgentEngine(private val context: Context) {
             sessionKey = sessionKey.takeIf { it.isNotBlank() },
             sessionId = hookSessionId,
             workspaceDir = terminalWorkingDirectory(),
-            messageProvider = channelContext?.channelId,
+            messageProvider = effectiveMessageProvider,
             trigger = "user",
-            channelId = channelContext?.channelId,
+            channelId = effectiveChannelId,
         )
         val modelResolve = try {
             hookRunner.runBeforeModelResolve(
@@ -601,8 +610,8 @@ class AgentEngine(private val context: Context) {
                     legacyBeforeAgentStartResult = legacyModelResolve,
                     turnContext = EmbeddedTurnContext(
                         trigger = "user",
-                        messageProvider = channelContext?.channelId,
-                        channelId = channelContext?.channelId,
+                        messageProvider = effectiveMessageProvider,
+                        channelId = effectiveChannelId,
                         sessionId = hookSessionId,
                     ),
                 ),
@@ -939,6 +948,9 @@ class AgentEngine(private val context: Context) {
                 model = params.model,
                 agentId = params.agentId ?: defaultAgentId(),
                 sessionKey = params.sessionKey,
+                messageProvider = params.channel,
+                messageChannelId = params.channel,
+                messageAccountId = params.accountId,
             )
         }
 
@@ -1015,9 +1027,15 @@ class AgentEngine(private val context: Context) {
         return resolver.buildSkillSummaries(resolved)
     }
 
-    private fun buildChannelContext(sessionKey: String): SystemPromptBuilder.ChannelContext? {
-        val channelId = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return null
-        return SystemPromptBuilder.ChannelContext(channelId = channelId)
+    private fun buildChannelContext(
+        channelId: String?,
+        accountId: String? = null,
+    ): SystemPromptBuilder.ChannelContext? {
+        val resolvedChannelId = channelId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return SystemPromptBuilder.ChannelContext(
+            channelId = resolvedChannelId,
+            accountId = accountId?.trim()?.takeIf { it.isNotEmpty() },
+        )
     }
 
     private fun applyProviderOverride(requestedModel: String?, providerOverride: String?): String? {
@@ -1159,7 +1177,6 @@ class AgentEngine(private val context: Context) {
             arch = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
             host = android.os.Build.MODEL,
             timezone = java.util.TimeZone.getDefault().id,
-            currentTime = java.time.LocalDateTime.now().toString(),
         )
     }
 
