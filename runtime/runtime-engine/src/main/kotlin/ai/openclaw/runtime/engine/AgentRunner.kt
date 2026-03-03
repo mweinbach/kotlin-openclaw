@@ -60,8 +60,11 @@ class AgentRunner(
     private val toolPolicyEnforcer: ToolPolicyEnforcer? = null,
 ) {
     /**
-     * Run a single turn: message → LLM → tool calls → loop → done.
+     * Run a single turn: message -> LLM -> tool calls -> loop -> done.
      * Returns a Flow of AcpRuntimeEvents for streaming.
+     *
+     * Tool calls from a single LLM response are accumulated into one assistant message,
+     * then executed sequentially with all results appended as individual tool messages.
      */
     fun runTurn(
         messages: List<LlmMessage>,
@@ -71,6 +74,9 @@ class AgentRunner(
         agentId: String = DEFAULT_AGENT_ID,
         agentIdentity: IdentityConfig? = null,
         channelContext: SystemPromptBuilder.ChannelContext? = null,
+        skills: List<SystemPromptBuilder.SkillSummary> = emptyList(),
+        runtimeInfo: SystemPromptBuilder.RuntimeInfo? = null,
+        workspaceDir: String? = null,
         maxHistoryTurns: Int? = null,
     ): Flow<AcpRuntimeEvent> = flow {
         // Build system prompt if not provided
@@ -78,7 +84,10 @@ class AgentRunner(
             SystemPromptBuilder.PromptConfig(
                 agentIdentity = agentIdentity,
                 tools = toolRegistry.toSummaries(),
+                skills = skills,
+                runtimeInfo = runtimeInfo,
                 channelContext = channelContext,
+                workspaceDir = workspaceDir,
                 modelId = model,
                 provider = provider.id,
             )
@@ -88,9 +97,17 @@ class AgentRunner(
         var currentMessages = if (sessionPersistence != null && sessionPersistence.exists(sessionKey)) {
             val (_, history) = sessionPersistence.load(sessionKey)
             val combined = history.toMutableList()
-            // Add new messages that aren't already in history
+            // Add new messages that aren't already in history.
+            // Use structural identity (role + content + toolCallId + toolCall IDs) to avoid
+            // dropping legitimately repeated user messages while still preventing true duplicates.
             for (msg in messages) {
-                if (combined.none { it.content == msg.content && it.role == msg.role }) {
+                val isDuplicate = combined.any { existing ->
+                    existing.role == msg.role &&
+                        existing.content == msg.content &&
+                        existing.toolCallId == msg.toolCallId &&
+                        existing.toolCalls?.map { it.id } == msg.toolCalls?.map { it.id }
+                }
+                if (!isDuplicate) {
                     combined.add(msg)
                 }
             }
@@ -120,8 +137,11 @@ class AgentRunner(
                 systemPrompt = effectiveSystemPrompt,
             )
 
-            var hasToolUse = false
+            // --- Phase 1: Stream the full LLM response, collecting tool calls ---
             val textBuffer = StringBuilder()
+            val pendingToolCalls = mutableListOf<LlmStreamEvent.ToolUse>()
+            var streamError: LlmStreamEvent.Error? = null
+            var stopReason: String? = null
 
             provider.streamCompletion(request).collect { event ->
                 when (event) {
@@ -136,67 +156,12 @@ class AgentRunner(
                         ))
                     }
                     is LlmStreamEvent.ToolUse -> {
-                        hasToolUse = true
+                        pendingToolCalls.add(event)
                         emit(AcpRuntimeEvent.ToolCall(
                             text = "Calling ${event.name}",
                             toolCallId = event.id,
                             title = event.name,
                         ))
-
-                        // Check tool policy enforcement first
-                        val policyResult = toolPolicyEnforcer?.check(event.name, agentId, sessionKey)
-                        val policyAllowed = policyResult?.allowed != false
-
-                        // Check approval before execution
-                        val approvalDecision = if (policyAllowed && approvalManager != null) {
-                            emit(AcpRuntimeEvent.Status(
-                                text = "Checking approval for ${event.name}",
-                                tag = "approval_check",
-                            ))
-                            approvalManager.checkApproval(event.name, event.input, agentId, sessionKey)
-                        } else {
-                            ApprovalDecision.APPROVED
-                        }
-
-                        // Execute tool with context guard (only if policy + approval pass)
-                        val tool = toolRegistry.get(event.name)
-                        val rawResult = when {
-                            !policyAllowed ->
-                                "Error: Tool '${event.name}' denied by policy: ${policyResult?.reason}"
-                            approvalDecision == ApprovalDecision.DENIED ->
-                                "Error: Tool call '${event.name}' was denied by approval policy."
-                            approvalDecision == ApprovalDecision.TIMED_OUT ->
-                                "Error: Tool call '${event.name}' timed out waiting for approval."
-                            tool != null -> {
-                                try {
-                                    tool.execute(event.input, ToolContext(sessionKey, agentId))
-                                } catch (e: Exception) {
-                                    "Error: ${e.message}"
-                                }
-                            }
-                            else -> "Error: Unknown tool '${event.name}'"
-                        }
-                        // Guard tool result size
-                        val result = contextGuard.guardToolResult(rawResult, currentMessages)
-
-                        // Add assistant message with tool call and tool result
-                        currentMessages.add(LlmMessage(
-                            role = LlmMessage.Role.ASSISTANT,
-                            content = textBuffer.toString(),
-                            toolCalls = listOf(LlmToolCall(event.id, event.name, event.input)),
-                        ))
-                        currentMessages.add(LlmMessage(
-                            role = LlmMessage.Role.TOOL,
-                            content = result,
-                            toolCallId = event.id,
-                        ))
-                        textBuffer.clear()
-
-                        // Persist tool interactions
-                        if (sessionPersistence != null) {
-                            sessionPersistence.appendMessage(sessionKey, currentMessages[currentMessages.size - 2])
-                            sessionPersistence.appendMessage(sessionKey, currentMessages[currentMessages.size - 1])
-                        }
                     }
                     is LlmStreamEvent.Usage -> {
                         emit(AcpRuntimeEvent.Status(
@@ -206,30 +171,67 @@ class AgentRunner(
                         ))
                     }
                     is LlmStreamEvent.Done -> {
-                        if (!hasToolUse) {
-                            // Persist final assistant response
-                            if (sessionPersistence != null && textBuffer.isNotEmpty()) {
-                                sessionPersistence.appendMessage(sessionKey, LlmMessage(
-                                    role = LlmMessage.Role.ASSISTANT,
-                                    content = textBuffer.toString(),
-                                ))
-                            }
-                            emit(AcpRuntimeEvent.Done(stopReason = event.stopReason))
-                        }
+                        stopReason = event.stopReason
                     }
                     is LlmStreamEvent.Error -> {
-                        emit(AcpRuntimeEvent.Error(
-                            message = event.message,
-                            code = event.code,
-                            retryable = event.retryable,
-                        ))
-                        aborted = true
+                        streamError = event
                     }
                 }
             }
 
-            // If no tool use or error, we're done
-            if (!hasToolUse || aborted) return@flow
+            // Handle stream error
+            if (streamError != null) {
+                emit(AcpRuntimeEvent.Error(
+                    message = streamError!!.message,
+                    code = streamError!!.code,
+                    retryable = streamError!!.retryable,
+                ))
+                aborted = true
+                return@flow
+            }
+
+            // --- Phase 2: Execute tool calls (if any) ---
+            if (pendingToolCalls.isNotEmpty()) {
+                // Add a single assistant message with ALL tool calls from this response
+                val assistantMsg = LlmMessage(
+                    role = LlmMessage.Role.ASSISTANT,
+                    content = textBuffer.toString(),
+                    toolCalls = pendingToolCalls.map {
+                        LlmToolCall(it.id, it.name, it.input)
+                    },
+                )
+                currentMessages.add(assistantMsg)
+                sessionPersistence?.appendMessage(sessionKey, assistantMsg)
+
+                // Execute each tool and add individual result messages
+                for (tc in pendingToolCalls) {
+                    val rawResult = executeTool(
+                        toolCall = tc,
+                        agentId = agentId,
+                        sessionKey = sessionKey,
+                    )
+                    val result = contextGuard.guardToolResult(rawResult, currentMessages)
+
+                    val toolMsg = LlmMessage(
+                        role = LlmMessage.Role.TOOL,
+                        content = result,
+                        toolCallId = tc.id,
+                        name = tc.name,
+                    )
+                    currentMessages.add(toolMsg)
+                    sessionPersistence?.appendMessage(sessionKey, toolMsg)
+                }
+            } else {
+                // No tool calls — persist final assistant text and finish
+                if (textBuffer.isNotEmpty()) {
+                    sessionPersistence?.appendMessage(sessionKey, LlmMessage(
+                        role = LlmMessage.Role.ASSISTANT,
+                        content = textBuffer.toString(),
+                    ))
+                }
+                emit(AcpRuntimeEvent.Done(stopReason = stopReason ?: "end_turn"))
+                return@flow
+            }
 
             // Check context budget between rounds
             if (!contextGuard.fitsInContext(currentMessages)) {
@@ -244,6 +246,47 @@ class AgentRunner(
         // Exceeded max tool rounds
         if (!aborted) {
             emit(AcpRuntimeEvent.Error(message = "Exceeded maximum tool call rounds ($maxToolRounds)"))
+        }
+    }
+
+    /**
+     * Execute a single tool call with policy and approval checks.
+     */
+    private suspend fun executeTool(
+        toolCall: LlmStreamEvent.ToolUse,
+        agentId: String,
+        sessionKey: String,
+    ): String {
+        // Check tool policy
+        val policyResult = toolPolicyEnforcer?.check(toolCall.name, agentId, sessionKey)
+        if (policyResult?.allowed == false) {
+            return "Error: Tool '${toolCall.name}' denied by policy: ${policyResult.reason}"
+        }
+
+        // Check approval
+        val approvalDecision = if (approvalManager != null) {
+            approvalManager.checkApproval(toolCall.name, toolCall.input, agentId, sessionKey)
+        } else {
+            ApprovalDecision.APPROVED
+        }
+
+        return when (approvalDecision) {
+            ApprovalDecision.DENIED ->
+                "Error: Tool call '${toolCall.name}' was denied by approval policy."
+            ApprovalDecision.TIMED_OUT ->
+                "Error: Tool call '${toolCall.name}' timed out waiting for approval."
+            ApprovalDecision.APPROVED -> {
+                val tool = toolRegistry.get(toolCall.name)
+                if (tool != null) {
+                    try {
+                        tool.execute(toolCall.input, ToolContext(sessionKey, agentId))
+                    } catch (e: Exception) {
+                        "Error: ${e.message}"
+                    }
+                } else {
+                    "Error: Unknown tool '${toolCall.name}'"
+                }
+            }
         }
     }
 }

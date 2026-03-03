@@ -32,10 +32,13 @@ import ai.openclaw.runtime.cron.CronTool
 import ai.openclaw.runtime.devices.DeviceToolsConfig
 import ai.openclaw.runtime.devices.DeviceToolsModule
 import ai.openclaw.runtime.engine.AgentRunner
+import ai.openclaw.runtime.engine.ContextGuard
 import ai.openclaw.runtime.engine.SessionPersistence
 import ai.openclaw.runtime.engine.SkillDefinition
 import ai.openclaw.runtime.engine.SkillExecutor
+import ai.openclaw.runtime.engine.SkillResolver
 import ai.openclaw.runtime.engine.SkillsTool
+import ai.openclaw.runtime.engine.SystemPromptBuilder
 import ai.openclaw.runtime.engine.ToolRegistry
 import ai.openclaw.runtime.gateway.ChannelManager
 import ai.openclaw.runtime.gateway.GatewayServer
@@ -509,6 +512,8 @@ class AgentEngine(private val context: Context) {
             val runner = AgentRunner(
                 provider = provider,
                 toolRegistry = toolRegistry,
+                sessionPersistence = sessionPersistence,
+                contextGuard = ContextGuard(),
                 approvalManager = approvalManager,
                 toolPolicyEnforcer = ToolPolicyEnforcer(config, toolAuditor),
             )
@@ -523,6 +528,8 @@ class AgentEngine(private val context: Context) {
                 sessionKey = sessionKey,
                 agentId = resolvedAgentId,
                 agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
+                runtimeInfo = buildRuntimeInfo(),
+                workspaceDir = terminalWorkingDirectory(),
             ).collect { event ->
                 when (event) {
                     is AcpRuntimeEvent.Error -> {
@@ -829,7 +836,9 @@ class AgentEngine(private val context: Context) {
         toolRegistry.register(
             SkillsTool(
                 skillExecutor = skillExecutor,
-                availableSkills = { emptyList<SkillDefinition>() },
+                availableSkills = {
+                    SkillResolver(config = config.skills).resolveSkills()
+                },
             ),
         )
     }
@@ -1014,6 +1023,16 @@ class AgentEngine(private val context: Context) {
             "gemini" -> listOf("api_key_gemini", "api_key_google")
             else -> listOf("api_key_${canonicalProvider(providerId)}")
         }
+    }
+
+    private fun buildRuntimeInfo(): SystemPromptBuilder.RuntimeInfo {
+        return SystemPromptBuilder.RuntimeInfo(
+            os = "Android ${android.os.Build.VERSION.RELEASE}",
+            arch = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
+            host = android.os.Build.MODEL,
+            timezone = java.util.TimeZone.getDefault().id,
+            currentTime = java.time.LocalDateTime.now().toString(),
+        )
     }
 
     companion object {

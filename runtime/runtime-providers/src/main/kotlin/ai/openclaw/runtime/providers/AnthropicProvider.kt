@@ -75,15 +75,33 @@ class AnthropicProvider(
             }
         }
 
+        val thinkingBudget = request.thinkingBudget
+
         val body = buildJsonObject {
             put("model", modelId)
             put("max_tokens", request.maxTokens)
             put("messages", messagesArray)
             put("stream", true)
+            // System prompt with prompt caching
             if (request.systemPrompt != null) {
-                put("system", request.systemPrompt)
+                putJsonArray("system") {
+                    addJsonObject {
+                        put("type", "text")
+                        put("text", request.systemPrompt)
+                        putJsonObject("cache_control") {
+                            put("type", "ephemeral")
+                        }
+                    }
+                }
             }
-            if (request.temperature != null) {
+            // Extended thinking support
+            if (thinkingBudget != null && thinkingBudget > 0) {
+                putJsonObject("thinking") {
+                    put("type", "enabled")
+                    put("budget_tokens", thinkingBudget)
+                }
+                // Temperature must not be set when thinking is enabled
+            } else if (request.temperature != null) {
                 put("temperature", request.temperature)
             }
             if (request.tools.isNotEmpty()) {
@@ -99,10 +117,16 @@ class AnthropicProvider(
             }
         }
 
+        val betaFeatures = mutableListOf("prompt-caching-2024-07-31")
+        if (thinkingBudget != null && thinkingBudget > 0) {
+            betaFeatures.add("interleaved-thinking-2025-05-14")
+        }
+
         val httpRequest = Request.Builder()
             .url("$baseUrl/v1/messages")
             .header("x-api-key", apiKey)
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", betaFeatures.joinToString(","))
             .header("content-type", "application/json")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
@@ -144,15 +168,7 @@ class AnthropicProvider(
         val toolInputBuffer = StringBuilder()
         var stopReason: String? = null
 
-        var line = reader.readLine()
-        while (line != null) {
-            if (!line.startsWith("data: ")) {
-                line = reader.readLine()
-                continue
-            }
-            val data = line.removePrefix("data: ").trim()
-            if (data == "[DONE]") break
-
+        for (data in reader.sseEvents()) {
             try {
                 val event = json.parseToJsonElement(data).jsonObject
                 val type = event["type"]?.jsonPrimitive?.contentOrNull
@@ -243,8 +259,6 @@ class AnthropicProvider(
                 if (e is CancellationException) throw e
                 // Skip malformed SSE events
             }
-
-            line = reader.readLine()
         }
 
         emit(LlmStreamEvent.Done(stopReason = stopReason ?: "end_turn"))

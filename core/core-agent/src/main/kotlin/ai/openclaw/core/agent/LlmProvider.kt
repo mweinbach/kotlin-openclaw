@@ -62,6 +62,8 @@ data class LlmRequest(
     val maxTokens: Int = 4096,
     val temperature: Double? = null,
     val systemPrompt: String? = null,
+    /** When set, enables extended thinking with this token budget (Anthropic only). */
+    val thinkingBudget: Int? = null,
 )
 
 /**

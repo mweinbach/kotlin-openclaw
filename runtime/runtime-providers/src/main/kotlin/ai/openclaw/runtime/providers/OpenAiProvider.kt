@@ -151,15 +151,7 @@ class OpenAiProvider(
         val toolCallBuilders = mutableMapOf<Int, ToolCallBuilder>()
         var stopReason: String? = null
 
-        var line = reader.readLine()
-        while (line != null) {
-            if (!line.startsWith("data: ")) {
-                line = reader.readLine()
-                continue
-            }
-            val data = line.removePrefix("data: ").trim()
-            if (data == "[DONE]") break
-
+        for (data in reader.sseEvents()) {
             try {
                 val chunk = json.parseToJsonElement(data).jsonObject
                 val choices = chunk["choices"]?.jsonArray
@@ -207,8 +199,6 @@ class OpenAiProvider(
                 if (e is CancellationException) throw e
                 // Skip malformed SSE events
             }
-
-            line = reader.readLine()
         }
 
         // Emit accumulated tool calls

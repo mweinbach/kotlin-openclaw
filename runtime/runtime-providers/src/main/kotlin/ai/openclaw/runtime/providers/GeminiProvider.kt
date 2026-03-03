@@ -11,6 +11,7 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.BufferedReader
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Google Gemini API provider.
@@ -42,10 +43,10 @@ class GeminiProvider(
                     })
                     putJsonArray("parts") {
                         if (msg.toolCallId != null) {
-                            // Function response
+                            // Function response — use the stored tool name, fall back to toolCallId
                             addJsonObject {
                                 putJsonObject("functionResponse") {
-                                    put("name", msg.name ?: "tool_result")
+                                    put("name", msg.name ?: msg.toolCallId ?: "tool_result")
                                     putJsonObject("response") {
                                         put("result", msg.content)
                                     }
@@ -147,14 +148,7 @@ class GeminiProvider(
         val json = Json { ignoreUnknownKeys = true }
         var stopReason = "stop"
 
-        var line = reader.readLine()
-        while (line != null) {
-            if (!line.startsWith("data: ")) {
-                line = reader.readLine()
-                continue
-            }
-            val data = line.removePrefix("data: ").trim()
-
+        for (data in reader.sseEvents()) {
             try {
                 val chunk = json.parseToJsonElement(data).jsonObject
                 val candidates = chunk["candidates"]?.jsonArray
@@ -175,7 +169,7 @@ class GeminiProvider(
                                 val name = functionCall["name"]?.jsonPrimitive?.contentOrNull ?: ""
                                 val args = functionCall["args"]?.toString() ?: "{}"
                                 emit(LlmStreamEvent.ToolUse(
-                                    id = "gemini_${name}_${System.currentTimeMillis()}",
+                                    id = "gemini_${name}_${toolCallCounter.incrementAndGet()}",
                                     name = name,
                                     input = args,
                                 ))
@@ -200,10 +194,13 @@ class GeminiProvider(
                 if (e is CancellationException) throw e
                 // Skip malformed events
             }
-
-            line = reader.readLine()
         }
 
         emit(LlmStreamEvent.Done(stopReason = stopReason))
+    }
+
+    companion object {
+        /** Atomic counter for generating unique tool call IDs across all Gemini requests. */
+        private val toolCallCounter = AtomicLong(0)
     }
 }

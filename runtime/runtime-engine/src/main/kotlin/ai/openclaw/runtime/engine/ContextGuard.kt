@@ -56,42 +56,73 @@ class ContextGuard(
     }
 
     /**
-     * Trim conversation history to fit in context window by removing oldest messages.
-     * Keeps system prompt and the most recent messages.
+     * Trim conversation history to fit in context window.
+     * Keeps system prompts and the most recent messages.
+     * Groups assistant messages with their following tool result messages so that
+     * tool-call / tool-result pairs are never split (splitting would cause API errors).
      */
     fun trimToFit(messages: List<LlmMessage>): List<LlmMessage> {
         if (fitsInContext(messages)) return messages
 
         val result = mutableListOf<LlmMessage>()
-        // Always keep system messages
         val systemMessages = messages.filter { it.role == LlmMessage.Role.SYSTEM }
         val nonSystem = messages.filter { it.role != LlmMessage.Role.SYSTEM }
 
         result.addAll(systemMessages)
 
-        // Add messages from the end until we exceed budget
+        // Group non-system messages into logical units so assistant+tool pairs stay together.
+        val groups = groupMessagePairs(nonSystem)
+
         val budget = (maxContextTokens * INPUT_HEADROOM_RATIO).toInt()
         var tokensUsed = estimateTokens(systemMessages)
 
-        val toAdd = mutableListOf<LlmMessage>()
-        for (msg in nonSystem.reversed()) {
-            val msgTokens = estimateTokens(listOf(msg))
-            if (tokensUsed + msgTokens > budget) break
-            toAdd.add(0, msg)
-            tokensUsed += msgTokens
+        // Add groups from the end until we exceed budget
+        val toAdd = mutableListOf<List<LlmMessage>>()
+        for (group in groups.reversed()) {
+            val groupTokens = estimateTokens(group)
+            if (tokensUsed + groupTokens > budget) break
+            toAdd.add(0, group)
+            tokensUsed += groupTokens
         }
 
-        // Add a compaction notice if we dropped messages
-        if (toAdd.size < nonSystem.size) {
-            val dropped = nonSystem.size - toAdd.size
+        val keptMessages = toAdd.flatten()
+        if (keptMessages.size < nonSystem.size) {
+            val dropped = nonSystem.size - keptMessages.size
             result.add(LlmMessage(
                 role = LlmMessage.Role.SYSTEM,
                 content = "[context compacted: $dropped earlier messages removed to fit context window]",
             ))
         }
 
-        result.addAll(toAdd)
+        result.addAll(keptMessages)
         return result
+    }
+
+    /**
+     * Group messages into logical units: an assistant message that has tool calls is
+     * grouped with all immediately following TOOL result messages.
+     * All other messages form single-element groups.
+     */
+    private fun groupMessagePairs(messages: List<LlmMessage>): List<List<LlmMessage>> {
+        val groups = mutableListOf<List<LlmMessage>>()
+        var i = 0
+        while (i < messages.size) {
+            val msg = messages[i]
+            if (msg.role == LlmMessage.Role.ASSISTANT && !msg.toolCalls.isNullOrEmpty()) {
+                val group = mutableListOf(msg)
+                var j = i + 1
+                while (j < messages.size && messages[j].role == LlmMessage.Role.TOOL) {
+                    group.add(messages[j])
+                    j++
+                }
+                groups.add(group)
+                i = j
+            } else {
+                groups.add(listOf(msg))
+                i++
+            }
+        }
+        return groups
     }
 
     /**

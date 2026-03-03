@@ -123,15 +123,7 @@ class OllamaProvider(
         val json = Json { ignoreUnknownKeys = true }
         var stopReason: String? = null
 
-        var line = reader.readLine()
-        while (line != null) {
-            if (!line.startsWith("data: ")) {
-                line = reader.readLine()
-                continue
-            }
-            val data = line.removePrefix("data: ").trim()
-            if (data == "[DONE]") break
-
+        for (data in reader.sseEvents()) {
             try {
                 val chunk = json.parseToJsonElement(data).jsonObject
                 val choices = chunk["choices"]?.jsonArray
@@ -163,8 +155,6 @@ class OllamaProvider(
                 if (e is CancellationException) throw e
                 // Skip malformed events
             }
-
-            line = reader.readLine()
         }
 
         emit(LlmStreamEvent.Done(stopReason = stopReason ?: "stop"))
