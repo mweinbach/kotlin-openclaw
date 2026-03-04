@@ -54,4 +54,28 @@ class ConfigLoaderTest {
         val merged = loader.merge(base, overlay)
         assertEquals(SessionScope.PER_SENDER, merged.session?.scope)
     }
+
+    @Test
+    fun `parse session transcript repair config`() {
+        val config = loader.parse(
+            """
+            {
+              "session": {
+                "transcriptRepair": {
+                  "fileRepairEnabled": true,
+                  "toolCallInputRepairEnabled": true,
+                  "toolResultPairRepairEnabled": true,
+                  "allowSyntheticToolResults": false
+                }
+              }
+            }
+            """.trimIndent(),
+        )
+        val transcriptRepair = config.session?.transcriptRepair
+        assertNotNull(transcriptRepair)
+        assertEquals(true, transcriptRepair.fileRepairEnabled)
+        assertEquals(true, transcriptRepair.toolCallInputRepairEnabled)
+        assertEquals(true, transcriptRepair.toolResultPairRepairEnabled)
+        assertEquals(false, transcriptRepair.allowSyntheticToolResults)
+    }
 }

@@ -5,6 +5,7 @@ import ai.openclaw.core.agent.LlmContentBlock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
@@ -14,6 +15,7 @@ import java.nio.file.StandardCopyOption
  */
 class SessionPersistence(
     private val sessionsDir: String,
+    private var transcriptRepairPolicy: TranscriptRepairPolicy = TranscriptRepairPolicy(),
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -38,7 +40,16 @@ class SessionPersistence(
         val stopReason: String? = null,
         val toolCalls: List<ToolCallEntry>? = null,
         val contentBlocks: List<ContentBlockEntry>? = null,
+        val idempotencyKey: String? = null,
+        val openclawAbort: OpenclawAbortEntry? = null,
         val timestamp: Long = System.currentTimeMillis(),
+    )
+
+    @Serializable
+    data class OpenclawAbortEntry(
+        val aborted: Boolean = true,
+        val origin: String? = null,
+        val runId: String? = null,
     )
 
     @Serializable
@@ -56,34 +67,75 @@ class SessionPersistence(
         val mimeType: String? = null,
     )
 
+    data class SessionLoadResult(
+        val header: SessionHeader?,
+        val messages: List<LlmMessage>,
+        val repairReport: SessionFileRepairReport?,
+    )
+
     /**
      * Load a session from its JSONL file. Returns header + messages.
      */
     fun load(sessionKey: String): Pair<SessionHeader?, List<LlmMessage>> {
+        val result = loadWithReport(sessionKey)
+        return result.header to result.messages
+    }
+
+    /**
+     * Load a session and include repair metadata.
+     */
+    fun loadWithReport(
+        sessionKey: String,
+        warn: (String) -> Unit = {},
+    ): SessionLoadResult {
         val file = sessionFile(sessionKey)
-        if (!file.exists()) return null to emptyList()
+        if (!file.exists()) {
+            return SessionLoadResult(
+                header = null,
+                messages = emptyList(),
+                repairReport = SessionFileRepairReport(
+                    repaired = false,
+                    droppedLines = 0,
+                    reason = "missing session file",
+                ),
+            )
+        }
+
+        val repairReport = if (transcriptRepairPolicy.fileRepairEnabled) {
+            repairSessionFileIfNeeded(file, warn)
+        } else {
+            null
+        }
 
         var header: SessionHeader? = null
         val messages = mutableListOf<LlmMessage>()
 
-        file.bufferedReader().useLines { lines ->
-            for (line in lines) {
-                if (line.isBlank()) continue
-                try {
-                    val obj = json.parseToJsonElement(line).jsonObject
-                    if (obj.containsKey("sessionId")) {
-                        header = json.decodeFromJsonElement(SessionHeader.serializer(), obj)
-                    } else {
-                        val entry = json.decodeFromJsonElement(SessionMessageEntry.serializer(), obj)
-                        messages.add(entryToMessage(entry))
+        try {
+            file.bufferedReader().useLines { lines ->
+                for (line in lines) {
+                    if (line.isBlank()) continue
+                    try {
+                        val obj = json.parseToJsonElement(line).jsonObject
+                        if (obj.containsKey("sessionId")) {
+                            header = json.decodeFromJsonElement(SessionHeader.serializer(), obj)
+                        } else {
+                            val entry = json.decodeFromJsonElement(SessionMessageEntry.serializer(), obj)
+                            messages.add(entryToMessage(entry))
+                        }
+                    } catch (_: Exception) {
+                        // If repair is disabled, keep legacy behavior and skip malformed lines.
                     }
-                } catch (_: Exception) {
-                    // Skip malformed lines
                 }
             }
+        } catch (err: IOException) {
+            warn("session load failed: ${err.message ?: "unknown error"} (${file.name})")
         }
 
-        return header to messages
+        return SessionLoadResult(
+            header = header,
+            messages = messages,
+            repairReport = repairReport,
+        )
     }
 
     /**
@@ -93,7 +145,40 @@ class SessionPersistence(
         val file = sessionFile(sessionKey)
         file.parentFile?.mkdirs()
         val entry = messageToEntry(message)
-        file.appendText(json.encodeToString(SessionMessageEntry.serializer(), entry) + "\n")
+        appendEntry(file, entry)
+    }
+
+    fun appendAbortAssistantPartial(
+        sessionKey: String,
+        runId: String,
+        text: String,
+        origin: String,
+    ): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return false
+        val key = "${runId.trim()}:assistant"
+        if (key == ":assistant") return false
+
+        val file = sessionFile(sessionKey)
+        file.parentFile?.mkdirs()
+
+        if (hasIdempotencyKey(file, key)) {
+            return false
+        }
+
+        val entry = SessionMessageEntry(
+            role = "assistant",
+            content = trimmed,
+            stopReason = "stop",
+            idempotencyKey = key,
+            openclawAbort = OpenclawAbortEntry(
+                aborted = true,
+                origin = origin,
+                runId = runId.trim().takeIf { it.isNotEmpty() },
+            ),
+        )
+        appendEntry(file, entry)
+        return true
     }
 
     /**
@@ -109,6 +194,10 @@ class SessionPersistence(
      * Check if a session file exists.
      */
     fun exists(sessionKey: String): Boolean = sessionFile(sessionKey).exists()
+
+    fun setTranscriptRepairPolicy(policy: TranscriptRepairPolicy) {
+        transcriptRepairPolicy = policy
+    }
 
     /**
      * Delete a session file.
@@ -203,5 +292,24 @@ class SessionPersistence(
                 }
             }?.takeIf { it.isNotEmpty() },
         )
+    }
+
+    private fun appendEntry(file: File, entry: SessionMessageEntry) {
+        file.appendText(json.encodeToString(SessionMessageEntry.serializer(), entry) + "\n")
+    }
+
+    private fun hasIdempotencyKey(file: File, key: String): Boolean {
+        if (!file.exists()) return false
+        return try {
+            file.bufferedReader().useLines { lines ->
+                lines.any { line ->
+                    if (line.isBlank()) return@any false
+                    val obj = runCatching { json.parseToJsonElement(line).jsonObject }.getOrNull() ?: return@any false
+                    obj["idempotencyKey"]?.jsonPrimitive?.contentOrNull == key
+                }
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 }

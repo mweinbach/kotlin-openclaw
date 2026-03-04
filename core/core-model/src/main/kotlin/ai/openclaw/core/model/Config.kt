@@ -148,6 +148,14 @@ data class SessionMaintenanceConfig(
 )
 
 @Serializable
+data class SessionTranscriptRepairConfig(
+    val fileRepairEnabled: Boolean? = null,
+    val toolCallInputRepairEnabled: Boolean? = null,
+    val toolResultPairRepairEnabled: Boolean? = null,
+    val allowSyntheticToolResults: Boolean? = null,
+)
+
+@Serializable
 data class SessionConfig(
     val scope: SessionScope? = null,
     val dmScope: DmScope? = null,
@@ -166,6 +174,7 @@ data class SessionConfig(
     val agentToAgent: AgentToAgentConfig? = null,
     val threadBindings: SessionThreadBindingsConfig? = null,
     val maintenance: SessionMaintenanceConfig? = null,
+    val transcriptRepair: SessionTranscriptRepairConfig? = null,
 )
 
 @Serializable

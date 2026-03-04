@@ -11,6 +11,19 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class GatewayServerChatEventParityTest {
+    private fun adminContext(server: GatewayServer): RpcContext {
+        return RpcContext(
+            connectionId = "conn-1",
+            authContext = AuthContext(
+                connectionId = "conn-1",
+                authenticated = true,
+                authMode = AuthMode.NONE,
+                scopes = setOf("admin"),
+            ),
+            gateway = server,
+        )
+    }
+
     @Test
     fun `chat text delta payload uses state delta schema`() {
         val server = GatewayServer()
@@ -120,6 +133,30 @@ class GatewayServerChatEventParityTest {
     }
 
     @Test
+    fun `lifecycle end payload includes pending tool calls`() {
+        val server = GatewayServer()
+        val mapped = server.buildAgentStreamPayload(
+            AcpRuntimeEvent.Done(
+                stopReason = "tool_calls",
+                pendingToolCalls = listOf(
+                    ai.openclaw.core.model.AcpPendingToolCall(
+                        id = "call_1",
+                        name = "browser_click",
+                        arguments = """{"selector":"#submit"}""",
+                    ),
+                ),
+            ),
+        )
+
+        assertNotNull(mapped)
+        assertEquals("lifecycle", mapped.stream)
+        assertEquals("end", mapped.data["phase"]?.jsonPrimitive?.content)
+        val pending = mapped.data["pendingToolCalls"]?.jsonArray
+        assertNotNull(pending)
+        assertEquals("call_1", pending.first().jsonObject["id"]?.jsonPrimitive?.content)
+    }
+
+    @Test
     fun `chat send requires idempotency key`() = runTest {
         val server = GatewayServer()
         server.onChatSend = { flow { emit(AcpRuntimeEvent.Done(stopReason = "end_turn")) } }
@@ -133,11 +170,7 @@ class GatewayServerChatEventParityTest {
                     put("message", "hello")
                 },
             ),
-            RpcContext(
-                connectionId = "conn-1",
-                authContext = null,
-                gateway = server,
-            ),
+            adminContext(server),
         )
 
         assertEquals(false, response.ok)
@@ -166,11 +199,11 @@ class GatewayServerChatEventParityTest {
 
         val first = server.dispatcher.dispatch(
             request,
-            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+            adminContext(server),
         )
         val second = server.dispatcher.dispatch(
             request.copy(id = "req-2"),
-            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+            adminContext(server),
         )
 
         assertEquals(true, first.ok)
@@ -194,13 +227,28 @@ class GatewayServerChatEventParityTest {
                     put("sessionKey", "s1")
                 },
             ),
-            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+            adminContext(server),
         )
 
         assertEquals(true, response.ok)
         assertEquals(true, response.payload?.jsonObject?.get("ok")?.jsonPrimitive?.booleanOrNull)
         assertEquals(false, response.payload?.jsonObject?.get("aborted")?.jsonPrimitive?.booleanOrNull)
         assertTrue(response.payload?.jsonObject?.get("runIds")?.jsonArray?.isEmpty() == true)
+    }
+
+    @Test
+    fun `chat aborted payload includes abort origin`() {
+        val server = GatewayServer()
+        val payload = server.buildChatAbortedPayload(
+            runId = "run-1",
+            sessionKey = "session-1",
+            seq = 3,
+            text = "partial text",
+            stopReason = "aborted",
+            origin = "rpc",
+        )
+        assertEquals("aborted", payload["state"]?.jsonPrimitive?.content)
+        assertEquals("rpc", payload["origin"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -223,7 +271,7 @@ class GatewayServerChatEventParityTest {
                     put("idempotencyKey", "run-1")
                 },
             ),
-            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+            adminContext(server),
         )
 
         val abort = server.dispatcher.dispatch(
@@ -235,7 +283,7 @@ class GatewayServerChatEventParityTest {
                     put("runId", "run-1")
                 },
             ),
-            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+            adminContext(server),
         )
 
         assertEquals(false, abort.ok)

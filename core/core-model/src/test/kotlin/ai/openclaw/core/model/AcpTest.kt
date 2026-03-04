@@ -25,6 +25,23 @@ class AcpTest {
     }
 
     @Test
+    fun `serialize and deserialize AcpRuntimeEvent Done with pending tool calls`() {
+        val event: AcpRuntimeEvent = AcpRuntimeEvent.Done(
+            stopReason = "tool_calls",
+            pendingToolCalls = listOf(
+                AcpPendingToolCall(
+                    id = "call_1",
+                    name = "client_tool",
+                    arguments = """{"foo":"bar"}""",
+                ),
+            ),
+        )
+        val encoded = json.encodeToString(event)
+        val decoded = json.decodeFromString<AcpRuntimeEvent>(encoded)
+        assertEquals(event, decoded)
+    }
+
+    @Test
     fun `serialize and deserialize AcpRuntimeEvent Error`() {
         val event: AcpRuntimeEvent = AcpRuntimeEvent.Error(message = "Rate limited", code = "429", retryable = true)
         val encoded = json.encodeToString(event)

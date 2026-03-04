@@ -104,6 +104,13 @@ data class AcpRuntimeDoctorReport(
 )
 
 @Serializable
+data class AcpPendingToolCall(
+    val id: String,
+    val name: String,
+    val arguments: String,
+)
+
+@Serializable
 sealed class AcpRuntimeEvent {
     @Serializable
     @SerialName("text_delta")
@@ -140,6 +147,7 @@ sealed class AcpRuntimeEvent {
     @SerialName("done")
     data class Done(
         val stopReason: String? = null,
+        val pendingToolCalls: List<AcpPendingToolCall>? = null,
     ) : AcpRuntimeEvent()
 
     @Serializable

@@ -37,6 +37,7 @@ import ai.openclaw.runtime.devices.DeviceToolsConfig
 import ai.openclaw.runtime.devices.DeviceToolsModule
 import ai.openclaw.runtime.engine.AgentRunner
 import ai.openclaw.runtime.engine.ContextGuard
+import ai.openclaw.runtime.engine.ClientToolDefinition
 import ai.openclaw.runtime.engine.EmbeddedRunParams
 import ai.openclaw.runtime.engine.EmbeddedTurnContext
 import ai.openclaw.runtime.engine.SessionPersistence
@@ -45,6 +46,7 @@ import ai.openclaw.runtime.engine.SkillExecutor
 import ai.openclaw.runtime.engine.SkillResolver
 import ai.openclaw.runtime.engine.SkillsTool
 import ai.openclaw.runtime.engine.SystemPromptBuilder
+import ai.openclaw.runtime.engine.TranscriptRepairPolicy
 import ai.openclaw.runtime.engine.ToolLoopDetector
 import ai.openclaw.runtime.engine.ToolRegistry
 import ai.openclaw.runtime.engine.tools.CodingToolsModule
@@ -101,7 +103,10 @@ class AgentEngine(private val context: Context) {
     val configManager: ConfigManager by lazy { ConfigManager(context) }
 
     val sessionPersistence: SessionPersistence by lazy {
-        SessionPersistence(context.filesDir.resolve("sessions").absolutePath)
+        SessionPersistence(
+            context.filesDir.resolve("sessions").absolutePath,
+            transcriptRepairPolicy = TranscriptRepairPolicy.fromConfig(config.session?.transcriptRepair),
+        )
     }
 
     val channelManager: ChannelManager by lazy { ChannelManager(scope) }
@@ -502,6 +507,7 @@ class AgentEngine(private val context: Context) {
     fun sendMessage(
         userMessage: String,
         conversationHistory: List<LlmMessage> = emptyList(),
+        prependMessages: List<LlmMessage> = emptyList(),
         model: String? = null,
         systemPrompt: String? = null,
         extraSystemPrompt: String? = null,
@@ -510,6 +516,7 @@ class AgentEngine(private val context: Context) {
         messageProvider: String? = null,
         messageChannelId: String? = null,
         messageAccountId: String? = null,
+        clientTools: List<ClientToolDefinition> = emptyList(),
     ): Flow<AcpRuntimeEvent> = channelFlow {
         val resolvedAgentId = agentId ?: defaultAgentId()
         val effectiveMessageProvider = messageProvider?.trim()?.takeIf { it.isNotEmpty() }
@@ -572,7 +579,7 @@ class AgentEngine(private val context: Context) {
             requestedModel = requestedModel,
         )
 
-        val messages = conversationHistory + LlmMessage(
+        val messages = conversationHistory + prependMessages + LlmMessage(
             role = LlmMessage.Role.USER,
             content = userMessage,
         )
@@ -600,6 +607,7 @@ class AgentEngine(private val context: Context) {
                 toolPolicyEnforcer = ToolPolicyEnforcer(config, toolAuditor),
                 toolLoopDetector = resolveToolLoopDetector(sessionKey),
                 hookRunner = hookRunner,
+                transcriptRepairPolicy = TranscriptRepairPolicy.fromConfig(config.session?.transcriptRepair),
             )
 
             var retryableFailure: AcpRuntimeEvent.Error? = null
@@ -659,6 +667,7 @@ class AgentEngine(private val context: Context) {
                         sandboxed = runtimeInfoForTurn.sandboxed,
                         groupToolPolicy = null,
                     ),
+                    clientTools = clientTools,
                 ),
             ).collect { event ->
                 when (event) {
@@ -726,6 +735,9 @@ class AgentEngine(private val context: Context) {
         notifyPluginReload: Boolean,
         startGateway: Boolean,
     ) {
+        sessionPersistence.setTranscriptRepairPolicy(
+            TranscriptRepairPolicy.fromConfig(config.session?.transcriptRepair),
+        )
         sessionToolLoopDetectors.clear()
         registerProviders()
         registerTools()
@@ -1013,6 +1025,21 @@ class AgentEngine(private val context: Context) {
 
         val server = gatewayServerInternal ?: return
         server.onChatSend = { params ->
+            val prependMessages = params.functionCallOutputs.map { output ->
+                LlmMessage(
+                    role = LlmMessage.Role.TOOL,
+                    content = output.output,
+                    toolCallId = output.callId,
+                    name = output.name ?: "client",
+                )
+            }
+            val clientTools = params.clientTools.map { tool ->
+                ClientToolDefinition(
+                    name = tool.name,
+                    description = tool.description,
+                    parameters = tool.parameters,
+                )
+            }
             sendMessage(
                 userMessage = params.text,
                 model = params.model,
@@ -1021,6 +1048,16 @@ class AgentEngine(private val context: Context) {
                 messageProvider = params.channel,
                 messageChannelId = params.channel,
                 messageAccountId = params.accountId,
+                prependMessages = prependMessages,
+                clientTools = clientTools,
+            )
+        }
+        server.onAbortPersistPartial = { abort ->
+            sessionPersistence.appendAbortAssistantPartial(
+                sessionKey = abort.sessionKey,
+                runId = abort.runId,
+                text = abort.text,
+                origin = abort.origin,
             )
         }
 

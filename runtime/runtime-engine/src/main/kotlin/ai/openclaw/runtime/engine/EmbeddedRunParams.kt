@@ -21,6 +21,12 @@ data class EmbeddedTurnContext(
     val groupToolPolicy: GroupToolPolicyConfig? = null,
 )
 
+data class ClientToolDefinition(
+    val name: String,
+    val description: String = "Client-side hosted tool",
+    val parameters: String = """{"type":"object","properties":{},"additionalProperties":true}""",
+)
+
 /**
  * Structured runner params used by AgentRunner.
  * Keeps turn wiring explicit and aligned with the reference runtime architecture.
@@ -58,4 +64,5 @@ data class EmbeddedRunParams(
     val messageToolHints: List<String> = emptyList(),
     val heartbeatPrompt: String? = null,
     val turnContext: EmbeddedTurnContext = EmbeddedTurnContext(),
+    val clientTools: List<ClientToolDefinition> = emptyList(),
 )

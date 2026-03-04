@@ -3,11 +3,11 @@ package ai.openclaw.runtime.gateway
 import ai.openclaw.core.model.GatewayAuthConfig
 import ai.openclaw.core.model.GatewayAuthMode
 import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Authentication context for a connected client.
- * Ported from src/gateway/server/ws-connection/auth-context.ts
  */
 data class AuthContext(
     val connectionId: String,
@@ -17,9 +17,18 @@ data class AuthContext(
     val deviceId: String? = null,
     val role: String? = null,
     val ip: String? = null,
+    val trustedProxyUser: String? = null,
 ) {
-    fun hasScope(scope: String): Boolean =
-        "admin" in scopes || scope in scopes
+    fun hasScope(scope: String): Boolean {
+        if ("admin" in scopes) return true
+        if (scope in scopes) return true
+        val segments = scope.split('.')
+        if (segments.size > 1) {
+            val wildcard = segments.dropLast(1).joinToString(".") + ".*"
+            if (wildcard in scopes) return true
+        }
+        return false
+    }
 }
 
 enum class AuthMode {
@@ -27,77 +36,159 @@ enum class AuthMode {
     TOKEN,
     PASSWORD,
     DEVICE,
-    TAILSCALE,
+    TRUSTED_PROXY,
     LOCAL,
+}
+
+data class DevicePairingRecord(
+    val token: String,
+    val deviceId: String,
+    val role: String?,
+    val scopes: Set<String>,
+    val createdAt: Long = System.currentTimeMillis(),
+    val expiresAt: Long? = null,
+)
+
+class DevicePairingStore {
+    private val records = ConcurrentHashMap<String, DevicePairingRecord>()
+
+    fun issueToken(
+        deviceId: String,
+        role: String? = null,
+        scopes: Set<String> = setOf("operator.*"),
+        ttlMs: Long? = null,
+    ): DevicePairingRecord {
+        val token = "dvt_${UUID.randomUUID()}"
+        val now = System.currentTimeMillis()
+        val record = DevicePairingRecord(
+            token = token,
+            deviceId = deviceId,
+            role = role,
+            scopes = scopes,
+            createdAt = now,
+            expiresAt = ttlMs?.let { now + it },
+        )
+        records[token] = record
+        return record
+    }
+
+    fun verify(token: String): DevicePairingRecord? {
+        val record = records[token] ?: return null
+        val expiresAt = record.expiresAt
+        if (expiresAt != null && expiresAt <= System.currentTimeMillis()) {
+            records.remove(token)
+            return null
+        }
+        return record
+    }
+
+    fun revoke(token: String): Boolean = records.remove(token) != null
 }
 
 /**
  * Authenticator for gateway connections.
- * Ported from src/gateway/auth.ts
  */
 class GatewayAuthenticator(
     private val config: GatewayAuthConfig? = null,
+    private val pairingStore: DevicePairingStore = DevicePairingStore(),
 ) {
-    private val rateLimiter = AuthRateLimiter()
+    private val rateLimiter = AuthRateLimiter(
+        maxAttempts = config?.rateLimit?.maxAttempts ?: 10,
+        windowMs = config?.rateLimit?.windowMs ?: 60_000,
+        lockoutMs = config?.rateLimit?.lockoutMs ?: 300_000,
+    )
+
+    fun mode(): AuthMode = resolveAuthMode().mode
 
     fun authenticate(params: ConnectParams): AuthResult {
-        val mode = resolveAuthMode()
-
-        // Rate limit check
-        val ip = params.ip ?: "unknown"
-        if (rateLimiter.isLimited(ip)) {
-            return AuthResult.Denied("Rate limited", AuthMode.NONE)
+        val resolved = resolveAuthMode()
+        if (resolved.misconfiguredReason != null) {
+            return AuthResult.Denied(resolved.misconfiguredReason, resolved.mode)
         }
 
-        return when (mode) {
+        val ip = params.ip ?: "unknown"
+        val exemptLoopback = config?.rateLimit?.exemptLoopback ?: false
+        val shouldRateLimit = !(exemptLoopback && isLoopback(ip))
+        if (shouldRateLimit && rateLimiter.isLimited(ip)) {
+            return AuthResult.Denied("Rate limited", resolved.mode)
+        }
+
+        params.deviceToken?.trim()?.takeIf { it.isNotEmpty() }?.let { token ->
+            val record = pairingStore.verify(token)
+            if (record != null) {
+                return AuthResult.Allowed(
+                    AuthContext(
+                        connectionId = params.connectionId,
+                        authenticated = true,
+                        authMode = AuthMode.DEVICE,
+                        scopes = record.scopes,
+                        deviceId = record.deviceId,
+                        role = record.role,
+                        ip = ip,
+                    ),
+                )
+            }
+            if (shouldRateLimit) {
+                rateLimiter.recordFailure(ip)
+            }
+            return AuthResult.Denied("Invalid device token", AuthMode.DEVICE)
+        }
+
+        return when (resolved.mode) {
             AuthMode.NONE -> AuthResult.Allowed(
                 AuthContext(
                     connectionId = params.connectionId,
                     authenticated = true,
                     authMode = AuthMode.NONE,
                     scopes = setOf("admin"),
-                )
+                    ip = ip,
+                ),
             )
 
             AuthMode.TOKEN -> {
-                val expected = config?.token
-                if (expected != null && safeCompare(params.token ?: "", expected)) {
+                val expected = config?.token.orEmpty()
+                val provided = params.token.orEmpty()
+                if (provided.isNotBlank() && safeCompare(provided, expected)) {
                     AuthResult.Allowed(
                         AuthContext(
                             connectionId = params.connectionId,
                             authenticated = true,
                             authMode = AuthMode.TOKEN,
-                            scopes = params.scopes ?: setOf("admin"),
+                            scopes = normalizeRequestedScopes(params.scopes),
                             ip = ip,
-                        )
+                        ),
                     )
                 } else {
-                    rateLimiter.recordFailure(ip)
+                    if (shouldRateLimit) {
+                        rateLimiter.recordFailure(ip)
+                    }
                     AuthResult.Denied("Invalid token", AuthMode.TOKEN)
                 }
             }
 
             AuthMode.PASSWORD -> {
-                val expected = config?.password
-                if (expected != null && safeCompare(params.password ?: "", expected)) {
+                val expected = config?.password.orEmpty()
+                val provided = params.password.orEmpty()
+                if (provided.isNotBlank() && safeCompare(provided, expected)) {
                     AuthResult.Allowed(
                         AuthContext(
                             connectionId = params.connectionId,
                             authenticated = true,
                             authMode = AuthMode.PASSWORD,
-                            scopes = params.scopes ?: setOf("admin"),
+                            scopes = normalizeRequestedScopes(params.scopes),
                             ip = ip,
-                        )
+                        ),
                     )
                 } else {
-                    rateLimiter.recordFailure(ip)
+                    if (shouldRateLimit) {
+                        rateLimiter.recordFailure(ip)
+                    }
                     AuthResult.Denied("Invalid password", AuthMode.PASSWORD)
                 }
             }
 
             AuthMode.LOCAL -> {
-                val isLocal = ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
-                if (isLocal) {
+                if (isLoopback(ip)) {
                     AuthResult.Allowed(
                         AuthContext(
                             connectionId = params.connectionId,
@@ -105,37 +196,137 @@ class GatewayAuthenticator(
                             authMode = AuthMode.LOCAL,
                             scopes = setOf("admin"),
                             ip = ip,
-                        )
+                        ),
                     )
                 } else {
                     AuthResult.Denied("Not a local connection", AuthMode.LOCAL)
                 }
             }
 
-            else -> AuthResult.Denied("Unsupported auth mode: $mode", mode)
+            AuthMode.TRUSTED_PROXY -> {
+                val trusted = authenticateTrustedProxy(params)
+                if (trusted != null) {
+                    AuthResult.Allowed(trusted)
+                } else {
+                    if (shouldRateLimit) {
+                        rateLimiter.recordFailure(ip)
+                    }
+                    AuthResult.Denied("Trusted proxy headers missing or invalid", AuthMode.TRUSTED_PROXY)
+                }
+            }
+
+            AuthMode.DEVICE -> AuthResult.Denied("Device auth requires a valid device token", AuthMode.DEVICE)
         }
     }
 
-    private fun resolveAuthMode(): AuthMode {
-        val mode = config?.mode
-        return when {
-            mode == GatewayAuthMode.TOKEN && config?.token != null -> AuthMode.TOKEN
-            mode == GatewayAuthMode.PASSWORD && config?.password != null -> AuthMode.PASSWORD
-            mode == GatewayAuthMode.TRUSTED_PROXY -> AuthMode.TAILSCALE
-            config?.token != null -> AuthMode.TOKEN
-            config?.password != null -> AuthMode.PASSWORD
-            else -> AuthMode.NONE
+    fun issueDeviceToken(
+        deviceId: String,
+        role: String? = null,
+        scopes: Set<String> = setOf("operator.*"),
+        ttlMs: Long? = null,
+    ): DevicePairingRecord {
+        return pairingStore.issueToken(
+            deviceId = deviceId,
+            role = role,
+            scopes = scopes,
+            ttlMs = ttlMs,
+        )
+    }
+
+    fun revokeDeviceToken(token: String): Boolean = pairingStore.revoke(token)
+
+    private fun authenticateTrustedProxy(params: ConnectParams): AuthContext? {
+        val trustedProxy = config?.trustedProxy ?: return null
+        val headers = params.headers
+        val userHeader = trustedProxy.userHeader.trim().ifEmpty { return null }
+        val user = headers[userHeader]?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val requiredHeaders = trustedProxy.requiredHeaders.orEmpty()
+        val hasRequiredHeaders = requiredHeaders.all { headerName ->
+            headers[headerName]?.trim()?.isNotEmpty() == true
         }
+        if (!hasRequiredHeaders) {
+            return null
+        }
+        val allowUsers = trustedProxy.allowUsers.orEmpty().map { it.trim() }.filter { it.isNotEmpty() }
+        if (allowUsers.isNotEmpty() && user !in allowUsers) {
+            return null
+        }
+        return AuthContext(
+            connectionId = params.connectionId,
+            authenticated = true,
+            authMode = AuthMode.TRUSTED_PROXY,
+            scopes = normalizeRequestedScopes(params.scopes),
+            ip = params.ip,
+            trustedProxyUser = user,
+            role = params.role,
+        )
+    }
+
+    private data class ResolvedAuthMode(
+        val mode: AuthMode,
+        val misconfiguredReason: String? = null,
+    )
+
+    private fun resolveAuthMode(): ResolvedAuthMode {
+        return when (config?.mode) {
+            GatewayAuthMode.TOKEN -> {
+                if (config.token.isNullOrBlank()) {
+                    ResolvedAuthMode(AuthMode.TOKEN, "Auth mode token requires gateway.auth.token")
+                } else {
+                    ResolvedAuthMode(AuthMode.TOKEN)
+                }
+            }
+
+            GatewayAuthMode.PASSWORD -> {
+                if (config.password.isNullOrBlank()) {
+                    ResolvedAuthMode(AuthMode.PASSWORD, "Auth mode password requires gateway.auth.password")
+                } else {
+                    ResolvedAuthMode(AuthMode.PASSWORD)
+                }
+            }
+
+            GatewayAuthMode.TRUSTED_PROXY -> {
+                if (config.trustedProxy == null) {
+                    ResolvedAuthMode(
+                        AuthMode.TRUSTED_PROXY,
+                        "Auth mode trusted-proxy requires gateway.auth.trustedProxy",
+                    )
+                } else {
+                    ResolvedAuthMode(AuthMode.TRUSTED_PROXY)
+                }
+            }
+
+            GatewayAuthMode.NONE, null -> {
+                when {
+                    !config?.token.isNullOrBlank() -> ResolvedAuthMode(AuthMode.TOKEN)
+                    !config?.password.isNullOrBlank() -> ResolvedAuthMode(AuthMode.PASSWORD)
+                    else -> ResolvedAuthMode(AuthMode.NONE)
+                }
+            }
+        }
+    }
+
+    private fun normalizeRequestedScopes(scopes: Set<String>?): Set<String> {
+        val normalized = scopes.orEmpty()
+            .mapNotNull { scope ->
+                val trimmed = scope.trim()
+                if (trimmed.isEmpty()) null else trimmed
+            }
+            .toSet()
+        return if (normalized.isEmpty()) setOf("operator.*") else normalized
+    }
+
+    private fun isLoopback(ip: String): Boolean {
+        val normalized = ip.trim().lowercase()
+        return normalized == "127.0.0.1" || normalized == "::1" || normalized == "localhost"
     }
 
     /**
      * Constant-time string comparison to prevent timing attacks.
      */
     private fun safeCompare(a: String, b: String): Boolean {
-        val aBytes = a.toByteArray()
-        val bBytes = b.toByteArray()
-        val aHash = MessageDigest.getInstance("SHA-256").digest(aBytes)
-        val bHash = MessageDigest.getInstance("SHA-256").digest(bBytes)
+        val aHash = MessageDigest.getInstance("SHA-256").digest(a.toByteArray())
+        val bHash = MessageDigest.getInstance("SHA-256").digest(b.toByteArray())
         return MessageDigest.isEqual(aHash, bHash)
     }
 }
@@ -145,9 +336,11 @@ data class ConnectParams(
     val token: String? = null,
     val password: String? = null,
     val deviceId: String? = null,
+    val deviceToken: String? = null,
     val scopes: Set<String>? = null,
     val ip: String? = null,
     val role: String? = null,
+    val headers: Map<String, String> = emptyMap(),
 )
 
 sealed class AuthResult {
@@ -157,7 +350,6 @@ sealed class AuthResult {
 
 /**
  * Per-IP rate limiter for authentication attempts.
- * Ported from src/gateway/auth-rate-limit.ts
  */
 class AuthRateLimiter(
     private val maxAttempts: Int = 10,
@@ -174,9 +366,7 @@ class AuthRateLimiter(
     fun isLimited(ip: String): Boolean {
         val state = ipStates[ip] ?: return false
         val now = System.currentTimeMillis()
-
         if (state.lockedUntil > now) return true
-
         synchronized(state) {
             state.failures.removeIf { now - it > windowMs }
         }

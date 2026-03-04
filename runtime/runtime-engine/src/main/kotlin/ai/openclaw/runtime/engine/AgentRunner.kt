@@ -252,6 +252,7 @@ class AgentRunner(
     private val toolPolicyEnforcer: ToolPolicyEnforcer? = null,
     private val toolLoopDetector: ToolLoopDetector? = null,
     private val hookRunner: HookRunner? = null,
+    private val transcriptRepairPolicy: TranscriptRepairPolicy = TranscriptRepairPolicy(),
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -260,6 +261,7 @@ class AgentRunner(
     private val hookDispatchScope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default,
     )
+    private val transcriptRepair = SessionTranscriptRepair()
 
     /**
      * Structured entrypoint mirroring the reference runner architecture.
@@ -303,6 +305,7 @@ class AgentRunner(
             senderIsOwner = params.turnContext.senderIsOwner,
             turnSandboxed = params.turnContext.sandboxed,
             groupToolPolicy = params.turnContext.groupToolPolicy,
+            clientTools = params.clientTools,
         )
     }
 
@@ -351,6 +354,7 @@ class AgentRunner(
         senderIsOwner: Boolean? = null,
         turnSandboxed: Boolean? = null,
         groupToolPolicy: GroupToolPolicyConfig? = null,
+        clientTools: List<ClientToolDefinition> = emptyList(),
     ): Flow<AcpRuntimeEvent> = flow {
         val effectiveRunId = runId?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
         val effectiveHookSessionId = hookSessionId?.trim()?.takeIf { it.isNotEmpty() }
@@ -378,7 +382,14 @@ class AgentRunner(
         try {
             // Load persisted history if available.
             currentMessages = if (persistence != null && persistence.exists(sessionKey)) {
-                val (_, history) = persistence.load(sessionKey)
+                val loadWarnings = mutableListOf<String>()
+                val loadResult = persistence.loadWithReport(sessionKey) { warning ->
+                    loadWarnings += warning
+                }
+                loadWarnings.forEach { warning ->
+                    emit(AcpRuntimeEvent.Status(text = warning, tag = "session_repair"))
+                }
+                val history = loadResult.messages
                 val combined = history.toMutableList()
                 for (msg in messages) {
                     val isDuplicate = combined.any { existing ->
@@ -410,6 +421,7 @@ class AgentRunner(
                 groupToolPolicy = groupToolPolicy,
             )
             var allowedToolNames = resolveAllowedToolNames(policyContext)
+            val clientToolNames = clientTools.map { normalizeToolName(it.name) }.toSet()
             val mergedExtraSystemPrompt = listOfNotNull(
                 extraSystemPrompt?.trim()?.takeIf { it.isNotEmpty() },
                 subagentPromptContract(sessionKey)?.trim()?.takeIf { it.isNotEmpty() },
@@ -473,6 +485,10 @@ class AgentRunner(
 
             currentMessages = contextGuard.limitHistoryTurns(currentMessages, maxHistoryTurns).toMutableList()
             currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
+            currentMessages = applyTranscriptRepairs(
+                messages = currentMessages,
+                allowedToolNames = allowedToolNames + clientToolNames,
+            ).toMutableList()
 
             val latestUserMessage = currentMessages.lastOrNull { it.role == LlmMessage.Role.USER }
             val historyMessagesForHook = if (latestUserMessage != null) {
@@ -518,6 +534,7 @@ class AgentRunner(
             val turnTimeoutMs = timeoutMs?.takeIf { it > 0L }
             val maxOverflowCompactionAttempts = 3
             var overflowCompactionAttempts = 0
+            var toolResultTruncationAttempted = false
             var runAttempt = 0
             var lastRetryableError: LlmStreamEvent.Error? = null
             var aborted = false
@@ -574,11 +591,14 @@ class AgentRunner(
                         aborted = true
                         return@flow
                     }
-                    currentMessages = sanitizeToolCallResultPairing(currentMessages).toMutableList()
+                    currentMessages = applyTranscriptRepairs(
+                        messages = currentMessages,
+                        allowedToolNames = allowedToolNames + clientToolNames,
+                    ).toMutableList()
                     val request = LlmRequest(
                         model = effectiveModel,
                         messages = currentMessages,
-                        tools = toolRegistry.toDefinitions(allowedToolNames),
+                        tools = buildRequestTools(allowedToolNames, clientTools),
                         systemPrompt = effectiveSystemPrompt,
                     )
 
@@ -746,6 +766,31 @@ class AgentRunner(
                         if (overflowCode != null) {
                             val overflowMessage =
                                 "Context overflow: prompt too large for the model context window."
+                            if (!toolResultTruncationAttempted && contextGuard.sessionLikelyHasOversizedToolResults(currentMessages)) {
+                                toolResultTruncationAttempted = true
+                                val truncation = contextGuard.truncateOversizedToolResults(currentMessages)
+                                if (truncation.truncated) {
+                                    currentMessages = applyTranscriptRepairs(
+                                        messages = truncation.messages,
+                                        allowedToolNames = allowedToolNames + clientToolNames,
+                                    ).toMutableList()
+                                    persistCompactedTranscript(
+                                        persistence = persistence,
+                                        sessionKey = sessionKey,
+                                        model = effectiveModel,
+                                        agentId = agentId,
+                                        workspaceDir = workspaceDir,
+                                        messages = currentMessages,
+                                    )
+                                    emit(
+                                        AcpRuntimeEvent.Status(
+                                            text = "Recovered context overflow by truncating oversized tool results; retrying",
+                                            tag = "tool_result_truncation_retry",
+                                        ),
+                                    )
+                                    continue@attemptLoop
+                                }
+                            }
                             if (runAttempt < effectiveMaxRunAttempts) {
                                 lastRetryableError = LlmStreamEvent.Error(
                                     message = overflowMessage,
@@ -827,9 +872,30 @@ class AgentRunner(
                             message = assistantMsg,
                             toolContext = null,
                         )
+                        val pendingClientToolCalls = mutableListOf<AcpPendingToolCall>()
 
                         for (tc in pendingToolCalls) {
                             val normalizedToolName = normalizeToolName(tc.name)
+                            if (normalizedToolName in clientToolNames) {
+                                pendingClientToolCalls += AcpPendingToolCall(
+                                    id = tc.id,
+                                    name = normalizedToolName,
+                                    arguments = tc.input,
+                                )
+                                emit(
+                                    AcpRuntimeEvent.ToolCall(
+                                        text = "Delegated $normalizedToolName to client",
+                                        tag = "tool_call_update",
+                                        toolCallId = tc.id,
+                                        status = "pending",
+                                        title = normalizedToolName,
+                                        detail = "status=pending",
+                                        kind = inferToolKind(normalizedToolName),
+                                        rawInput = tc.input,
+                                    ),
+                                )
+                                continue
+                            }
                             val toolContext = PluginHookToolContext(
                                 agentId = agentId,
                                 sessionKey = sessionKey.takeIf { it.isNotBlank() },
@@ -958,6 +1024,7 @@ class AgentRunner(
                                         runId = effectiveRunId,
                                         workspaceDir = workspaceDir,
                                         policyContext = policyContext,
+                                        clientToolNames = clientToolNames,
                                     )
                                 }
                             } else {
@@ -969,6 +1036,7 @@ class AgentRunner(
                                     runId = effectiveRunId,
                                     workspaceDir = workspaceDir,
                                     policyContext = policyContext,
+                                    clientToolNames = clientToolNames,
                                 )
                             }
                             if (execution == null) {
@@ -1078,6 +1146,16 @@ class AgentRunner(
                                 toolContext = toolContext,
                             )
                         }
+                        if (pendingClientToolCalls.isNotEmpty()) {
+                            completedSuccessfully = true
+                            emit(
+                                AcpRuntimeEvent.Done(
+                                    stopReason = "tool_calls",
+                                    pendingToolCalls = pendingClientToolCalls,
+                                ),
+                            )
+                            return@flow
+                        }
                     } else {
                         if (assistantText.isNotEmpty()) {
                             persistMessage(
@@ -1097,10 +1175,30 @@ class AgentRunner(
                     }
 
                     if (!contextGuard.fitsInContext(currentMessages)) {
+                        val preCompactionSnapshot = currentMessages.toList()
+                        val preCompactionSessionId = sessionKey
+                        var timedOutDuringCompaction = false
                         val remainingCompactionTimeoutMs = turnTimeoutMs?.let { timeout ->
                             (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
                         }
                         if (remainingCompactionTimeoutMs != null && remainingCompactionTimeoutMs <= 0L) {
+                            timedOutDuringCompaction = shouldFlagCompactionTimeout(
+                                CompactionTimeoutSignal(
+                                    isTimeout = true,
+                                    isCompactionPendingOrRetrying = true,
+                                    isCompactionInFlight = false,
+                                ),
+                            )
+                            val snapshotSelection = selectCompactionTimeoutSnapshot(
+                                CompactionTimeoutSnapshotSelectionParams(
+                                    timedOutDuringCompaction = timedOutDuringCompaction,
+                                    preCompactionSnapshot = preCompactionSnapshot,
+                                    preCompactionSessionId = preCompactionSessionId,
+                                    currentSnapshot = currentMessages.toList(),
+                                    currentSessionId = sessionKey,
+                                ),
+                            )
+                            currentMessages = snapshotSelection.messagesSnapshot.toMutableList()
                             val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
                             val timeoutError = LlmStreamEvent.Error(
                                 message = timeoutMessage,
@@ -1131,10 +1229,63 @@ class AgentRunner(
                             return@flow
                         }
 
-                        val beforeCompaction = currentMessages
+                        val beforeCompaction = currentMessages.toList()
                         val compacted = contextGuard.trimToFit(currentMessages)
                         val compactionChanged = compacted != beforeCompaction
-                        currentMessages = compacted.toMutableList()
+                        currentMessages = applyTranscriptRepairs(
+                            messages = compacted,
+                            allowedToolNames = allowedToolNames + clientToolNames,
+                        ).toMutableList()
+                        val remainingAfterCompactionTimeoutMs = turnTimeoutMs?.let { timeout ->
+                            (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
+                        }
+                        if (remainingAfterCompactionTimeoutMs != null && remainingAfterCompactionTimeoutMs <= 0L) {
+                            timedOutDuringCompaction = shouldFlagCompactionTimeout(
+                                CompactionTimeoutSignal(
+                                    isTimeout = true,
+                                    isCompactionPendingOrRetrying = true,
+                                    isCompactionInFlight = true,
+                                ),
+                            )
+                            val snapshotSelection = selectCompactionTimeoutSnapshot(
+                                CompactionTimeoutSnapshotSelectionParams(
+                                    timedOutDuringCompaction = timedOutDuringCompaction,
+                                    preCompactionSnapshot = preCompactionSnapshot,
+                                    preCompactionSessionId = preCompactionSessionId,
+                                    currentSnapshot = currentMessages.toList(),
+                                    currentSessionId = sessionKey,
+                                ),
+                            )
+                            currentMessages = snapshotSelection.messagesSnapshot.toMutableList()
+                            val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                            val timeoutError = LlmStreamEvent.Error(
+                                message = timeoutMessage,
+                                code = "timeout",
+                                retryable = runAttempt < effectiveMaxRunAttempts,
+                            )
+                            if (runAttempt < effectiveMaxRunAttempts) {
+                                lastRetryableError = timeoutError
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "$timeoutMessage during compaction; retrying",
+                                        tag = "turn_timeout_retry_compaction",
+                                    ),
+                                )
+                                continue@attemptLoop
+                            }
+                            val retryLimitMessage =
+                                "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                            emit(
+                                AcpRuntimeEvent.Error(
+                                    message = retryLimitMessage,
+                                    code = "retry_limit",
+                                    retryable = true,
+                                ),
+                            )
+                            terminalError = retryLimitMessage
+                            aborted = true
+                            return@flow
+                        }
                         if (!contextGuard.fitsInContext(currentMessages)) {
                             overflowCompactionAttempts += 1
                             val overflowCode = if (compactionChanged) {
@@ -1144,6 +1295,31 @@ class AgentRunner(
                             }
                             val overflowMessage =
                                 "Context overflow: prompt too large for the model context window."
+                            if (!toolResultTruncationAttempted && contextGuard.sessionLikelyHasOversizedToolResults(currentMessages)) {
+                                toolResultTruncationAttempted = true
+                                val truncation = contextGuard.truncateOversizedToolResults(currentMessages)
+                                if (truncation.truncated) {
+                                    currentMessages = applyTranscriptRepairs(
+                                        messages = truncation.messages,
+                                        allowedToolNames = allowedToolNames + clientToolNames,
+                                    ).toMutableList()
+                                    persistCompactedTranscript(
+                                        persistence = persistence,
+                                        sessionKey = sessionKey,
+                                        model = effectiveModel,
+                                        agentId = agentId,
+                                        workspaceDir = workspaceDir,
+                                        messages = currentMessages,
+                                    )
+                                    emit(
+                                        AcpRuntimeEvent.Status(
+                                            text = "Recovered context overflow by truncating oversized tool results; retrying",
+                                            tag = "tool_result_truncation_retry",
+                                        ),
+                                    )
+                                    continue@attemptLoop
+                                }
+                            }
                             if (
                                 runAttempt < effectiveMaxRunAttempts &&
                                 overflowCompactionAttempts < maxOverflowCompactionAttempts
@@ -1177,6 +1353,14 @@ class AgentRunner(
                             return@flow
                         }
                         overflowCompactionAttempts = 0
+                        persistCompactedTranscript(
+                            persistence = persistence,
+                            sessionKey = sessionKey,
+                            model = effectiveModel,
+                            agentId = agentId,
+                            workspaceDir = workspaceDir,
+                            messages = currentMessages,
+                        )
                         emit(
                             AcpRuntimeEvent.Status(
                                 text = "Context compacted",
@@ -1331,9 +1515,18 @@ class AgentRunner(
         runId: String,
         workspaceDir: String?,
         policyContext: ToolPolicyContext,
+        clientToolNames: Set<String>,
     ): ToolExecutionOutcome {
         val startedAt = System.currentTimeMillis()
         val toolName = normalizeToolName(toolCall.name)
+        if (toolName in clientToolNames) {
+            return ToolExecutionOutcome(
+                result = """{"status":"pending","tool":"$toolName","message":"Tool execution delegated to client"}""",
+                error = null,
+                skipOutcomeRecord = true,
+                status = "pending",
+            )
+        }
         val toolContext = PluginHookToolContext(
             agentId = agentId,
             sessionKey = sessionKey.takeIf { it.isNotBlank() },
@@ -2014,6 +2207,69 @@ class AgentRunner(
                 recordAudit = false,
             ).allowed
         }.toSet()
+    }
+
+    private fun buildRequestTools(
+        allowedToolNames: Set<String>,
+        clientTools: List<ClientToolDefinition>,
+    ): List<LlmToolDefinition> {
+        val builtIn = toolRegistry.toDefinitions(allowedToolNames)
+        if (clientTools.isEmpty()) return builtIn
+
+        val existing = builtIn.map { normalizeToolName(it.name) }.toMutableSet()
+        val clientDefs = mutableListOf<LlmToolDefinition>()
+        for (clientTool in clientTools) {
+            val normalized = normalizeToolName(clientTool.name)
+            if (normalized.isBlank() || existing.contains(normalized)) {
+                continue
+            }
+            existing += normalized
+            clientDefs += LlmToolDefinition(
+                name = normalized,
+                description = clientTool.description,
+                parameters = clientTool.parameters,
+            )
+        }
+        return builtIn + clientDefs
+    }
+
+    private fun applyTranscriptRepairs(
+        messages: List<LlmMessage>,
+        allowedToolNames: Set<String>,
+    ): List<LlmMessage> {
+        var repaired = messages
+        if (transcriptRepairPolicy.toolCallInputRepairEnabled) {
+            repaired = transcriptRepair.repairToolCallInputs(
+                messages = repaired,
+                allowedToolNames = allowedToolNames,
+            ).messages
+        }
+        if (transcriptRepairPolicy.toolResultPairRepairEnabled) {
+            repaired = transcriptRepair.repairToolUseResultPairing(
+                messages = repaired,
+                allowSyntheticToolResults = transcriptRepairPolicy.allowSyntheticToolResults,
+            ).messages
+        }
+        return repaired
+    }
+
+    private fun persistCompactedTranscript(
+        persistence: SessionPersistence?,
+        sessionKey: String,
+        model: String,
+        agentId: String,
+        workspaceDir: String?,
+        messages: List<LlmMessage>,
+    ) {
+        if (persistence == null || sessionKey.isBlank()) return
+        val existingHeader = persistence.load(sessionKey).first
+        val header = existingHeader ?: SessionPersistence.SessionHeader(
+            sessionId = sessionKey,
+            agentId = agentId,
+            model = model,
+            cwd = workspaceDir,
+        )
+        persistence.compact(sessionKey, header, messages)
     }
 
     private fun resolvePromptModeForSession(sessionKey: String): SystemPromptBuilder.PromptMode {

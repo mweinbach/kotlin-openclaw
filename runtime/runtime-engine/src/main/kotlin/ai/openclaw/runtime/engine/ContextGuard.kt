@@ -11,6 +11,13 @@ import ai.openclaw.core.agent.LlmMessage
 class ContextGuard(
     private val maxContextTokens: Int = 128_000,
 ) {
+    data class ToolResultTruncationResult(
+        val messages: List<LlmMessage>,
+        val truncatedCount: Int,
+    ) {
+        val truncated: Boolean get() = truncatedCount > 0
+    }
+
     /**
      * Estimate token count for a list of messages.
      * Uses conservative 4 chars ≈ 1 token ratio for general text,
@@ -46,13 +53,15 @@ class ContextGuard(
     ): String {
         val currentTokens = estimateTokens(currentMessages)
         val remainingBudget = (maxContextTokens * INPUT_HEADROOM_RATIO).toInt() - currentTokens
-        val maxToolTokens = (remainingBudget * SINGLE_TOOL_RESULT_SHARE).toInt()
-        val maxToolChars = (maxToolTokens * TOOL_CHARS_PER_TOKEN).toInt()
+        val maxToolTokens = (remainingBudget * MAX_TOOL_RESULT_CONTEXT_SHARE).toInt()
+        val maxToolChars = minOf(
+            (maxToolTokens * TOOL_CHARS_PER_TOKEN).toInt(),
+            calculateMaxToolResultChars(),
+        ).coerceAtLeast(MIN_KEEP_CHARS)
 
         if (result.length <= maxToolChars) return result
 
-        val truncated = result.take(maxToolChars)
-        return "$truncated\n\n[truncated: output exceeded context limit, showing first $maxToolChars chars of ${result.length}]"
+        return truncateToolResultText(result, maxToolChars)
     }
 
     /**
@@ -150,10 +159,100 @@ class ContextGuard(
         return systemMessages + nonSystem.subList(cutoffIndex, nonSystem.size)
     }
 
+    fun calculateMaxToolResultChars(): Int {
+        val maxTokens = (maxContextTokens * MAX_TOOL_RESULT_CONTEXT_SHARE).toInt()
+        val maxChars = (maxTokens * GENERAL_CHARS_PER_TOKEN).toInt()
+        return minOf(maxChars, HARD_MAX_TOOL_RESULT_CHARS)
+    }
+
+    fun sessionLikelyHasOversizedToolResults(messages: List<LlmMessage>): Boolean {
+        if (messages.isEmpty()) return false
+        val maxChars = calculateMaxToolResultChars()
+        return messages.any { message ->
+            message.role == LlmMessage.Role.TOOL && message.plainTextContent().length > maxChars
+        }
+    }
+
+    fun truncateOversizedToolResults(messages: List<LlmMessage>): ToolResultTruncationResult {
+        if (messages.isEmpty()) {
+            return ToolResultTruncationResult(messages = messages, truncatedCount = 0)
+        }
+        val maxChars = calculateMaxToolResultChars()
+        var truncatedCount = 0
+        val repaired = messages.map { message ->
+            if (message.role != LlmMessage.Role.TOOL) {
+                return@map message
+            }
+            val content = message.plainTextContent()
+            if (content.length <= maxChars) {
+                return@map message
+            }
+            truncatedCount += 1
+            val truncated = truncateToolResultText(content, maxChars)
+            message.copy(
+                content = truncated,
+                contentBlocks = null,
+            )
+        }
+        return ToolResultTruncationResult(
+            messages = if (truncatedCount > 0) repaired else messages,
+            truncatedCount = truncatedCount,
+        )
+    }
+
+    private fun truncateToolResultText(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text
+        val budget = (maxChars - TRUNCATION_SUFFIX.length).coerceAtLeast(MIN_KEEP_CHARS)
+
+        if (hasImportantTail(text) && budget > MIN_KEEP_CHARS * 2) {
+            val tailBudget = minOf((budget * 0.3).toInt(), 4_000)
+            val markerChars = MIDDLE_OMISSION_MARKER.length
+            val headBudget = (budget - tailBudget - markerChars).coerceAtLeast(MIN_KEEP_CHARS)
+            if (headBudget > MIN_KEEP_CHARS) {
+                var headCut = headBudget
+                val headNewline = text.lastIndexOf('\n', headBudget)
+                if (headNewline > (headBudget * 0.8).toInt()) {
+                    headCut = headNewline
+                }
+
+                var tailStart = text.length - tailBudget
+                val tailNewline = text.indexOf('\n', tailStart)
+                if (tailNewline != -1 && tailNewline < tailStart + (tailBudget * 0.2).toInt()) {
+                    tailStart = tailNewline + 1
+                }
+                return text.substring(0, headCut) + MIDDLE_OMISSION_MARKER + text.substring(tailStart) + TRUNCATION_SUFFIX
+            }
+        }
+
+        var cutPoint = budget
+        val lastNewline = text.lastIndexOf('\n', budget)
+        if (lastNewline > (budget * 0.8).toInt()) {
+            cutPoint = lastNewline
+        }
+        return text.substring(0, cutPoint) + TRUNCATION_SUFFIX
+    }
+
+    private fun hasImportantTail(text: String): Boolean {
+        val tail = text.takeLast(2_000).lowercase()
+        if (TAIL_ERROR_REGEX.containsMatchIn(tail)) return true
+        if (tail.trim().endsWith("}")) return true
+        return TAIL_SUMMARY_REGEX.containsMatchIn(tail)
+    }
+
     companion object {
         private const val INPUT_HEADROOM_RATIO = 0.75
-        private const val SINGLE_TOOL_RESULT_SHARE = 0.5
+        private const val MAX_TOOL_RESULT_CONTEXT_SHARE = 0.3
         private const val GENERAL_CHARS_PER_TOKEN = 4.0
         private const val TOOL_CHARS_PER_TOKEN = 2.0
+        private const val HARD_MAX_TOOL_RESULT_CHARS = 400_000
+        private const val MIN_KEEP_CHARS = 2_000
+        private const val TRUNCATION_SUFFIX =
+            "\n\n[truncated: original output exceeded context limit; request specific sections or use offset/limit]"
+        private const val MIDDLE_OMISSION_MARKER =
+            "\n\n[... middle content omitted; showing head and tail ...]\n\n"
+        private val TAIL_ERROR_REGEX =
+            Regex("\\b(error|exception|failed|fatal|traceback|panic|stack trace|errno|exit code)\\b")
+        private val TAIL_SUMMARY_REGEX =
+            Regex("\\b(total|summary|result|complete|finished|done)\\b")
     }
 }
