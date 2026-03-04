@@ -1,67 +1,57 @@
 package ai.openclaw.runtime.gateway
 
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.*
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 
 /**
- * JSON-RPC 2.0 protocol types and dispatcher.
- * Ported from src/gateway/server/ws-connection/message-handler.ts
+ * Gateway frame protocol types and dispatcher.
+ * Mirrors OpenClaw gateway ws frame topology: req/res/event.
  */
 
 @Serializable
-data class JsonRpcRequest(
-    val jsonrpc: String = "2.0",
-    val id: JsonElement? = null,
+data class GatewayRequestFrame(
+    val type: String = "req",
+    val id: String,
     val method: String,
     val params: JsonElement? = null,
 )
 
 @Serializable
-data class JsonRpcResponse(
-    val jsonrpc: String = "2.0",
-    val id: JsonElement? = null,
-    val result: JsonElement? = null,
-    val error: JsonRpcError? = null,
-)
-
-@Serializable
-data class JsonRpcError(
-    val code: Int,
+data class GatewayErrorFrame(
+    val code: String,
     val message: String,
-    val data: JsonElement? = null,
-) {
-    companion object {
-        const val PARSE_ERROR = -32700
-        const val INVALID_REQUEST = -32600
-        const val METHOD_NOT_FOUND = -32601
-        const val INVALID_PARAMS = -32602
-        const val INTERNAL_ERROR = -32603
-        const val AUTH_REQUIRED = -32000
-        const val FORBIDDEN = -32001
-        const val RATE_LIMITED = -32002
-    }
-}
+    val details: JsonElement? = null,
+    val retryable: Boolean? = null,
+)
 
-/**
- * Event notification pushed to clients (no id, no response expected).
- */
 @Serializable
-data class JsonRpcNotification(
-    val jsonrpc: String = "2.0",
-    val method: String,
-    val params: JsonElement? = null,
+data class GatewayResponseFrame(
+    val type: String = "res",
+    val id: String,
+    val ok: Boolean,
+    val payload: JsonElement? = null,
+    val error: GatewayErrorFrame? = null,
+)
+
+@Serializable
+data class GatewayEventFrame(
+    val type: String = "event",
+    val event: String,
+    val payload: JsonElement? = null,
+    val seq: Long? = null,
+    val stateVersion: JsonElement? = null,
 )
 
 /**
- * Handler for a JSON-RPC method.
+ * Handler for a gateway request method.
  */
 fun interface RpcMethodHandler {
     suspend fun handle(params: JsonElement?, context: RpcContext): JsonElement?
 }
 
 /**
- * Context available to every RPC handler.
+ * Context available to every request handler.
  */
 data class RpcContext(
     val connectionId: String,
@@ -70,7 +60,7 @@ data class RpcContext(
 )
 
 /**
- * Dispatches JSON-RPC requests to registered method handlers.
+ * Dispatches gateway requests to registered method handlers.
  */
 class RpcDispatcher {
     private val methods = mutableMapOf<String, RpcMethodHandler>()
@@ -85,25 +75,28 @@ class RpcDispatcher {
 
     fun hasMethod(method: String): Boolean = method in methods
 
-    suspend fun dispatch(request: JsonRpcRequest, context: RpcContext): JsonRpcResponse {
+    fun methodNames(): List<String> = methods.keys.sorted()
+
+    suspend fun dispatch(request: GatewayRequestFrame, context: RpcContext): GatewayResponseFrame {
         val handler = methods[request.method]
-            ?: return JsonRpcResponse(
+            ?: return GatewayResponseFrame(
                 id = request.id,
-                error = JsonRpcError(
-                    code = JsonRpcError.METHOD_NOT_FOUND,
+                ok = false,
+                error = GatewayErrorFrame(
+                    code = "method_not_found",
                     message = "Method not found: ${request.method}",
                 ),
             )
 
-        // Check scope requirements
         val requiredScope = scopeRequirements[request.method]
         if (requiredScope != null) {
             val auth = context.authContext
             if (auth == null || !auth.hasScope(requiredScope)) {
-                return JsonRpcResponse(
+                return GatewayResponseFrame(
                     id = request.id,
-                    error = JsonRpcError(
-                        code = JsonRpcError.FORBIDDEN,
+                    ok = false,
+                    error = GatewayErrorFrame(
+                        code = "forbidden",
                         message = "Insufficient scope for method: ${request.method}",
                     ),
                 )
@@ -112,17 +105,19 @@ class RpcDispatcher {
 
         return try {
             val result = handler.handle(request.params, context)
-            JsonRpcResponse(id = request.id, result = result ?: JsonNull)
+            GatewayResponseFrame(id = request.id, ok = true, payload = result ?: JsonNull)
         } catch (e: RpcException) {
-            JsonRpcResponse(
+            GatewayResponseFrame(
                 id = request.id,
-                error = JsonRpcError(code = e.code, message = e.message ?: "Unknown error"),
+                ok = false,
+                error = GatewayErrorFrame(code = e.code, message = e.message ?: "Unknown error"),
             )
         } catch (e: Exception) {
-            JsonRpcResponse(
+            GatewayResponseFrame(
                 id = request.id,
-                error = JsonRpcError(
-                    code = JsonRpcError.INTERNAL_ERROR,
+                ok = false,
+                error = GatewayErrorFrame(
+                    code = "internal_error",
                     message = e.message ?: "Internal error",
                 ),
             )
@@ -130,4 +125,4 @@ class RpcDispatcher {
     }
 }
 
-class RpcException(val code: Int, override val message: String) : RuntimeException(message)
+class RpcException(val code: String, override val message: String) : RuntimeException(message)

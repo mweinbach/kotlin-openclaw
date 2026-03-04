@@ -142,4 +142,23 @@ class AgentRunnerPromptParityTest {
         assertEquals(0, promptHookMessageCount)
         assertEquals(0, legacyHookMessageCount)
     }
+
+    @Test
+    fun `extra system prompt merges with subagent contract context`() = runTest {
+        val provider = CapturingProvider()
+        val runner = AgentRunner(provider = provider)
+
+        runner.runTurn(
+            messages = listOf(LlmMessage(role = LlmMessage.Role.USER, content = "hello")),
+            model = "test-model",
+            sessionKey = "agent:main:subagent:child-2",
+            extraSystemPrompt = "Group chat directives",
+        ).toList()
+
+        val prompt = provider.lastRequest?.systemPrompt
+        assertNotNull(prompt)
+        assertTrue(prompt.contains("## Subagent Context"))
+        assertTrue(prompt.contains("Group chat directives"))
+        assertTrue(prompt.contains("## Subagent Contract"))
+    }
 }

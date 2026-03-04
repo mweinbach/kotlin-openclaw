@@ -4,6 +4,7 @@ import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.model.DEFAULT_AGENT_ID
 import ai.openclaw.core.model.GroupToolPolicyConfig
 import ai.openclaw.core.model.IdentityConfig
+import ai.openclaw.core.model.MemoryCitationsMode
 import ai.openclaw.core.plugins.BeforeAgentStartResult
 
 /**
@@ -41,5 +42,20 @@ data class EmbeddedRunParams(
     val maxRunAttempts: Int? = null,
     val hookSessionId: String? = null,
     val legacyBeforeAgentStartResult: BeforeAgentStartResult? = null,
+    val modelAliasLines: List<String> = emptyList(),
+    val workspaceNotes: List<String> = emptyList(),
+    val docsPath: String? = null,
+    val ownerNumbers: List<String> = emptyList(),
+    val ownerDisplay: SystemPromptBuilder.OwnerDisplay = SystemPromptBuilder.OwnerDisplay.RAW,
+    val ownerDisplaySecret: String? = null,
+    val reasoningTagHint: Boolean = false,
+    val extraSystemPrompt: String? = null,
+    val contextFiles: List<SystemPromptBuilder.ContextFile> = emptyList(),
+    val bootstrapTruncationWarningLines: List<String> = emptyList(),
+    val memoryCitationsMode: MemoryCitationsMode? = null,
+    val ttsHint: String? = null,
+    val reactionGuidance: SystemPromptBuilder.ReactionGuidance? = null,
+    val messageToolHints: List<String> = emptyList(),
+    val heartbeatPrompt: String? = null,
     val turnContext: EmbeddedTurnContext = EmbeddedTurnContext(),
 )

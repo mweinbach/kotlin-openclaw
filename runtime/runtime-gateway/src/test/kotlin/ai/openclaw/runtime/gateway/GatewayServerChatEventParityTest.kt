@@ -1,52 +1,245 @@
 package ai.openclaw.runtime.gateway
 
 import ai.openclaw.core.model.AcpRuntimeEvent
-import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.*
 import org.junit.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class GatewayServerChatEventParityTest {
     @Test
-    fun `tool call payload includes lifecycle metadata`() {
+    fun `chat text delta payload uses state delta schema`() {
         val server = GatewayServer()
         val payload = server.buildChatEventPayload(
+            event = AcpRuntimeEvent.TextDelta(text = "hello"),
+            sessionKey = "session-1",
+            runId = "req-1",
+            seq = 1,
+        )!!
+
+        assertEquals("req-1", payload["runId"]?.jsonPrimitive?.content)
+        assertEquals("session-1", payload["sessionKey"]?.jsonPrimitive?.content)
+        assertEquals(1, payload["seq"]?.jsonPrimitive?.int)
+        assertEquals("delta", payload["state"]?.jsonPrimitive?.content)
+        val message = payload["message"]?.jsonObject
+        assertNotNull(message)
+        assertEquals("assistant", message["role"]?.jsonPrimitive?.content)
+        val content = message["content"]?.jsonArray?.firstOrNull()?.jsonObject
+        assertNotNull(content)
+        assertEquals("text", content["type"]?.jsonPrimitive?.content)
+        assertEquals("hello", content["text"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `chat done payload uses state final schema`() {
+        val server = GatewayServer()
+        val payload = server.buildChatEventPayload(
+            event = AcpRuntimeEvent.Done(stopReason = "end_turn"),
+            sessionKey = "session-1",
+            runId = "req-1",
+            seq = 2,
+            bufferedAssistantText = "final text",
+        )!!
+
+        assertEquals("final", payload["state"]?.jsonPrimitive?.content)
+        assertEquals("end_turn", payload["stopReason"]?.jsonPrimitive?.content)
+        val message = payload["message"]?.jsonObject
+        assertNotNull(message)
+        val content = message["content"]?.jsonArray?.firstOrNull()?.jsonObject
+        assertNotNull(content)
+        assertEquals("final text", content["text"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `agent event payload preserves envelope fields`() {
+        val server = GatewayServer()
+        val payload = server.buildAgentEventPayload(
+            runId = "req-1",
+            sessionKey = "session-1",
+            seq = 3,
+            stream = "tool",
+            data = kotlinx.serialization.json.buildJsonObject {
+                put("phase", JsonPrimitive("start"))
+                put("toolCallId", JsonPrimitive("call_1"))
+            },
+        )
+
+        assertEquals("req-1", payload["runId"]?.jsonPrimitive?.content)
+        assertEquals("session-1", payload["sessionKey"]?.jsonPrimitive?.content)
+        assertEquals(3, payload["seq"]?.jsonPrimitive?.int)
+        assertEquals("tool", payload["stream"]?.jsonPrimitive?.content)
+        assertNotNull(payload["ts"]?.jsonPrimitive?.longOrNull)
+        assertEquals("start", payload["data"]?.jsonObject?.get("phase")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `tool update with output maps to result phase`() {
+        val server = GatewayServer()
+        val mapped = server.buildAgentStreamPayload(
+            AcpRuntimeEvent.ToolCall(
+                text = "Completed read",
+                tag = "tool_call_update",
+                toolCallId = "call_1",
+                status = "completed",
+                title = "read",
+                rawOutput = """{"status":"ok"}""",
+            ),
+        )
+
+        assertNotNull(mapped)
+        assertEquals("tool", mapped.stream)
+        assertEquals("result", mapped.data["phase"]?.jsonPrimitive?.content)
+        assertEquals("call_1", mapped.data["toolCallId"]?.jsonPrimitive?.content)
+        assertEquals(false, mapped.data["isError"]?.jsonPrimitive?.booleanOrNull)
+        assertEquals("ok", mapped.data["result"]?.jsonObject?.get("status")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `tool payload can redact result fields`() {
+        val server = GatewayServer()
+        val mapped = server.buildAgentStreamPayload(
             event = AcpRuntimeEvent.ToolCall(
                 text = "Completed read",
                 tag = "tool_call_update",
                 toolCallId = "call_1",
                 status = "completed",
                 title = "read",
+                rawOutput = """{"status":"ok"}""",
             ),
-            sessionKey = "session-1",
-            requestId = "req-1",
+            includeToolResults = false,
         )
 
-        assertEquals("tool_call", payload["type"]?.jsonPrimitive?.content)
-        assertEquals("tool_call_update", payload["tag"]?.jsonPrimitive?.content)
-        assertEquals("call_1", payload["toolCallId"]?.jsonPrimitive?.content)
-        assertEquals("completed", payload["status"]?.jsonPrimitive?.content)
-        assertEquals("read", payload["title"]?.jsonPrimitive?.content)
-        assertEquals("read | status=completed | Completed read", payload["detail"]?.jsonPrimitive?.content)
+        assertNotNull(mapped)
+        assertEquals("result", mapped.data["phase"]?.jsonPrimitive?.content)
+        assertEquals(null, mapped.data["result"])
+        assertEquals(false, mapped.data["isError"]?.jsonPrimitive?.booleanOrNull)
     }
 
     @Test
-    fun `status payload preserves status tag and token metadata`() {
+    fun `chat send requires idempotency key`() = runTest {
         val server = GatewayServer()
-        val payload = server.buildChatEventPayload(
-            event = AcpRuntimeEvent.Status(
-                text = "Tokens: 10+5",
-                tag = "usage_update",
-                used = 15,
-                size = 128,
+        server.onChatSend = { flow { emit(AcpRuntimeEvent.Done(stopReason = "end_turn")) } }
+
+        val response = server.dispatcher.dispatch(
+            GatewayRequestFrame(
+                id = "req-1",
+                method = "chat.send",
+                params = kotlinx.serialization.json.buildJsonObject {
+                    put("sessionKey", "s1")
+                    put("message", "hello")
+                },
             ),
-            sessionKey = "session-1",
-            requestId = "req-1",
+            RpcContext(
+                connectionId = "conn-1",
+                authContext = null,
+                gateway = server,
+            ),
         )
 
-        assertEquals("status", payload["type"]?.jsonPrimitive?.content)
-        assertEquals("usage_update", payload["tag"]?.jsonPrimitive?.content)
-        assertEquals(15, payload["used"]?.jsonPrimitive?.int)
-        assertEquals(128, payload["size"]?.jsonPrimitive?.int)
+        assertEquals(false, response.ok)
+        assertEquals("invalid_params", response.error?.code)
+    }
+
+    @Test
+    fun `chat send duplicate idempotency key returns in flight`() = runTest {
+        val server = GatewayServer()
+        server.onChatSend = {
+            flow {
+                emit(AcpRuntimeEvent.TextDelta(text = "hi"))
+                delay(250)
+                emit(AcpRuntimeEvent.Done(stopReason = "end_turn"))
+            }
+        }
+        val request = GatewayRequestFrame(
+            id = "req-1",
+            method = "chat.send",
+            params = kotlinx.serialization.json.buildJsonObject {
+                put("sessionKey", "s1")
+                put("message", "hello")
+                put("idempotencyKey", "run-1")
+            },
+        )
+
+        val first = server.dispatcher.dispatch(
+            request,
+            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+        )
+        val second = server.dispatcher.dispatch(
+            request.copy(id = "req-2"),
+            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+        )
+
+        assertEquals(true, first.ok)
+        assertEquals("run-1", first.payload?.jsonObject?.get("runId")?.jsonPrimitive?.content)
+        assertEquals("started", first.payload?.jsonObject?.get("status")?.jsonPrimitive?.content)
+
+        assertEquals(true, second.ok)
+        assertEquals("run-1", second.payload?.jsonObject?.get("runId")?.jsonPrimitive?.content)
+        assertEquals("in_flight", second.payload?.jsonObject?.get("status")?.jsonPrimitive?.content)
+        server.stop()
+    }
+
+    @Test
+    fun `chat abort response uses ok aborted and runIds contract`() = runTest {
+        val server = GatewayServer()
+        val response = server.dispatcher.dispatch(
+            GatewayRequestFrame(
+                id = "req-1",
+                method = "chat.abort",
+                params = kotlinx.serialization.json.buildJsonObject {
+                    put("sessionKey", "s1")
+                },
+            ),
+            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+        )
+
+        assertEquals(true, response.ok)
+        assertEquals(true, response.payload?.jsonObject?.get("ok")?.jsonPrimitive?.booleanOrNull)
+        assertEquals(false, response.payload?.jsonObject?.get("aborted")?.jsonPrimitive?.booleanOrNull)
+        assertTrue(response.payload?.jsonObject?.get("runIds")?.jsonArray?.isEmpty() == true)
+    }
+
+    @Test
+    fun `chat abort rejects runId session mismatch`() = runTest {
+        val server = GatewayServer()
+        server.onChatSend = {
+            flow {
+                delay(500)
+                emit(AcpRuntimeEvent.Done(stopReason = "end_turn"))
+            }
+        }
+
+        server.dispatcher.dispatch(
+            GatewayRequestFrame(
+                id = "req-send",
+                method = "chat.send",
+                params = kotlinx.serialization.json.buildJsonObject {
+                    put("sessionKey", "s1")
+                    put("message", "hello")
+                    put("idempotencyKey", "run-1")
+                },
+            ),
+            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+        )
+
+        val abort = server.dispatcher.dispatch(
+            GatewayRequestFrame(
+                id = "req-abort",
+                method = "chat.abort",
+                params = kotlinx.serialization.json.buildJsonObject {
+                    put("sessionKey", "s2")
+                    put("runId", "run-1")
+                },
+            ),
+            RpcContext(connectionId = "conn-1", authContext = null, gateway = server),
+        )
+
+        assertEquals(false, abort.ok)
+        assertEquals("invalid_request", abort.error?.code)
+        server.stop()
     }
 }

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.json.*
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Embedded Ktor-based gateway server.
@@ -30,6 +31,14 @@ class GatewayServer(
     private val host: String = "127.0.0.1",
     private val config: OpenClawConfig? = null,
 ) {
+    private companion object {
+        private const val PROTOCOL_VERSION = 7
+        private const val GATEWAY_SERVER_VERSION = "kotlin-openclaw"
+        private const val MAX_PAYLOAD_BYTES = 4_194_304
+        private const val MAX_BUFFERED_BYTES = 1_048_576
+        private const val TICK_INTERVAL_MS = 1_000
+    }
+
     private var server: EmbeddedServer<NettyApplicationEngine, NettyApplicationEngine.Configuration>? = null
 
     val json = Json {
@@ -46,6 +55,13 @@ class GatewayServer(
 
     // Connected WebSocket sessions
     private val connections = ConcurrentHashMap<String, WsConnection>()
+    private val eventSeq = AtomicLong(0L)
+    private val activeChatJobs = ConcurrentHashMap<String, Job>()
+    private val activeChatSessions = ConcurrentHashMap<String, String>()
+    private val activeChatConnections = ConcurrentHashMap<String, String>()
+    private val chatBuffers = ConcurrentHashMap<String, StringBuilder>()
+    private val chatSeqByRun = ConcurrentHashMap<String, Int>()
+    private val abortedChatRuns = ConcurrentHashMap.newKeySet<String>()
 
     data class WsConnection(
         val id: String,
@@ -226,24 +242,66 @@ class GatewayServer(
             val connId = UUID.randomUUID().toString()
             var authContext: AuthContext? = null
             var authenticated = false
+            val connectNonce = UUID.randomUUID().toString()
+
+            send(
+                Frame.Text(
+                    json.encodeToString(
+                        GatewayEventFrame.serializer(),
+                        GatewayEventFrame(
+                            event = "connect.challenge",
+                            payload = buildJsonObject {
+                                put("nonce", connectNonce)
+                                put("ts", System.currentTimeMillis())
+                            },
+                            seq = null,
+                        ),
+                    ),
+                ),
+            )
 
             try {
                 for (frame in incoming) {
                     if (frame !is Frame.Text) continue
                     val text = frame.readText()
 
-                    val request = try {
-                        json.decodeFromString(JsonRpcRequest.serializer(), text)
-                    } catch (e: Exception) {
-                        send(Frame.Text(json.encodeToString(JsonRpcResponse.serializer(), JsonRpcResponse(
-                            error = JsonRpcError(JsonRpcError.PARSE_ERROR, "Invalid JSON-RPC"),
-                        ))))
+                    val request = parseRequestFrame(text)
+                    if (request == null) {
+                        send(
+                            Frame.Text(
+                                json.encodeToString(
+                                    GatewayResponseFrame.serializer(),
+                                    GatewayResponseFrame(
+                                        id = "unknown",
+                                        ok = false,
+                                        error = GatewayErrorFrame(
+                                            code = "parse_error",
+                                            message = "Invalid request frame",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
                         continue
                     }
 
                     // Handle connect/auth as a special case
                     if (request.method == "connect") {
-                        val result = handleConnect(connId, request.params, this)
+                        val protocolValidationError = validateConnectProtocol(request.params)
+                        if (protocolValidationError != null) {
+                            val protocolResponse = GatewayResponseFrame(
+                                id = request.id,
+                                ok = false,
+                                error = GatewayErrorFrame(
+                                    code = "invalid_request",
+                                    message = protocolValidationError,
+                                ),
+                            )
+                            send(Frame.Text(json.encodeToString(GatewayResponseFrame.serializer(), protocolResponse)))
+                            continue
+                        }
+
+                        val result = handleConnect(connId, request.params, this, connectNonce)
                         authContext = when (result) {
                             is AuthResult.Allowed -> {
                                 authenticated = true
@@ -254,28 +312,38 @@ class GatewayServer(
                         }
 
                         val response = when (result) {
-                            is AuthResult.Allowed -> JsonRpcResponse(
+                            is AuthResult.Allowed -> GatewayResponseFrame(
                                 id = request.id,
-                                result = buildJsonObject {
-                                    put("status", "connected")
-                                    put("connectionId", connId)
-                                },
+                                ok = true,
+                                payload = buildHelloOkPayload(connId),
                             )
-                            is AuthResult.Denied -> JsonRpcResponse(
+                            is AuthResult.Denied -> GatewayResponseFrame(
                                 id = request.id,
-                                error = JsonRpcError(JsonRpcError.AUTH_REQUIRED, result.reason),
+                                ok = false,
+                                error = GatewayErrorFrame(code = "auth_required", message = result.reason),
                             )
                         }
-                        send(Frame.Text(json.encodeToString(JsonRpcResponse.serializer(), response)))
+                        send(Frame.Text(json.encodeToString(GatewayResponseFrame.serializer(), response)))
                         continue
                     }
 
                     // All other methods require authentication (unless auth mode is NONE)
                     if (!authenticated && authenticator.authenticate(ConnectParams(connId)).let { it is AuthResult.Denied }) {
-                        send(Frame.Text(json.encodeToString(JsonRpcResponse.serializer(), JsonRpcResponse(
-                            id = request.id,
-                            error = JsonRpcError(JsonRpcError.AUTH_REQUIRED, "Authentication required"),
-                        ))))
+                        send(
+                            Frame.Text(
+                                json.encodeToString(
+                                    GatewayResponseFrame.serializer(),
+                                    GatewayResponseFrame(
+                                        id = request.id,
+                                        ok = false,
+                                        error = GatewayErrorFrame(
+                                            code = "auth_required",
+                                            message = "Authentication required",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        )
                         continue
                     }
 
@@ -286,7 +354,7 @@ class GatewayServer(
                         gateway = this@GatewayServer,
                     )
                     val response = dispatcher.dispatch(request, context)
-                    send(Frame.Text(json.encodeToString(JsonRpcResponse.serializer(), response)))
+                    send(Frame.Text(json.encodeToString(GatewayResponseFrame.serializer(), response)))
                 }
             } finally {
                 connections.remove(connId)
@@ -298,8 +366,13 @@ class GatewayServer(
         connId: String,
         params: JsonElement?,
         session: DefaultWebSocketServerSession,
+        connectNonce: String,
     ): AuthResult {
         val obj = params?.jsonObject
+        val nonce = obj?.get("nonce")?.jsonPrimitive?.contentOrNull
+        if (!nonce.isNullOrBlank() && nonce != connectNonce) {
+            return AuthResult.Denied("Invalid connect challenge nonce", AuthMode.NONE)
+        }
         return authenticator.authenticate(ConnectParams(
             connectionId = connId,
             token = obj?.get("token")?.jsonPrimitive?.contentOrNull,
@@ -309,16 +382,79 @@ class GatewayServer(
         ))
     }
 
+    private fun parseRequestFrame(raw: String): GatewayRequestFrame? {
+        val element = runCatching { json.parseToJsonElement(raw) }.getOrNull() as? JsonObject ?: return null
+        val type = element["type"]?.jsonPrimitive?.contentOrNull ?: return null
+        if (type != "req") return null
+        val id = element["id"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val method = element["method"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return GatewayRequestFrame(
+            id = id,
+            method = method,
+            params = element["params"],
+        )
+    }
+
+    private fun validateConnectProtocol(params: JsonElement?): String? {
+        val obj = params?.jsonObject
+        val minProtocol = obj?.get("minProtocol")?.jsonPrimitive?.intOrNull ?: PROTOCOL_VERSION
+        val maxProtocol = obj?.get("maxProtocol")?.jsonPrimitive?.intOrNull ?: PROTOCOL_VERSION
+        if (minProtocol > maxProtocol) {
+            return "invalid protocol bounds: minProtocol must be <= maxProtocol"
+        }
+        if (maxProtocol < PROTOCOL_VERSION || minProtocol > PROTOCOL_VERSION) {
+            return "protocol mismatch (expected $PROTOCOL_VERSION)"
+        }
+        return null
+    }
+
+    private fun buildHelloOkPayload(connId: String): JsonObject {
+        return buildJsonObject {
+            put("type", "hello-ok")
+            put("protocol", PROTOCOL_VERSION)
+            putJsonObject("server") {
+                put("version", GATEWAY_SERVER_VERSION)
+                put("connId", connId)
+            }
+            putJsonObject("features") {
+                putJsonArray("methods") {
+                    dispatcher.methodNames().forEach { method ->
+                        add(JsonPrimitive(method))
+                    }
+                }
+                putJsonArray("events") {
+                    listOf("connect.challenge", "agent", "chat").forEach { event ->
+                        add(JsonPrimitive(event))
+                    }
+                }
+            }
+            putJsonObject("snapshot") {
+                put("connections", connections.size)
+            }
+            putJsonObject("policy") {
+                put("maxPayload", MAX_PAYLOAD_BYTES)
+                put("maxBufferedBytes", MAX_BUFFERED_BYTES)
+                put("tickIntervalMs", TICK_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun nextEventSeq(): Long = eventSeq.incrementAndGet()
+
     // --- Broadcasting ---
 
     suspend fun broadcast(method: String, params: JsonElement?) {
-        val notification = json.encodeToString(
-            JsonRpcNotification.serializer(),
-            JsonRpcNotification(method = method, params = params),
+        val frame = json.encodeToString(
+            GatewayEventFrame.serializer(),
+            GatewayEventFrame(
+                event = method,
+                payload = params,
+                seq = nextEventSeq(),
+            ),
         )
         connections.values.forEach { conn ->
             try {
-                conn.session.send(Frame.Text(notification))
+                conn.session.send(Frame.Text(frame))
             } catch (_: Exception) {
                 // Client disconnected
                 connections.remove(conn.id)
@@ -328,12 +464,16 @@ class GatewayServer(
 
     suspend fun sendTo(connectionId: String, method: String, params: JsonElement?) {
         val conn = connections[connectionId] ?: return
-        val notification = json.encodeToString(
-            JsonRpcNotification.serializer(),
-            JsonRpcNotification(method = method, params = params),
+        val frame = json.encodeToString(
+            GatewayEventFrame.serializer(),
+            GatewayEventFrame(
+                event = method,
+                payload = params,
+                seq = null,
+            ),
         )
         try {
-            conn.session.send(Frame.Text(notification))
+            conn.session.send(Frame.Text(frame))
         } catch (_: Exception) {
             connections.remove(connectionId)
         }
@@ -372,18 +512,17 @@ class GatewayServer(
         }
 
         dispatcher.register("chat.send") { params, context ->
-            val obj = params?.jsonObject ?: throw RpcException(
-                JsonRpcError.INVALID_PARAMS, "Missing params",
-            )
+            val obj = params?.jsonObject ?: throw RpcException("invalid_params", "Missing params")
             val text = obj["message"]?.jsonPrimitive?.contentOrNull
                 ?: obj["text"]?.jsonPrimitive?.contentOrNull
-                ?: throw RpcException(JsonRpcError.INVALID_PARAMS, "Missing message text")
+                ?: throw RpcException("invalid_params", "Missing message text")
 
-            val chatHandler = onChatSend ?: throw RpcException(
-                JsonRpcError.INTERNAL_ERROR, "Agent not configured",
-            )
+            val chatHandler = onChatSend ?: throw RpcException("internal_error", "Agent not configured")
 
-            val requestId = UUID.randomUUID().toString()
+            val runId = obj["idempotencyKey"]?.jsonPrimitive?.contentOrNull
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: throw RpcException("invalid_params", "Missing idempotencyKey")
             val sessionKey = obj["sessionKey"]?.jsonPrimitive?.contentOrNull ?: "ws:${context.connectionId}"
             val agentId = obj["agentId"]?.jsonPrimitive?.contentOrNull
             val channel = obj["channel"]?.jsonPrimitive?.contentOrNull
@@ -392,24 +531,29 @@ class GatewayServer(
             val model = obj["model"]?.jsonPrimitive?.contentOrNull
             val deliver = obj["deliver"]?.jsonPrimitive?.booleanOrNull ?: true
 
-            // Stream events to the requesting connection
-            serverScope.launch {
-                var agentSeq = 0
-                suspend fun sendAgentEvent(stream: String, data: JsonObject) {
-                    agentSeq += 1
-                    val payload = buildAgentEventPayload(
-                        runId = requestId,
-                        sessionKey = sessionKey,
-                        seq = agentSeq,
-                        stream = stream,
-                        data = data,
-                    )
-                    sendTo(context.connectionId, "agent.event", payload)
+            val existingJob = activeChatJobs[runId]
+            if (existingJob?.isActive == true) {
+                return@register buildJsonObject {
+                    put("runId", runId)
+                    put("status", "in_flight")
                 }
+            }
+
+            // Stream events for this run id.
+            chatBuffers[runId] = StringBuilder()
+            chatSeqByRun[runId] = 0
+            val chatJob = serverScope.launch {
                 try {
-                    sendAgentEvent(
-                        stream = "lifecycle",
-                        data = buildJsonObject { put("phase", "start") },
+                    val startSeq = nextChatSeq(runId)
+                    broadcast(
+                        "agent",
+                        buildAgentEventPayload(
+                            runId = runId,
+                            sessionKey = sessionKey,
+                            seq = startSeq,
+                            stream = "lifecycle",
+                            data = buildJsonObject { put("phase", "start") },
+                        ),
                     )
                     chatHandler(ChatSendParams(
                         sessionKey = sessionKey,
@@ -420,45 +564,148 @@ class GatewayServer(
                         to = to,
                         model = model,
                         deliver = deliver,
-                        requestId = requestId,
+                        requestId = runId,
                     )).collect { event ->
-                        val eventJson = buildChatEventPayload(
-                            event = event,
-                            sessionKey = sessionKey,
-                            requestId = requestId,
-                        )
-                        sendTo(context.connectionId, "chat.event", eventJson)
-                        buildAgentStreamPayload(event)?.let { mapped ->
-                            sendAgentEvent(stream = mapped.stream, data = mapped.data)
+                        buildAgentStreamPayload(event, includeToolResults = false)?.let { mapped ->
+                            val seq = nextChatSeq(runId)
+                            val agentPayload = buildAgentEventPayload(
+                                runId = runId,
+                                sessionKey = sessionKey,
+                                seq = seq,
+                                stream = mapped.stream,
+                                data = mapped.data,
+                            )
+                            if (mapped.stream == "tool") {
+                                // Tool events are requester-scoped by default to avoid leaking tool output.
+                                sendTo(context.connectionId, "agent", agentPayload)
+                            } else {
+                                broadcast("agent", agentPayload)
+                            }
+                            when (mapped.stream) {
+                                "assistant" -> {
+                                    val delta = mapped.data["text"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                                    if (delta.isNotEmpty()) {
+                                        val cumulative = chatBuffers[runId]?.apply { append(delta) }?.toString().orEmpty()
+                                        broadcast(
+                                            "chat",
+                                            buildChatDeltaPayload(
+                                                runId = runId,
+                                                sessionKey = sessionKey,
+                                                seq = seq,
+                                                text = cumulative,
+                                            ),
+                                        )
+                                    }
+                                }
+
+                                "lifecycle" -> {
+                                    val phase = mapped.data["phase"]?.jsonPrimitive?.contentOrNull
+                                    if (phase == "end") {
+                                        val finalText = chatBuffers[runId]?.toString().orEmpty()
+                                        broadcast(
+                                            "chat",
+                                            buildChatFinalPayload(
+                                                runId = runId,
+                                                sessionKey = sessionKey,
+                                                seq = seq,
+                                                text = finalText,
+                                                stopReason = mapped.data["stopReason"]?.jsonPrimitive?.contentOrNull,
+                                            ),
+                                        )
+                                    } else if (phase == "error") {
+                                        broadcast(
+                                            "chat",
+                                            buildChatErrorPayload(
+                                                runId = runId,
+                                                sessionKey = sessionKey,
+                                                seq = seq,
+                                                error = mapped.data["error"]?.jsonPrimitive?.contentOrNull
+                                                    ?: "Unknown error",
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
+                } catch (cancelled: CancellationException) {
+                    if (!abortedChatRuns.contains(runId)) {
+                        throw cancelled
+                    }
                 } catch (e: Exception) {
-                    sendTo(context.connectionId, "chat.event", buildJsonObject {
-                        put("type", "error")
-                        put("message", e.message ?: "Unknown error")
-                        put("sessionKey", sessionKey)
-                        put("requestId", requestId)
-                    })
-                    sendAgentEvent(
-                        stream = "lifecycle",
-                        data = buildJsonObject {
-                            put("phase", "error")
-                            put("error", e.message ?: "Unknown error")
-                        },
+                    val seq = nextChatSeq(runId)
+                    broadcast(
+                        "agent",
+                        buildAgentEventPayload(
+                            runId = runId,
+                            sessionKey = sessionKey,
+                            seq = seq,
+                            stream = "lifecycle",
+                            data = buildJsonObject {
+                                put("phase", "error")
+                                put("error", e.message ?: "Unknown error")
+                            },
+                        ),
                     )
+                    broadcast(
+                        "chat",
+                        buildChatErrorPayload(
+                            runId = runId,
+                            sessionKey = sessionKey,
+                            seq = seq,
+                            error = e.message ?: "Unknown error",
+                        ),
+                    )
+                } finally {
+                    activeChatJobs.remove(runId)
+                    activeChatSessions.remove(runId)
+                    activeChatConnections.remove(runId)
+                    chatBuffers.remove(runId)
+                    chatSeqByRun.remove(runId)
+                    abortedChatRuns.remove(runId)
                 }
             }
+            activeChatJobs[runId] = chatJob
+            activeChatSessions[runId] = sessionKey
+            activeChatConnections[runId] = context.connectionId
 
             buildJsonObject {
-                put("requestId", requestId)
-                put("sessionKey", sessionKey)
-                put("status", "accepted")
+                put("runId", runId)
+                put("status", "started")
             }
         }
 
         dispatcher.register("chat.abort") { params, _ ->
-            // TODO: Wire to session manager abort
-            buildJsonObject { put("status", "ok") }
+            val obj = params?.jsonObject ?: throw RpcException("invalid_params", "Missing params")
+            val sessionKey = obj["sessionKey"]?.jsonPrimitive?.contentOrNull
+                ?: throw RpcException("invalid_params", "Missing sessionKey")
+            val runId = obj["runId"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+            val abortedRunIds = mutableListOf<String>()
+            if (runId != null) {
+                val activeSessionKey = activeChatSessions[runId]
+                if (activeSessionKey != null && activeSessionKey != sessionKey) {
+                    throw RpcException("invalid_request", "runId does not match sessionKey")
+                }
+                if (abortActiveChatRun(runId, sessionKey)) {
+                    abortedRunIds += runId
+                }
+            } else {
+                val matchingRunIds = activeChatSessions.entries
+                    .filter { (_, activeSessionKey) -> activeSessionKey == sessionKey }
+                    .map { (activeRunId, _) -> activeRunId }
+                for (activeRunId in matchingRunIds) {
+                    if (abortActiveChatRun(activeRunId, sessionKey)) {
+                        abortedRunIds += activeRunId
+                    }
+                }
+            }
+            buildJsonObject {
+                put("ok", true)
+                put("aborted", abortedRunIds.isNotEmpty())
+                putJsonArray("runIds") {
+                    abortedRunIds.forEach { add(JsonPrimitive(it)) }
+                }
+            }
         }
 
         dispatcher.register("config.get") { params, _ ->
@@ -491,58 +738,301 @@ class GatewayServer(
         }
     }
 
+    private fun nextChatSeq(runId: String): Int {
+        val next = (chatSeqByRun[runId] ?: 0) + 1
+        chatSeqByRun[runId] = next
+        return next
+    }
+
+    private suspend fun abortActiveChatRun(runId: String, sessionKey: String): Boolean {
+        val activeSessionKey = activeChatSessions[runId] ?: return false
+        if (activeSessionKey != sessionKey) return false
+
+        abortedChatRuns += runId
+        val seq = nextChatSeq(runId)
+        val partialText = chatBuffers[runId]?.toString().orEmpty()
+
+        activeChatJobs[runId]?.cancel(CancellationException("chat.abort"))
+
+        broadcast(
+            "agent",
+            buildAgentEventPayload(
+                runId = runId,
+                sessionKey = sessionKey,
+                seq = seq,
+                stream = "lifecycle",
+                data = buildJsonObject {
+                    put("phase", "end")
+                    put("stopReason", "aborted")
+                },
+            ),
+        )
+        broadcast(
+            "chat",
+            buildChatAbortedPayload(
+                runId = runId,
+                sessionKey = sessionKey,
+                seq = seq,
+                text = partialText,
+                stopReason = "aborted",
+            ),
+        )
+        return true
+    }
+
+    internal fun buildChatDeltaPayload(
+        runId: String,
+        sessionKey: String,
+        seq: Int,
+        text: String,
+    ): JsonObject {
+        return buildJsonObject {
+            put("runId", runId)
+            put("sessionKey", sessionKey)
+            put("seq", seq)
+            put("state", "delta")
+            putJsonObject("message") {
+                put("role", "assistant")
+                putJsonArray("content") {
+                    addJsonObject {
+                        put("type", "text")
+                        put("text", text)
+                    }
+                }
+                put("timestamp", System.currentTimeMillis())
+            }
+        }
+    }
+
+    internal fun buildChatFinalPayload(
+        runId: String,
+        sessionKey: String,
+        seq: Int,
+        text: String,
+        stopReason: String? = null,
+    ): JsonObject {
+        return buildJsonObject {
+            put("runId", runId)
+            put("sessionKey", sessionKey)
+            put("seq", seq)
+            put("state", "final")
+            stopReason?.let { put("stopReason", it) }
+            val trimmed = text.trim()
+            if (trimmed.isNotEmpty()) {
+                putJsonObject("message") {
+                    put("role", "assistant")
+                    putJsonArray("content") {
+                        addJsonObject {
+                            put("type", "text")
+                            put("text", trimmed)
+                        }
+                    }
+                    put("timestamp", System.currentTimeMillis())
+                }
+            }
+        }
+    }
+
+    internal fun buildChatErrorPayload(
+        runId: String,
+        sessionKey: String,
+        seq: Int,
+        error: String,
+    ): JsonObject {
+        return buildJsonObject {
+            put("runId", runId)
+            put("sessionKey", sessionKey)
+            put("seq", seq)
+            put("state", "error")
+            put("errorMessage", error)
+        }
+    }
+
+    internal fun buildChatAbortedPayload(
+        runId: String,
+        sessionKey: String,
+        seq: Int,
+        text: String,
+        stopReason: String? = null,
+    ): JsonObject {
+        return buildJsonObject {
+            put("runId", runId)
+            put("sessionKey", sessionKey)
+            put("seq", seq)
+            put("state", "aborted")
+            stopReason?.let { put("stopReason", it) }
+            val trimmed = text.trim()
+            if (trimmed.isNotEmpty()) {
+                putJsonObject("message") {
+                    put("role", "assistant")
+                    putJsonArray("content") {
+                        addJsonObject {
+                            put("type", "text")
+                            put("text", trimmed)
+                        }
+                    }
+                    put("timestamp", System.currentTimeMillis())
+                }
+            }
+        }
+    }
+
     internal fun buildChatEventPayload(
         event: AcpRuntimeEvent,
         sessionKey: String,
-        requestId: String,
-    ): JsonObject {
+        runId: String,
+        seq: Int,
+        bufferedAssistantText: String = "",
+    ): JsonObject? {
         return when (event) {
-            is AcpRuntimeEvent.TextDelta -> buildJsonObject {
-                put("type", "text_delta")
-                put("text", event.text)
-                event.stream?.let { put("stream", it.name.lowercase()) }
-                event.tag?.let { put("tag", it) }
-                put("sessionKey", sessionKey)
-                put("requestId", requestId)
+            is AcpRuntimeEvent.TextDelta -> buildChatDeltaPayload(
+                runId = runId,
+                sessionKey = sessionKey,
+                seq = seq,
+                text = event.text,
+            )
+            is AcpRuntimeEvent.Done -> buildChatFinalPayload(
+                runId = runId,
+                sessionKey = sessionKey,
+                seq = seq,
+                text = bufferedAssistantText,
+                stopReason = event.stopReason,
+            )
+            is AcpRuntimeEvent.Error -> buildChatErrorPayload(
+                runId = runId,
+                sessionKey = sessionKey,
+                seq = seq,
+                error = event.message,
+            )
+            else -> null
+        }
+    }
+
+    internal data class AgentStreamPayload(
+        val stream: String,
+        val data: JsonObject,
+    )
+
+    internal fun buildAgentEventPayload(
+        runId: String,
+        sessionKey: String,
+        seq: Int,
+        stream: String,
+        data: JsonObject,
+    ): JsonObject {
+        return buildJsonObject {
+            put("runId", runId)
+            put("sessionKey", sessionKey)
+            put("seq", seq)
+            put("stream", stream)
+            put("ts", System.currentTimeMillis())
+            put("data", data)
+        }
+    }
+
+    internal fun buildAgentStreamPayload(
+        event: AcpRuntimeEvent,
+        includeToolResults: Boolean = true,
+    ): AgentStreamPayload? {
+        return when (event) {
+            is AcpRuntimeEvent.TextDelta -> AgentStreamPayload(
+                stream = "assistant",
+                data = buildJsonObject {
+                    put("text", event.text)
+                    event.stream?.let { put("substream", it.name.lowercase()) }
+                    event.tag?.let { put("tag", it) }
+                },
+            )
+            is AcpRuntimeEvent.ToolCall -> {
+                val normalizedStatus = normalizeToolStatus(event.status)
+                val phase = when {
+                    event.tag == "tool_call" -> "start"
+                    normalizedStatus == "completed" || normalizedStatus == "failed" -> "result"
+                    !event.rawOutput.isNullOrBlank() -> "result"
+                    else -> "update"
+                }
+                val toolName = resolveToolName(event)
+                val data = buildJsonObject {
+                    put("phase", phase)
+                    toolName?.let { put("name", it) }
+                    event.toolCallId?.let { put("toolCallId", it) }
+                    if (phase == "start") {
+                        parseJsonOrString(event.rawInput)?.let { put("args", it) }
+                    } else if (includeToolResults) {
+                        parseJsonOrString(event.rawOutput)?.let {
+                            if (phase == "update") {
+                                put("partialResult", it)
+                            } else {
+                                put("result", it)
+                            }
+                        }
+                    }
+                    if (phase == "result") {
+                        val errored = normalizedStatus == "failed" || inferToolError(event.rawOutput)
+                        put("isError", errored)
+                    }
+                    event.kind?.let { put("kind", it) }
+                    event.detail?.let { put("meta", it) }
+                }
+                AgentStreamPayload(stream = "tool", data = data)
             }
-            is AcpRuntimeEvent.ToolCall -> buildJsonObject {
-                put("type", "tool_call")
-                put("text", event.text)
-                event.title?.let { put("title", it) }
-                event.tag?.let { put("tag", it) }
-                event.toolCallId?.let { put("toolCallId", it) }
-                normalizeToolStatus(event.status)?.let { put("status", it) }
-                buildToolDetail(event)?.let { put("detail", it) }
-                event.kind?.let { put("kind", it) }
-                event.rawInput?.let { put("rawInput", it) }
-                event.rawOutput?.let { put("rawOutput", it) }
-                put("sessionKey", sessionKey)
-                put("requestId", requestId)
-            }
-            is AcpRuntimeEvent.Done -> buildJsonObject {
-                put("type", "done")
-                put("sessionKey", sessionKey)
-                put("requestId", requestId)
-                event.stopReason?.let { put("stopReason", it) }
-            }
-            is AcpRuntimeEvent.Error -> buildJsonObject {
-                put("type", "error")
-                put("message", event.message)
-                event.code?.let { put("code", it) }
-                event.retryable?.let { put("retryable", it) }
-                put("sessionKey", sessionKey)
-                put("requestId", requestId)
-            }
-            is AcpRuntimeEvent.Status -> buildJsonObject {
-                put("type", "status")
-                put("text", event.text)
-                event.tag?.let { put("tag", it) }
-                event.used?.let { put("used", it) }
-                event.size?.let { put("size", it) }
-                put("sessionKey", sessionKey)
-                put("requestId", requestId)
+            is AcpRuntimeEvent.Done -> AgentStreamPayload(
+                stream = "lifecycle",
+                data = buildJsonObject {
+                    put("phase", "end")
+                    event.stopReason?.let { put("stopReason", it) }
+                },
+            )
+            is AcpRuntimeEvent.Error -> AgentStreamPayload(
+                stream = "lifecycle",
+                data = buildJsonObject {
+                    put("phase", "error")
+                    put("error", event.message)
+                    event.code?.let { put("code", it) }
+                },
+            )
+            is AcpRuntimeEvent.Status -> AgentStreamPayload(
+                stream = "lifecycle",
+                data = buildJsonObject {
+                    put("phase", "status")
+                    put("text", event.text)
+                    event.tag?.let { put("tag", it) }
+                    event.used?.let { put("used", it) }
+                    event.size?.let { put("size", it) }
+                },
+            )
+        }
+    }
+
+    private fun resolveToolName(event: AcpRuntimeEvent.ToolCall): String? {
+        val fromTitle = event.title
+            ?.substringBefore(":")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        if (fromTitle != null) return fromTitle
+        val text = event.text.trim()
+        if (text.isEmpty()) return null
+        val knownPrefixes = listOf("calling ", "completed ", "blocked ", "tool ")
+        for (prefix in knownPrefixes) {
+            if (text.lowercase().startsWith(prefix)) {
+                return text.substring(prefix.length).substringBefore(" ").trim().takeIf { it.isNotEmpty() }
             }
         }
+        return null
+    }
+
+    private fun parseJsonOrString(raw: String?): JsonElement? {
+        val text = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return runCatching { json.parseToJsonElement(text) }.getOrElse { JsonPrimitive(text) }
+    }
+
+    private fun inferToolError(rawOutput: String?): Boolean {
+        val text = rawOutput?.trim()?.lowercase().orEmpty()
+        if (text.isEmpty()) return false
+        if (text.startsWith("error:")) return true
+        if (text.contains("\"status\":\"error\"")) return true
+        if (text.contains("\"error\"")) return true
+        return false
     }
 
     private fun normalizeToolStatus(status: String?): String? {

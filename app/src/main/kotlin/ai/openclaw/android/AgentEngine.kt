@@ -67,6 +67,7 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -503,6 +504,7 @@ class AgentEngine(private val context: Context) {
         conversationHistory: List<LlmMessage> = emptyList(),
         model: String? = null,
         systemPrompt: String? = null,
+        extraSystemPrompt: String? = null,
         agentId: String? = null,
         sessionKey: String = "",
         messageProvider: String? = null,
@@ -608,6 +610,16 @@ class AgentEngine(private val context: Context) {
                 modelId = routedModel,
                 channelContext = channelContext,
             )
+            val promptContext = buildPromptContextFilesWithWarnings()
+            val contextFiles = promptContext.files
+            val bootstrapTruncationWarningLines = promptContext.warningLines
+            val workspaceNotes = buildWorkspaceNotes(contextFiles)
+            val reactionGuidance = resolveReactionGuidance(channelContext)
+            val ttsHint = resolveTtsPromptHint()
+            val messageToolHints = buildMessageToolHints(channelContext)
+            val ownerDisplay = resolveOwnerDisplayMode()
+            val ownerDisplaySecret = config.commands?.ownerDisplaySecret
+            val heartbeatPrompt = resolveHeartbeatPrompt(resolvedAgentId)
             runner.runTurn(
                 EmbeddedRunParams(
                     messages = messages,
@@ -623,6 +635,21 @@ class AgentEngine(private val context: Context) {
                     workspaceDir = terminalWorkingDirectory(),
                     hookSessionId = hookSessionId,
                     legacyBeforeAgentStartResult = legacyModelResolve,
+                    modelAliasLines = buildModelAliasLines(),
+                    workspaceNotes = workspaceNotes,
+                    docsPath = resolveDocsPath(),
+                    ownerNumbers = config.commands?.ownerAllowFrom.orEmpty(),
+                    ownerDisplay = ownerDisplay,
+                    ownerDisplaySecret = ownerDisplaySecret,
+                    reasoningTagHint = resolveReasoningTagHint(routedModel),
+                    extraSystemPrompt = extraSystemPrompt,
+                    contextFiles = contextFiles,
+                    bootstrapTruncationWarningLines = bootstrapTruncationWarningLines,
+                    memoryCitationsMode = config.memory?.citations,
+                    ttsHint = ttsHint,
+                    reactionGuidance = reactionGuidance,
+                    messageToolHints = messageToolHints,
+                    heartbeatPrompt = heartbeatPrompt,
                     turnContext = EmbeddedTurnContext(
                         trigger = "user",
                         messageProvider = effectiveMessageProvider,
@@ -1256,6 +1283,150 @@ class AgentEngine(private val context: Context) {
             elevatedAllowed = elevatedAllowed,
             sandboxContainerWorkspaceDir = sandboxContainerWorkspaceDir,
         )
+    }
+
+    private data class PromptContextBundle(
+        val files: List<SystemPromptBuilder.ContextFile>,
+        val warningLines: List<String>,
+    )
+
+    private fun buildModelAliasLines(): List<String> {
+        val providers = config.models?.providers.orEmpty()
+        if (providers.isEmpty()) return emptyList()
+        return providers.entries
+            .sortedBy { canonicalProvider(it.key) }
+            .mapNotNull { (providerId, providerConfig) ->
+                val alias = canonicalProvider(providerId)
+                val preferredModel = providerConfig.models
+                    .firstOrNull()
+                    ?.id
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: defaultModelForProvider(alias)
+                if (preferredModel != null) {
+                    "- $alias -> $alias/$preferredModel"
+                } else {
+                    null
+                }
+            }
+            .distinct()
+    }
+
+    private fun resolveDocsPath(): String? {
+        val workspace = terminalWorkingDirectory()
+        if (workspace.isBlank()) return null
+        val docsDir = File(workspace, "docs")
+        return if (docsDir.isDirectory) docsDir.absolutePath else null
+    }
+
+    private fun buildPromptContextFilesWithWarnings(): PromptContextBundle {
+        val workspace = terminalWorkingDirectory()
+        if (workspace.isBlank()) return PromptContextBundle(emptyList(), emptyList())
+        val warningLines = mutableListOf<String>()
+        val maxFileChars = 16_000
+        val maxTotalChars = 64_000
+        var totalChars = 0
+        val files = listOf(
+            "AGENTS.md",
+            "SOUL.md",
+            "CLAUDE.md",
+            "README.md",
+        )
+        val contextFiles = files.mapNotNull { name ->
+            val file = File(workspace, name)
+            if (!file.isFile) return@mapNotNull null
+            val content = runCatching { file.readText() }.getOrNull()?.trim() ?: return@mapNotNull null
+            if (content.isEmpty()) return@mapNotNull null
+            val perFileTrimmed = if (content.length > maxFileChars) {
+                warningLines += "$name exceeded $maxFileChars chars and was truncated."
+                content.take(maxFileChars)
+            } else {
+                content
+            }
+            if (totalChars >= maxTotalChars) {
+                warningLines += "$name omitted because total bootstrap context exceeded $maxTotalChars chars."
+                return@mapNotNull null
+            }
+            val remaining = maxTotalChars - totalChars
+            val finalContent = if (perFileTrimmed.length > remaining) {
+                warningLines += "$name partially truncated to fit total bootstrap context budget ($maxTotalChars chars)."
+                perFileTrimmed.take(remaining)
+            } else {
+                perFileTrimmed
+            }.trim()
+            if (finalContent.isEmpty()) return@mapNotNull null
+            totalChars += finalContent.length
+            SystemPromptBuilder.ContextFile(
+                path = name,
+                content = finalContent,
+            )
+        }
+        return PromptContextBundle(
+            files = contextFiles,
+            warningLines = warningLines.distinct(),
+        )
+    }
+
+    private fun buildWorkspaceNotes(
+        contextFiles: List<SystemPromptBuilder.ContextFile>,
+    ): List<String> {
+        val hasAgentsFile = contextFiles.any { it.path.equals("AGENTS.md", ignoreCase = true) }
+        if (!hasAgentsFile) return emptyList()
+        return listOf("Reminder: commit your changes in this workspace after edits.")
+    }
+
+    private fun resolveReactionGuidance(
+        channelContext: SystemPromptBuilder.ChannelContext?,
+    ): SystemPromptBuilder.ReactionGuidance? {
+        if (channelContext?.supportsReactions != true) return null
+        return SystemPromptBuilder.ReactionGuidance(
+            level = "minimal",
+            channel = channelContext.channelId,
+        )
+    }
+
+    private fun resolveReasoningTagHint(modelId: String?): Boolean {
+        val provider = modelId
+            ?.let(::resolveProviderFromModel)
+            ?.trim()
+            ?.lowercase()
+            ?: return false
+        return provider in setOf("qwen", "deepseek")
+    }
+
+    private fun resolveTtsPromptHint(): String? {
+        val tts = config.messages?.tts ?: return null
+        if (tts.enabled == false) return null
+        val provider = tts.provider?.name?.lowercase() ?: "configured provider"
+        return "Text-to-speech is enabled (provider: $provider). Use voice output only when the user asks."
+    }
+
+    private fun resolveOwnerDisplayMode(): SystemPromptBuilder.OwnerDisplay {
+        return when (config.commands?.ownerDisplay?.trim()?.lowercase()) {
+            "hash" -> SystemPromptBuilder.OwnerDisplay.HASH
+            else -> SystemPromptBuilder.OwnerDisplay.RAW
+        }
+    }
+
+    private fun resolveHeartbeatPrompt(agentId: String): String? {
+        val agentPrompt = resolveAgentConfig(agentId)?.heartbeat?.message?.trim()
+        if (!agentPrompt.isNullOrEmpty()) return agentPrompt
+        val defaultPrompt = config.agents?.defaults?.heartbeat?.message?.trim()
+        return defaultPrompt?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun buildMessageToolHints(
+        channelContext: SystemPromptBuilder.ChannelContext?,
+    ): List<String> {
+        if (channelContext == null) return emptyList()
+        return buildList {
+            if (channelContext.supportsThreads) {
+                add("Threads are supported on this channel.")
+            }
+            if (channelContext.supportsRichText) {
+                add("Rich text formatting is supported on this channel.")
+            }
+        }
     }
 
     private fun isSandboxedMode(mode: String?): Boolean {

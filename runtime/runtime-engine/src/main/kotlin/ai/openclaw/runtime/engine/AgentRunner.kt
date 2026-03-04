@@ -282,6 +282,21 @@ class AgentRunner(
             maxRunAttempts = params.maxRunAttempts,
             hookSessionId = params.hookSessionId,
             legacyBeforeAgentStartResult = params.legacyBeforeAgentStartResult,
+            modelAliasLines = params.modelAliasLines,
+            workspaceNotes = params.workspaceNotes,
+            docsPath = params.docsPath,
+            ownerNumbers = params.ownerNumbers,
+            ownerDisplay = params.ownerDisplay,
+            ownerDisplaySecret = params.ownerDisplaySecret,
+            reasoningTagHint = params.reasoningTagHint,
+            extraSystemPrompt = params.extraSystemPrompt,
+            contextFiles = params.contextFiles,
+            bootstrapTruncationWarningLines = params.bootstrapTruncationWarningLines,
+            memoryCitationsMode = params.memoryCitationsMode,
+            ttsHint = params.ttsHint,
+            reactionGuidance = params.reactionGuidance,
+            messageToolHints = params.messageToolHints,
+            heartbeatPrompt = params.heartbeatPrompt,
             trigger = params.turnContext.trigger,
             messageProvider = params.turnContext.messageProvider,
             hookChannelId = params.turnContext.channelId,
@@ -315,6 +330,21 @@ class AgentRunner(
         maxRunAttempts: Int? = null,
         hookSessionId: String? = null,
         legacyBeforeAgentStartResult: BeforeAgentStartResult? = null,
+        modelAliasLines: List<String> = emptyList(),
+        workspaceNotes: List<String> = emptyList(),
+        docsPath: String? = null,
+        ownerNumbers: List<String> = emptyList(),
+        ownerDisplay: SystemPromptBuilder.OwnerDisplay = SystemPromptBuilder.OwnerDisplay.RAW,
+        ownerDisplaySecret: String? = null,
+        reasoningTagHint: Boolean = false,
+        extraSystemPrompt: String? = null,
+        contextFiles: List<SystemPromptBuilder.ContextFile> = emptyList(),
+        bootstrapTruncationWarningLines: List<String> = emptyList(),
+        memoryCitationsMode: MemoryCitationsMode? = null,
+        ttsHint: String? = null,
+        reactionGuidance: SystemPromptBuilder.ReactionGuidance? = null,
+        messageToolHints: List<String> = emptyList(),
+        heartbeatPrompt: String? = null,
         trigger: String? = null,
         messageProvider: String? = null,
         hookChannelId: String? = null,
@@ -380,6 +410,10 @@ class AgentRunner(
                 groupToolPolicy = groupToolPolicy,
             )
             var allowedToolNames = resolveAllowedToolNames(policyContext)
+            val mergedExtraSystemPrompt = listOfNotNull(
+                extraSystemPrompt?.trim()?.takeIf { it.isNotEmpty() },
+                subagentPromptContract(sessionKey)?.trim()?.takeIf { it.isNotEmpty() },
+            ).joinToString("\n\n").ifBlank { null }
             var effectiveSystemPrompt = systemPrompt ?: systemPromptBuilder.buildEmbedded(
                 SystemPromptBuilder.EmbeddedPromptConfig(
                     agentIdentity = agentIdentity,
@@ -391,7 +425,21 @@ class AgentRunner(
                     workspaceDir = workspaceDir ?: ".",
                     modelId = model,
                     provider = provider.id,
-                    extraSystemPrompt = subagentPromptContract(sessionKey),
+                    modelAliasLines = modelAliasLines,
+                    workspaceNotes = workspaceNotes,
+                    extraSystemPrompt = mergedExtraSystemPrompt,
+                    docsPath = docsPath,
+                    ownerNumbers = ownerNumbers,
+                    ownerDisplay = ownerDisplay,
+                    ownerDisplaySecret = ownerDisplaySecret,
+                    reasoningTagHint = reasoningTagHint,
+                    contextFiles = contextFiles,
+                    bootstrapTruncationWarningLines = bootstrapTruncationWarningLines,
+                    memoryCitationsMode = memoryCitationsMode,
+                    ttsHint = ttsHint,
+                    reactionGuidance = reactionGuidance,
+                    messageToolHints = messageToolHints,
+                    heartbeatPrompt = heartbeatPrompt,
                 ),
             )
 
@@ -468,6 +516,8 @@ class AgentRunner(
 
             val effectiveMaxRunAttempts = (maxRunAttempts ?: this@AgentRunner.maxRunAttempts).coerceAtLeast(1)
             val turnTimeoutMs = timeoutMs?.takeIf { it > 0L }
+            val maxOverflowCompactionAttempts = 3
+            var overflowCompactionAttempts = 0
             var runAttempt = 0
             var lastRetryableError: LlmStreamEvent.Error? = null
             var aborted = false
@@ -692,6 +742,39 @@ class AgentRunner(
 
                     if (streamError != null) {
                         val error = streamError!!
+                        val overflowCode = classifyContextOverflowError(error.message)
+                        if (overflowCode != null) {
+                            val overflowMessage =
+                                "Context overflow: prompt too large for the model context window."
+                            if (runAttempt < effectiveMaxRunAttempts) {
+                                lastRetryableError = LlmStreamEvent.Error(
+                                    message = overflowMessage,
+                                    code = overflowCode,
+                                    retryable = true,
+                                )
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "$overflowMessage Retrying attempt ${runAttempt + 1}/$effectiveMaxRunAttempts",
+                                        tag = if (overflowCode == "compaction_failure") {
+                                            "compaction_retry"
+                                        } else {
+                                            "context_overflow_retry"
+                                        },
+                                    ),
+                                )
+                                continue@attemptLoop
+                            }
+                            emit(
+                                AcpRuntimeEvent.Error(
+                                    message = overflowMessage,
+                                    code = overflowCode,
+                                    retryable = false,
+                                ),
+                            )
+                            terminalError = overflowMessage
+                            aborted = true
+                            return@flow
+                        }
                         if (error.retryable) {
                             if (runAttempt < effectiveMaxRunAttempts) {
                                 lastRetryableError = error
@@ -865,15 +948,92 @@ class AgentRunner(
                                 return@flow
                             }
 
-                            val execution = executeTool(
-                                toolCall = tc,
-                                agentId = agentId,
-                                sessionKey = sessionKey,
-                                sessionId = effectiveHookSessionId,
-                                runId = effectiveRunId,
-                                workspaceDir = workspaceDir,
-                                policyContext = policyContext,
-                            )
+                            val execution = if (remainingToolTimeoutMs != null && remainingToolTimeoutMs > 0L) {
+                                withTimeoutOrNull(remainingToolTimeoutMs) {
+                                    executeTool(
+                                        toolCall = tc,
+                                        agentId = agentId,
+                                        sessionKey = sessionKey,
+                                        sessionId = effectiveHookSessionId,
+                                        runId = effectiveRunId,
+                                        workspaceDir = workspaceDir,
+                                        policyContext = policyContext,
+                                    )
+                                }
+                            } else {
+                                executeTool(
+                                    toolCall = tc,
+                                    agentId = agentId,
+                                    sessionKey = sessionKey,
+                                    sessionId = effectiveHookSessionId,
+                                    runId = effectiveRunId,
+                                    workspaceDir = workspaceDir,
+                                    policyContext = policyContext,
+                                )
+                            }
+                            if (execution == null) {
+                                val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                                val timeoutError = LlmStreamEvent.Error(
+                                    message = timeoutMessage,
+                                    code = "timeout",
+                                    retryable = runAttempt < effectiveMaxRunAttempts,
+                                )
+                                if (runAttempt < effectiveMaxRunAttempts) {
+                                    lastRetryableError = timeoutError
+                                    emit(
+                                        AcpRuntimeEvent.Status(
+                                            text = "$timeoutMessage; retrying",
+                                            tag = "turn_timeout_retry",
+                                        ),
+                                    )
+                                    continue@attemptLoop
+                                }
+                                val retryLimitMessage =
+                                    "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                                emit(
+                                    AcpRuntimeEvent.Error(
+                                        message = retryLimitMessage,
+                                        code = "retry_limit",
+                                        retryable = true,
+                                    ),
+                                )
+                                terminalError = retryLimitMessage
+                                aborted = true
+                                return@flow
+                            }
+                            val remainingAfterToolTimeoutMs = turnTimeoutMs?.let { timeout ->
+                                (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
+                            }
+                            if (remainingAfterToolTimeoutMs != null && remainingAfterToolTimeoutMs <= 0L) {
+                                val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                                val timeoutError = LlmStreamEvent.Error(
+                                    message = timeoutMessage,
+                                    code = "timeout",
+                                    retryable = runAttempt < effectiveMaxRunAttempts,
+                                )
+                                if (runAttempt < effectiveMaxRunAttempts) {
+                                    lastRetryableError = timeoutError
+                                    emit(
+                                        AcpRuntimeEvent.Status(
+                                            text = "$timeoutMessage; retrying",
+                                            tag = "turn_timeout_retry",
+                                        ),
+                                    )
+                                    continue@attemptLoop
+                                }
+                                val retryLimitMessage =
+                                    "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                                emit(
+                                    AcpRuntimeEvent.Error(
+                                        message = retryLimitMessage,
+                                        code = "retry_limit",
+                                        retryable = true,
+                                    ),
+                                )
+                                terminalError = retryLimitMessage
+                                aborted = true
+                                return@flow
+                            }
                             if (!execution.skipOutcomeRecord) {
                                 toolLoopDetector?.recordToolCallOutcome(
                                     toolName = normalizedToolName,
@@ -937,7 +1097,86 @@ class AgentRunner(
                     }
 
                     if (!contextGuard.fitsInContext(currentMessages)) {
-                        currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
+                        val remainingCompactionTimeoutMs = turnTimeoutMs?.let { timeout ->
+                            (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
+                        }
+                        if (remainingCompactionTimeoutMs != null && remainingCompactionTimeoutMs <= 0L) {
+                            val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                            val timeoutError = LlmStreamEvent.Error(
+                                message = timeoutMessage,
+                                code = "timeout",
+                                retryable = runAttempt < effectiveMaxRunAttempts,
+                            )
+                            if (runAttempt < effectiveMaxRunAttempts) {
+                                lastRetryableError = timeoutError
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "$timeoutMessage during compaction; retrying",
+                                        tag = "turn_timeout_retry_compaction",
+                                    ),
+                                )
+                                continue@attemptLoop
+                            }
+                            val retryLimitMessage =
+                                "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                            emit(
+                                AcpRuntimeEvent.Error(
+                                    message = retryLimitMessage,
+                                    code = "retry_limit",
+                                    retryable = true,
+                                ),
+                            )
+                            terminalError = retryLimitMessage
+                            aborted = true
+                            return@flow
+                        }
+
+                        val beforeCompaction = currentMessages
+                        val compacted = contextGuard.trimToFit(currentMessages)
+                        val compactionChanged = compacted != beforeCompaction
+                        currentMessages = compacted.toMutableList()
+                        if (!contextGuard.fitsInContext(currentMessages)) {
+                            overflowCompactionAttempts += 1
+                            val overflowCode = if (compactionChanged) {
+                                "compaction_failure"
+                            } else {
+                                "context_overflow"
+                            }
+                            val overflowMessage =
+                                "Context overflow: prompt too large for the model context window."
+                            if (
+                                runAttempt < effectiveMaxRunAttempts &&
+                                overflowCompactionAttempts < maxOverflowCompactionAttempts
+                            ) {
+                                lastRetryableError = LlmStreamEvent.Error(
+                                    message = overflowMessage,
+                                    code = overflowCode,
+                                    retryable = true,
+                                )
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "$overflowMessage Retrying attempt ${runAttempt + 1}/$effectiveMaxRunAttempts",
+                                        tag = if (overflowCode == "compaction_failure") {
+                                            "compaction_retry"
+                                        } else {
+                                            "context_overflow_retry"
+                                        },
+                                    ),
+                                )
+                                continue@attemptLoop
+                            }
+                            emit(
+                                AcpRuntimeEvent.Error(
+                                    message = overflowMessage,
+                                    code = overflowCode,
+                                    retryable = false,
+                                ),
+                            )
+                            terminalError = overflowMessage
+                            aborted = true
+                            return@flow
+                        }
+                        overflowCompactionAttempts = 0
                         emit(
                             AcpRuntimeEvent.Status(
                                 text = "Context compacted",
@@ -1470,9 +1709,32 @@ class AgentRunner(
         return stopReason?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
     }
 
+    private fun classifyContextOverflowError(message: String?): String? {
+        val normalized = message?.trim()?.lowercase().orEmpty()
+        if (normalized.isEmpty()) return null
+        val overflowSignals = listOf(
+            "context overflow",
+            "context length",
+            "maximum context length",
+            "token limit",
+            "prompt is too long",
+            "too many tokens",
+        )
+        if (overflowSignals.any { normalized.contains(it) }) {
+            return "context_overflow"
+        }
+        if (normalized.contains("compaction")) {
+            return "compaction_failure"
+        }
+        return null
+    }
+
     private fun toAcpStopReason(stopReason: String?): String {
         return when (normalizeStopReason(stopReason)) {
             "max_tokens" -> "max_tokens"
+            "tool_calls" -> "tool_calls"
+            "error" -> "error"
+            "aborted", "cancelled", "canceled" -> "aborted"
             else -> "end_turn"
         }
     }
@@ -1588,6 +1850,14 @@ class AgentRunner(
                 continue
             }
 
+            if (shouldSkipSyntheticToolResult(normalizedAssistantMessage.stopReason)) {
+                // Match reference repair behavior: do not attempt tool-result pairing when
+                // assistant stopReason indicates an aborted/error turn.
+                sanitized += normalizedAssistantMessage
+                i += 1
+                continue
+            }
+
             sanitized += normalizedAssistantMessage
 
             val callIds = assistantToolCalls.map { it.id }.toSet()
@@ -1630,13 +1900,10 @@ class AgentRunner(
                 changed = true
             }
 
-            val skipSyntheticResults = shouldSkipSyntheticToolResult(normalizedAssistantMessage.stopReason)
             for (call in assistantToolCalls) {
                 val existingResult = spanResultsById[call.id]
                 if (existingResult != null) {
                     sanitized += existingResult
-                } else if (skipSyntheticResults) {
-                    changed = true
                 } else {
                     changed = true
                     val synthetic = createSyntheticMissingToolResult(call.id, call.name)
