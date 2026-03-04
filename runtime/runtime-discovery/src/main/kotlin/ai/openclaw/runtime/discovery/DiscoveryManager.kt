@@ -190,7 +190,7 @@ class DiscoveryManager(
     /**
      * Check if a device is paired.
      */
-    fun isPaired(peerId: String): Boolean = peerId in pairedDevices
+    fun isPaired(peerId: String): Boolean = pairedDevices.containsKey(peerId)
 
     /**
      * Validate a pairing token for a peer.

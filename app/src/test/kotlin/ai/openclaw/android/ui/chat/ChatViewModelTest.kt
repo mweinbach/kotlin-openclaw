@@ -177,6 +177,7 @@ class ChatViewModelTest {
             rawStatus = null,
             rawTag = "tool_call_update",
             eventText = "Tool call denied by policy",
+            rawOutput = null,
         )
         assertEquals("failed", status)
     }
@@ -187,8 +188,9 @@ class ChatViewModelTest {
             rawStatus = null,
             rawTag = "tool_call_update",
             eventText = "Completed read",
+            rawOutput = null,
         )
-        assertNull(status)
+        assertEquals("completed", status)
     }
 
     @Test

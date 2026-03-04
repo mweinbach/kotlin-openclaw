@@ -31,6 +31,9 @@ data class ChatToolCall(
     val title: String,
     val status: String = "in_progress",
     val detail: String? = null,
+    val kind: String? = null,
+    val rawInput: String? = null,
+    val rawOutput: String? = null,
 )
 
 class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
@@ -309,6 +312,7 @@ internal fun applyToolCallEvent(
         rawStatus = event.status,
         rawTag = event.tag,
         eventText = event.text,
+        rawOutput = event.rawOutput,
     )
     val detail = event.detail?.trim()?.takeIf { it.isNotEmpty() }
         ?: event.text.trim().takeIf { it.isNotEmpty() }
@@ -324,6 +328,9 @@ internal fun applyToolCallEvent(
         title = title.ifBlank { existing?.title ?: "tool" },
         status = mergedStatus,
         detail = detail ?: existing?.detail,
+        kind = event.kind ?: existing?.kind,
+        rawInput = event.rawInput ?: existing?.rawInput,
+        rawOutput = event.rawOutput ?: existing?.rawOutput,
     )
     if (existing == merged) {
         return toolCalls.values.toList()
@@ -336,6 +343,7 @@ internal fun normalizeToolCallStatus(
     rawStatus: String?,
     rawTag: String?,
     eventText: String?,
+    rawOutput: String?,
 ): String? {
     val status = rawStatus?.trim()?.lowercase().orEmpty()
     if (status.isNotEmpty()) {
@@ -347,12 +355,30 @@ internal fun normalizeToolCallStatus(
         }
     }
 
+    val tag = rawTag?.trim()?.lowercase().orEmpty()
+    if (tag == "tool_call") {
+        return "in_progress"
+    }
+    if (tag == "tool_call_update") {
+        val output = rawOutput?.trim().orEmpty()
+        if (output.isNotEmpty()) {
+            return if (output.lowercase().contains("\"status\":\"error\"") || output.lowercase().contains("\"error\"")) {
+                "failed"
+            } else {
+                "completed"
+            }
+        }
+    }
+
     val text = eventText?.trim()?.lowercase().orEmpty()
     if (text.contains("error") || text.contains("fail")) {
         return "failed"
     }
     if (text.contains("denied") || text.contains("timed out") || text.contains("blocked")) {
         return "failed"
+    }
+    if (text.startsWith("completed ")) {
+        return "completed"
     }
     return null
 }

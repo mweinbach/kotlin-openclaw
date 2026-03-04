@@ -148,6 +148,101 @@ class ToolPolicyEnforcerTest {
             assertFalse(ToolPolicyEnforcer.checkProfile(tool, ToolProfileId.CODING).allowed)
         }
     }
+
+    @Test
+    fun `provider policy applies when model provider matches`() {
+        val enforcer = ToolPolicyEnforcer(
+            OpenClawConfig(
+                tools = ExpandedToolsConfig(
+                    byProvider = mapOf(
+                        "openai" to ToolPolicyConfig(
+                            allow = listOf("read"),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val allowed = enforcer.check(
+            toolName = "read",
+            context = ToolPolicyContext(
+                modelProvider = "openai",
+                modelId = "gpt-5",
+            ),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        val denied = enforcer.check(
+            toolName = "exec",
+            context = ToolPolicyContext(
+                modelProvider = "openai",
+                modelId = "gpt-5",
+            ),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        assertTrue(allowed.allowed)
+        assertFalse(denied.allowed)
+    }
+
+    @Test
+    fun `message provider policy denies tts for voice`() {
+        val enforcer = ToolPolicyEnforcer(OpenClawConfig())
+        val result = enforcer.check(
+            toolName = "tts",
+            context = ToolPolicyContext(messageProvider = "voice"),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        assertFalse(result.allowed)
+    }
+
+    @Test
+    fun `owner-only tool blocked for non-owner context`() {
+        val enforcer = ToolPolicyEnforcer(OpenClawConfig())
+        val denied = enforcer.check(
+            toolName = "cron",
+            context = ToolPolicyContext(senderIsOwner = false),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        val allowed = enforcer.check(
+            toolName = "cron",
+            context = ToolPolicyContext(senderIsOwner = true),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        assertFalse(denied.allowed)
+        assertTrue(allowed.allowed)
+    }
+
+    @Test
+    fun `sandbox policy applies only when sandboxed`() {
+        val enforcer = ToolPolicyEnforcer(
+            OpenClawConfig(
+                tools = ExpandedToolsConfig(
+                    sandbox = SandboxToolsConfig(
+                        tools = SandboxToolsPolicy(
+                            allow = listOf("read"),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val outside = enforcer.check(
+            toolName = "exec",
+            context = ToolPolicyContext(sandboxed = false),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        val inside = enforcer.check(
+            toolName = "exec",
+            context = ToolPolicyContext(sandboxed = true),
+            includeRateLimit = false,
+            recordAudit = false,
+        )
+        assertTrue(outside.allowed)
+        assertFalse(inside.allowed)
+    }
 }
 
 class ToolAuditorTest {
