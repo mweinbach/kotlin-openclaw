@@ -110,6 +110,10 @@ class CodexOauthManager(context: Context) {
         }
     }
 
+    fun clearLocalState() {
+        prefs.edit().clear().apply()
+    }
+
     private fun exchangeAuthorizationCode(code: String, codeVerifier: String): CodexOauthSession {
         val body = "grant_type=authorization_code" +
             "&code=${Uri.encode(code)}" +

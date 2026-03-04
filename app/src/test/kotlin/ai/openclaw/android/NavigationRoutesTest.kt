@@ -75,6 +75,7 @@ class NavigationRoutesTest {
             Routes.PLUGINS,
             Routes.GATEWAY_SETTINGS,
             Routes.SESSION_SETTINGS,
+            Routes.STORAGE_SETTINGS,
             Routes.SECURITY,
             Routes.LOGS,
             Routes.ABOUT,

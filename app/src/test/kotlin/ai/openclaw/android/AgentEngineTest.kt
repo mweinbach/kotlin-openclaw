@@ -2,15 +2,19 @@ package ai.openclaw.android
 
 import android.app.Application
 import androidx.test.core.app.ApplicationProvider
+import ai.openclaw.core.model.AcpRuntimeEvent
+import ai.openclaw.runtime.engine.SessionPersistence
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], application = Application::class)
@@ -134,5 +138,75 @@ class AgentEngineTest {
         )
         engine.saveConfig(newConfig)
         assertEquals(5555, engine.config.gateway?.port)
+    }
+
+    @Test
+    fun `initialize creates startup directories on first run`() = runTest {
+        engine.initialize()
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        assertTrue(context.filesDir.resolve("config").exists())
+        assertTrue(context.filesDir.resolve("sessions").exists())
+        assertTrue(context.filesDir.resolve("cron").exists())
+    }
+
+    @Test
+    fun `sendMessage auto-initializes engine for first session`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        context.filesDir.resolve("config").deleteRecursively()
+        context.filesDir.resolve("sessions").deleteRecursively()
+        context.filesDir.resolve("cron").deleteRecursively()
+        val fresh = AgentEngine(context)
+
+        assertTrue(fresh.currentToolNames().isEmpty())
+
+        val terminal = fresh.sendMessage("hello").first {
+            it is AcpRuntimeEvent.Error || it is AcpRuntimeEvent.Done
+        }
+
+        assertNotNull(terminal)
+        assertTrue(fresh.currentToolNames().isNotEmpty(), "Tool registry should initialize on first send")
+    }
+
+    @Test
+    fun `wipeInstallStorage resets persisted install state`() = runTest {
+        engine.initialize()
+        engine.secretStore.storeSecret("wipe-key", "value")
+        engine.sessionPersistence.initSession(
+            "wipe-session",
+            SessionPersistence.SessionHeader(
+                sessionId = "wipe-session",
+                agentId = engine.defaultAgentId(),
+            ),
+        )
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        context.filesDir.resolve("cron").mkdirs()
+        context.filesDir.resolve("cron/cron-store.json").writeText("{\"jobs\":[]}")
+        engine.saveConfig(
+            ai.openclaw.core.model.OpenClawConfig(
+                gateway = ai.openclaw.core.model.GatewayConfig(port = 5333),
+            ),
+        )
+
+        engine.wipeInstallStorage()
+        val snapshot = engine.storageSnapshot()
+
+        assertTrue(snapshot.configFileExists, "Fresh install should re-create config file")
+        assertEquals(0, snapshot.sessionCount, "Sessions should be wiped")
+        assertEquals(0, snapshot.secretCount, "Secrets should be wiped")
+        assertFalse(engine.config.gateway?.port == 5333, "Config should reset to defaults after wipe")
+    }
+
+    @Test
+    fun `wipeInstallStorage removes unknown filesDir content`() = runTest {
+        engine.initialize()
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val customFile = context.filesDir.resolve("custom-state/data.txt")
+        customFile.parentFile?.mkdirs()
+        customFile.writeText("persisted")
+        assertTrue(customFile.exists())
+
+        engine.wipeInstallStorage()
+
+        assertFalse(customFile.exists(), "Wipe should clear arbitrary filesDir content")
     }
 }

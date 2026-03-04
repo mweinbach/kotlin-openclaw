@@ -52,6 +52,8 @@ class SettingsScreenTest {
         composeTestRule.onNodeWithText("Agents").assertExists()
         composeTestRule.onNode(hasScrollAction()).performScrollToNode(hasText("Plugins"))
         composeTestRule.onNodeWithText("Plugins").assertExists()
+        composeTestRule.onNode(hasScrollAction()).performScrollToNode(hasText("Storage"))
+        composeTestRule.onNodeWithText("Storage").assertExists()
     }
 
     @Test
@@ -94,5 +96,20 @@ class SettingsScreenTest {
         composeTestRule.onNodeWithText("Agents").performClick()
         assertTrue(navigatedTo?.contains("agents") == true,
             "Should navigate to agents route, got: $navigatedTo")
+    }
+
+    @Test
+    fun `clicking Storage invokes navigation`() {
+        var navigatedTo: String? = null
+        composeTestRule.setContent {
+            ai.openclaw.android.ui.theme.OpenClawTheme {
+                SettingsScreen(onNavigate = { navigatedTo = it })
+            }
+        }
+
+        composeTestRule.onNode(hasScrollAction()).performScrollToNode(hasText("Storage"))
+        composeTestRule.onNodeWithText("Storage").performClick()
+        assertTrue(navigatedTo?.contains("settings/storage") == true,
+            "Should navigate to storage route, got: $navigatedTo")
     }
 }

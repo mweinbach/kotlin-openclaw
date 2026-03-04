@@ -29,6 +29,7 @@ import ai.openclaw.core.security.SecretCategory
 import ai.openclaw.core.security.SecretStore
 import ai.openclaw.core.security.ToolAuditor
 import ai.openclaw.core.security.ToolPolicyEnforcer
+import ai.openclaw.core.storage.OpenClawDatabase
 import ai.openclaw.runtime.cron.CronPayload
 import ai.openclaw.runtime.cron.CronScheduler
 import ai.openclaw.runtime.cron.CronStore
@@ -99,6 +100,8 @@ class AgentEngine(private val context: Context) {
 
     var config: OpenClawConfig = OpenClawConfig()
         private set
+
+    private var configLoaded = false
 
     val configManager: ConfigManager by lazy { ConfigManager(context) }
 
@@ -172,6 +175,7 @@ class AgentEngine(private val context: Context) {
      */
     fun loadConfig(): OpenClawConfig {
         config = configManager.load()
+        configLoaded = true
         return config
     }
 
@@ -181,7 +185,8 @@ class AgentEngine(private val context: Context) {
     suspend fun initialize() {
         initMutex.withLock {
             if (initialized) return
-            loadConfig()
+            ensureStorageStructure()
+            ensureConfigLoaded()
             applyRuntimeConfiguration(notifyPluginReload = false, startGateway = true)
             initialized = true
         }
@@ -193,6 +198,7 @@ class AgentEngine(private val context: Context) {
     fun reloadConfig() {
         scope.launch {
             initMutex.withLock {
+                ensureStorageStructure()
                 loadConfig()
                 applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
                 initialized = true
@@ -206,6 +212,7 @@ class AgentEngine(private val context: Context) {
     fun saveConfig(newConfig: OpenClawConfig) {
         configManager.save(newConfig)
         config = newConfig
+        configLoaded = true
         scope.launch {
             initMutex.withLock {
                 applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
@@ -219,6 +226,13 @@ class AgentEngine(private val context: Context) {
         val accountId: String?,
         val email: String?,
         val expiresAtMs: Long?,
+    )
+
+    data class InstallStorageSnapshot(
+        val configFileExists: Boolean,
+        val sessionCount: Int,
+        val cronStoreExists: Boolean,
+        val secretCount: Int,
     )
 
     fun beginCodexOauthLogin(): String {
@@ -249,6 +263,7 @@ class AgentEngine(private val context: Context) {
     }
 
     suspend fun setApiKey(providerId: String, apiKey: String) {
+        ensureConfigLoaded()
         val canonical = canonicalProvider(providerId)
         secretStore.storeSecret(secretKeyForProvider(canonical), apiKey, SecretCategory.LLM_API_KEY)
         if (canonical == "openai") {
@@ -294,6 +309,7 @@ class AgentEngine(private val context: Context) {
         expiresAtMs: Long? = null,
         email: String? = null,
     ) {
+        ensureConfigLoaded()
         val token = accessToken.trim()
         require(token.isNotBlank()) { "Codex OAuth access token cannot be blank" }
 
@@ -348,6 +364,7 @@ class AgentEngine(private val context: Context) {
     }
 
     suspend fun clearCodexOauth() {
+        ensureConfigLoaded()
         secretStore.deleteSecret(CODEX_OAUTH_TOKEN_KEY)
         secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
         secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
@@ -382,6 +399,7 @@ class AgentEngine(private val context: Context) {
     }
 
     suspend fun clearApiKey(providerId: String) {
+        ensureConfigLoaded()
         val canonical = canonicalProvider(providerId)
         for (key in secretKeysForProvider(canonical)) {
             secretStore.deleteSecret(key)
@@ -404,7 +422,60 @@ class AgentEngine(private val context: Context) {
         }
     }
 
+    suspend fun storageSnapshot(): InstallStorageSnapshot {
+        val configFileExists = context.filesDir.resolve("config/openclaw.json").exists()
+        val sessionCount = sessionPersistence.listSessionKeys().size
+        val cronStoreExists = context.filesDir.resolve("cron/cron-store.json").exists()
+        val secretCount = secretStore.listSecretKeys().size
+        return InstallStorageSnapshot(
+            configFileExists = configFileExists,
+            sessionCount = sessionCount,
+            cronStoreExists = cronStoreExists,
+            secretCount = secretCount,
+        )
+    }
+
+    suspend fun wipeInstallStorage() {
+        initMutex.withLock {
+            runCatching { gatewayServerInternal?.stop() }
+            gatewayServerInternal = null
+
+            runCatching { cronScheduler.stop() }
+            runCatching { channelManager.stopAll() }
+            runCatching { pluginRegistry.stopAll() }
+
+            pluginsStarted = false
+            cronStarted = false
+            initialized = false
+
+            providerRegistry.clear()
+            toolRegistry.clear()
+            sessionToolLoopDetectors.clear()
+            sessionHookSessionIds.clear()
+            memoryManager.clear()
+
+            runCatching {
+                secretStore.listSecretKeys().forEach { key ->
+                    secretStore.deleteSecret(key)
+                }
+            }
+            runCatching { codexOauthManager.clearLocalState() }
+
+            clearFilesDirChildren()
+            OpenClawDatabase.wipe(context.applicationContext)
+
+            ensureStorageStructure()
+            config = OpenClawConfig()
+            configManager.save(config)
+            configLoaded = true
+
+            applyRuntimeConfiguration(notifyPluginReload = false, startGateway = true)
+            initialized = true
+        }
+    }
+
     fun defaultAgentId(): String {
+        ensureConfigLoaded()
         return config.agents?.list
             ?.firstOrNull { it.default == true }
             ?.id
@@ -413,6 +484,7 @@ class AgentEngine(private val context: Context) {
     }
 
     fun preferredModelForAgent(agentId: String = defaultAgentId()): String? {
+        ensureConfigLoaded()
         val agent = resolveAgentConfig(agentId)
         return agent?.model?.primary
             ?: config.agents?.defaults?.model?.primary
@@ -420,6 +492,7 @@ class AgentEngine(private val context: Context) {
     }
 
     fun availableModelIdsForEnabledProviders(): List<String> {
+        ensureConfigLoaded()
         val configuredProviders = config.models?.providers.orEmpty()
         val enabledProviders = resolveEnabledProviders(configuredProviders.keys)
         val available = mutableListOf<String>()
@@ -488,6 +561,7 @@ class AgentEngine(private val context: Context) {
         agentId: String = defaultAgentId(),
         sessionKey: String = "local:terminal",
     ): String? {
+        ensureInitialized()
         val enforcer = ToolPolicyEnforcer(config, toolAuditor)
         val policy = enforcer.check(toolName = toolName, agentId = agentId, sessionKey = sessionKey)
         if (!policy.allowed) {
@@ -518,6 +592,7 @@ class AgentEngine(private val context: Context) {
         messageAccountId: String? = null,
         clientTools: List<ClientToolDefinition> = emptyList(),
     ): Flow<AcpRuntimeEvent> = channelFlow {
+        ensureInitialized()
         val resolvedAgentId = agentId ?: defaultAgentId()
         val effectiveMessageProvider = messageProvider?.trim()?.takeIf { it.isNotEmpty() }
         val effectiveChannelId = messageChannelId?.trim()?.takeIf { it.isNotEmpty() } ?: effectiveMessageProvider
@@ -1477,6 +1552,29 @@ class AgentEngine(private val context: Context) {
         )
     }
 
+    private suspend fun ensureInitialized() {
+        if (initialized) return
+        initialize()
+    }
+
+    private fun ensureConfigLoaded() {
+        if (configLoaded) return
+        ensureStorageStructure()
+        loadConfig()
+    }
+
+    private fun ensureStorageStructure() {
+        STORAGE_DIRS.forEach { relativePath ->
+            context.filesDir.resolve(relativePath).mkdirs()
+        }
+    }
+
+    private fun clearFilesDirChildren() {
+        context.filesDir.listFiles()?.forEach { entry ->
+            entry.deleteRecursively()
+        }
+    }
+
     companion object {
         private const val DEFAULT_GATEWAY_PORT = 18789
         private const val DEFAULT_GATEWAY_HOST = "127.0.0.1"
@@ -1504,6 +1602,14 @@ class AgentEngine(private val context: Context) {
             "openai/gpt-4o-mini",
             "gemini/gemini-2.0-flash",
             "ollama/llama3",
+        )
+        private val STORAGE_DIRS = listOf(
+            "config",
+            "sessions",
+            "cron",
+            "camera_output",
+            "screen_captures",
+            "tts_output",
         )
     }
 }

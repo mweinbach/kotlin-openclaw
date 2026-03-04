@@ -43,6 +43,7 @@ private val settingsGroups = listOf(
             SettingsItem("Plugins", "Manage loaded plugins", Icons.Default.Extension, Routes.PLUGINS),
             SettingsItem("Gateway", "Gateway server configuration", Icons.Default.Router, Routes.GATEWAY_SETTINGS),
             SettingsItem("Sessions", "Session management settings", Icons.Default.Forum, Routes.SESSION_SETTINGS),
+            SettingsItem("Storage", "Inspect local data and wipe app state", Icons.Default.Storage, Routes.STORAGE_SETTINGS),
         ),
     ),
     SettingsGroup(

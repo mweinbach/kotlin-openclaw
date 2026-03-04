@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "db5428c9f741cf0247ec5e60c3d58ec2",
+    "identityHash": "cdaa85daf941fb0fc8c1b31c6f1ade00",
     "entities": [
       {
         "tableName": "sessions",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `agentId` TEXT NOT NULL, `channel` TEXT, `chatType` TEXT, `queueMode` TEXT, `model` TEXT, `modelProvider` TEXT, `inputTokens` INTEGER NOT NULL, `outputTokens` INTEGER NOT NULL, `totalTokens` INTEGER NOT NULL, `compactionCount` INTEGER NOT NULL, `label` TEXT, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `metadataJson` TEXT, PRIMARY KEY(`sessionId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sessionId` TEXT NOT NULL, `sessionKey` TEXT NOT NULL, `agentId` TEXT NOT NULL, `channelType` TEXT, `channelAccountId` TEXT, `senderKey` TEXT, `chatType` TEXT, `queueMode` TEXT, `model` TEXT, `modelProvider` TEXT, `inputTokens` INTEGER NOT NULL, `outputTokens` INTEGER NOT NULL, `totalTokens` INTEGER NOT NULL, `compactionCount` INTEGER NOT NULL, `label` TEXT, `createdAt` INTEGER NOT NULL, `lastActiveAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `metadataJson` TEXT, PRIMARY KEY(`sessionId`))",
         "fields": [
           {
             "fieldPath": "sessionId",
@@ -27,8 +27,18 @@
             "notNull": true
           },
           {
-            "fieldPath": "channel",
-            "columnName": "channel",
+            "fieldPath": "channelType",
+            "columnName": "channelType",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "channelAccountId",
+            "columnName": "channelAccountId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "senderKey",
+            "columnName": "senderKey",
             "affinity": "TEXT"
           },
           {
@@ -87,6 +97,12 @@
             "notNull": true
           },
           {
+            "fieldPath": "lastActiveAt",
+            "columnName": "lastActiveAt",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
             "fieldPath": "updatedAt",
             "columnName": "updatedAt",
             "affinity": "INTEGER",
@@ -103,11 +119,49 @@
           "columnNames": [
             "sessionId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_sessions_agentId",
+            "unique": false,
+            "columnNames": [
+              "agentId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_agentId` ON `${TABLE_NAME}` (`agentId`)"
+          },
+          {
+            "name": "index_sessions_channelType",
+            "unique": false,
+            "columnNames": [
+              "channelType"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_channelType` ON `${TABLE_NAME}` (`channelType`)"
+          },
+          {
+            "name": "index_sessions_senderKey",
+            "unique": false,
+            "columnNames": [
+              "senderKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_senderKey` ON `${TABLE_NAME}` (`senderKey`)"
+          },
+          {
+            "name": "index_sessions_lastActiveAt",
+            "unique": false,
+            "columnNames": [
+              "lastActiveAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sessions_lastActiveAt` ON `${TABLE_NAME}` (`lastActiveAt`)"
+          }
+        ]
       },
       {
         "tableName": "messages",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`messageId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `role` TEXT NOT NULL, `content` TEXT NOT NULL, `channel` TEXT, `senderId` TEXT, `senderName` TEXT, `threadId` TEXT, `replyToMessageId` TEXT, `attachmentsJson` TEXT, `metadataJson` TEXT, `timestamp` INTEGER NOT NULL, PRIMARY KEY(`messageId`), FOREIGN KEY(`sessionId`) REFERENCES `sessions`(`sessionId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`messageId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `role` TEXT NOT NULL, `content` TEXT NOT NULL, `toolCallId` TEXT, `toolName` TEXT, `channel` TEXT, `senderId` TEXT, `senderName` TEXT, `threadId` TEXT, `replyToMessageId` TEXT, `tokenCount` INTEGER, `attachmentsJson` TEXT, `metadataJson` TEXT, `timestamp` INTEGER NOT NULL, PRIMARY KEY(`messageId`), FOREIGN KEY(`sessionId`) REFERENCES `sessions`(`sessionId`) ON UPDATE NO ACTION ON DELETE CASCADE )",
         "fields": [
           {
             "fieldPath": "messageId",
@@ -134,6 +188,16 @@
             "notNull": true
           },
           {
+            "fieldPath": "toolCallId",
+            "columnName": "toolCallId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "toolName",
+            "columnName": "toolName",
+            "affinity": "TEXT"
+          },
+          {
             "fieldPath": "channel",
             "columnName": "channel",
             "affinity": "TEXT"
@@ -157,6 +221,11 @@
             "fieldPath": "replyToMessageId",
             "columnName": "replyToMessageId",
             "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "tokenCount",
+            "columnName": "tokenCount",
+            "affinity": "INTEGER"
           },
           {
             "fieldPath": "attachmentsJson",
@@ -199,6 +268,15 @@
             ],
             "orders": [],
             "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_timestamp` ON `${TABLE_NAME}` (`timestamp`)"
+          },
+          {
+            "name": "index_messages_role",
+            "unique": false,
+            "columnNames": [
+              "role"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_role` ON `${TABLE_NAME}` (`role`)"
           }
         ],
         "foreignKeys": [
@@ -217,7 +295,7 @@
       },
       {
         "tableName": "memory_entries",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `content` TEXT NOT NULL, `source` TEXT NOT NULL, `embeddingJson` TEXT, `metadataJson` TEXT, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `content` TEXT NOT NULL, `source` TEXT NOT NULL, `embedding` BLOB, `embeddingJson` TEXT, `metadataJson` TEXT, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -236,6 +314,11 @@
             "columnName": "source",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "embedding",
+            "columnName": "embedding",
+            "affinity": "BLOB"
           },
           {
             "fieldPath": "embeddingJson",
@@ -283,7 +366,7 @@
       },
       {
         "tableName": "cron_jobs",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`jobId` TEXT NOT NULL, `name` TEXT NOT NULL, `cronExpression` TEXT NOT NULL, `agentId` TEXT NOT NULL, `sessionKey` TEXT, `messageTemplate` TEXT, `enabled` INTEGER NOT NULL, `lastRunAt` INTEGER, `nextRunAt` INTEGER, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`jobId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`jobId` TEXT NOT NULL, `name` TEXT NOT NULL, `scheduleJson` TEXT NOT NULL, `payloadJson` TEXT, `cronExpression` TEXT, `agentId` TEXT, `sessionKey` TEXT, `messageTemplate` TEXT, `enabled` INTEGER NOT NULL, `lastRunAt` INTEGER, `nextRunAt` INTEGER, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`jobId`))",
         "fields": [
           {
             "fieldPath": "jobId",
@@ -298,16 +381,25 @@
             "notNull": true
           },
           {
-            "fieldPath": "cronExpression",
-            "columnName": "cronExpression",
+            "fieldPath": "scheduleJson",
+            "columnName": "scheduleJson",
             "affinity": "TEXT",
             "notNull": true
           },
           {
+            "fieldPath": "payloadJson",
+            "columnName": "payloadJson",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cronExpression",
+            "columnName": "cronExpression",
+            "affinity": "TEXT"
+          },
+          {
             "fieldPath": "agentId",
             "columnName": "agentId",
-            "affinity": "TEXT",
-            "notNull": true
+            "affinity": "TEXT"
           },
           {
             "fieldPath": "sessionKey",
@@ -353,21 +445,35 @@
           "columnNames": [
             "jobId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_cron_jobs_enabled",
+            "unique": false,
+            "columnNames": [
+              "enabled"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_cron_jobs_enabled` ON `${TABLE_NAME}` (`enabled`)"
+          },
+          {
+            "name": "index_cron_jobs_nextRunAt",
+            "unique": false,
+            "columnNames": [
+              "nextRunAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_cron_jobs_nextRunAt` ON `${TABLE_NAME}` (`nextRunAt`)"
+          }
+        ]
       },
       {
         "tableName": "channel_states",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`channelAccountKey` TEXT NOT NULL, `channelId` TEXT NOT NULL, `accountId` TEXT NOT NULL, `connected` INTEGER NOT NULL, `lastHeartbeatAt` INTEGER, `lastErrorMessage` TEXT, `stateJson` TEXT, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`channelAccountKey`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`channelType` TEXT NOT NULL, `accountId` TEXT NOT NULL, `connected` INTEGER NOT NULL, `lastHeartbeatAt` INTEGER, `lastErrorMessage` TEXT, `stateJson` TEXT, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`channelType`, `accountId`))",
         "fields": [
           {
-            "fieldPath": "channelAccountKey",
-            "columnName": "channelAccountKey",
-            "affinity": "TEXT",
-            "notNull": true
-          },
-          {
-            "fieldPath": "channelId",
-            "columnName": "channelId",
+            "fieldPath": "channelType",
+            "columnName": "channelType",
             "affinity": "TEXT",
             "notNull": true
           },
@@ -408,13 +514,25 @@
         "primaryKey": {
           "autoGenerate": false,
           "columnNames": [
-            "channelAccountKey"
+            "channelType",
+            "accountId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_channel_states_updatedAt",
+            "unique": false,
+            "columnNames": [
+              "updatedAt"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_channel_states_updatedAt` ON `${TABLE_NAME}` (`updatedAt`)"
+          }
+        ]
       },
       {
         "tableName": "plugin_states",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pluginId` TEXT NOT NULL, `name` TEXT NOT NULL, `enabled` INTEGER NOT NULL, `version` TEXT, `configJson` TEXT, `stateJson` TEXT, `installedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`pluginId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`pluginId` TEXT NOT NULL, `name` TEXT, `enabled` INTEGER NOT NULL, `version` TEXT, `configJson` TEXT, `stateJson` TEXT, `installedAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`pluginId`))",
         "fields": [
           {
             "fieldPath": "pluginId",
@@ -425,8 +543,7 @@
           {
             "fieldPath": "name",
             "columnName": "name",
-            "affinity": "TEXT",
-            "notNull": true
+            "affinity": "TEXT"
           },
           {
             "fieldPath": "enabled",
@@ -467,12 +584,23 @@
           "columnNames": [
             "pluginId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_plugin_states_enabled",
+            "unique": false,
+            "columnNames": [
+              "enabled"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_plugin_states_enabled` ON `${TABLE_NAME}` (`enabled`)"
+          }
+        ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'db5428c9f741cf0247ec5e60c3d58ec2')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'cdaa85daf941fb0fc8c1b31c6f1ade00')"
     ]
   }
 }

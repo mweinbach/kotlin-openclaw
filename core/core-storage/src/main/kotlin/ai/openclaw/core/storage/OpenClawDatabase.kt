@@ -52,6 +52,18 @@ abstract class OpenClawDatabase : RoomDatabase() {
             }
         }
 
+        @Synchronized
+        fun closeInstance() {
+            instance?.close()
+            instance = null
+        }
+
+        @Synchronized
+        fun wipe(context: Context): Boolean {
+            closeInstance()
+            return context.applicationContext.deleteDatabase(DATABASE_NAME)
+        }
+
         private fun buildDatabase(context: Context): OpenClawDatabase {
             return Room.databaseBuilder(
                 context.applicationContext,

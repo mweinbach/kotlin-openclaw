@@ -33,6 +33,7 @@ import ai.openclaw.android.ui.settings.models.ModelsScreen
 import ai.openclaw.android.ui.settings.plugins.PluginsScreen
 import ai.openclaw.android.ui.settings.security.SecurityScreen
 import ai.openclaw.android.ui.settings.sessions.SessionSettingsScreen
+import ai.openclaw.android.ui.settings.storage.StorageSettingsScreen
 import ai.openclaw.android.ui.tools.ToolsHubScreen
 import ai.openclaw.android.ui.tools.approvals.ApprovalsScreen
 import ai.openclaw.android.ui.tools.cron.CronEditSheet
@@ -254,6 +255,12 @@ fun AppNavigation(engine: AgentEngine) {
             }
             composable(Routes.SESSION_SETTINGS) {
                 SessionSettingsScreen(
+                    engine = engine,
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(Routes.STORAGE_SETTINGS) {
+                StorageSettingsScreen(
                     engine = engine,
                     onBack = { navController.popBackStack() },
                 )

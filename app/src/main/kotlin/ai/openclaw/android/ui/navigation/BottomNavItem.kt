@@ -59,6 +59,7 @@ object Routes {
     const val PLUGINS = "settings/plugins"
     const val GATEWAY_SETTINGS = "settings/gateway"
     const val SESSION_SETTINGS = "settings/sessions"
+    const val STORAGE_SETTINGS = "settings/storage"
     const val SECURITY = "settings/security"
     const val LOGS = "settings/logs"
     const val ABOUT = "settings/about"

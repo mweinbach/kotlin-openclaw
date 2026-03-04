@@ -91,4 +91,11 @@ class MemoryManager(
      * Get the number of stored memories.
      */
     fun size(): Int = store.size()
+
+    /**
+     * Remove all in-memory entries.
+     */
+    fun clear() {
+        store.clear()
+    }
 }

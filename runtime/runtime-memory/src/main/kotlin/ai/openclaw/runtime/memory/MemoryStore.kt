@@ -73,6 +73,11 @@ class InMemoryVectorStore {
     @Synchronized
     fun size(): Int = entries.size
 
+    @Synchronized
+    fun clear() {
+        entries.clear()
+    }
+
     /**
      * Search using brute-force cosine similarity.
      */

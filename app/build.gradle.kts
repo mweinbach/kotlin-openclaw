@@ -79,6 +79,7 @@ dependencies {
     implementation(project(":core:core-skills"))
     implementation(project(":core:core-agent"))
     implementation(project(":core:core-security"))
+    implementation(project(":core:core-storage"))
     implementation(project(":core:core-plugins"))
 
     // Runtime modules
