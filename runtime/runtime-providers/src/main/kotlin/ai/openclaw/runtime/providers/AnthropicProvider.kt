@@ -21,6 +21,10 @@ class AnthropicProvider(
     private val baseUrl: String = "https://api.anthropic.com",
     private val client: OkHttpClient = OkHttpClient(),
 ) : LlmProvider {
+    private data class InlineImage(
+        val mediaType: String,
+        val data: String,
+    )
 
     override val id = "anthropic"
 
@@ -64,9 +68,21 @@ class AnthropicProvider(
                                             }
                                         }
                                         is LlmContentBlock.ImageUrl -> {
-                                            addJsonObject {
-                                                put("type", "text")
-                                                put("text", "[image] ${block.url}")
+                                            val inlineImage = parseInlineImage(block)
+                                            if (inlineImage != null) {
+                                                addJsonObject {
+                                                    put("type", "image")
+                                                    putJsonObject("source") {
+                                                        put("type", "base64")
+                                                        put("media_type", inlineImage.mediaType)
+                                                        put("data", inlineImage.data)
+                                                    }
+                                                }
+                                            } else {
+                                                addJsonObject {
+                                                    put("type", "text")
+                                                    put("text", "[image] ${block.url}")
+                                                }
                                             }
                                         }
                                     }
@@ -96,8 +112,18 @@ class AnthropicProvider(
                                             put("text", block.text)
                                         }
                                         is LlmContentBlock.ImageUrl -> addJsonObject {
-                                            put("type", "text")
-                                            put("text", "[image] ${block.url}")
+                                            val inlineImage = parseInlineImage(block)
+                                            if (inlineImage != null) {
+                                                put("type", "image")
+                                                putJsonObject("source") {
+                                                    put("type", "base64")
+                                                    put("media_type", inlineImage.mediaType)
+                                                    put("data", inlineImage.data)
+                                                }
+                                            } else {
+                                                put("type", "text")
+                                                put("text", "[image] ${block.url}")
+                                            }
                                         }
                                     }
                                 }
@@ -156,9 +182,10 @@ class AnthropicProvider(
         if (thinkingBudget != null && thinkingBudget > 0) {
             betaFeatures.add("interleaved-thinking-2025-05-14")
         }
+        val requestBaseUrl = normalizeBaseUrl(baseUrl)
 
         val httpRequest = Request.Builder()
-            .url("$baseUrl/v1/messages")
+            .url("$requestBaseUrl/v1/messages")
             .header("x-api-key", apiKey)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", betaFeatures.joinToString(","))
@@ -166,7 +193,7 @@ class AnthropicProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val response = client.newCall(httpRequest).execute()
+        val response = client.newCall(httpRequest).executeCancellable()
         try {
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
@@ -297,5 +324,26 @@ class AnthropicProvider(
         }
 
         emit(LlmStreamEvent.Done(stopReason = stopReason ?: "end_turn"))
+    }
+
+    private fun parseInlineImage(block: LlmContentBlock.ImageUrl): InlineImage? {
+        val url = block.url.trim()
+        if (!url.startsWith("data:", ignoreCase = true)) return null
+        val match = DATA_URL_PATTERN.matchEntire(url) ?: return null
+        if (match.groupValues[2].lowercase() != ";base64") return null
+        val mediaType = block.mimeType?.takeIf { it.isNotBlank() }
+            ?: match.groupValues[1].ifBlank { "application/octet-stream" }
+        val data = match.groupValues[3].trim()
+        if (data.isEmpty()) return null
+        return InlineImage(mediaType = mediaType, data = data)
+    }
+
+    companion object {
+        private val DATA_URL_PATTERN = Regex("^data:([^;,]+)?(;base64),(.+)$", RegexOption.IGNORE_CASE)
+
+        private fun normalizeBaseUrl(baseUrl: String): String {
+            val trimmed = baseUrl.trim().removeSuffix("/")
+            return trimmed.replace(Regex("/v1$", RegexOption.IGNORE_CASE), "")
+        }
     }
 }

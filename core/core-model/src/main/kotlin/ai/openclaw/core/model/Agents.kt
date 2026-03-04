@@ -35,6 +35,11 @@ data class MemorySearchConfig(
 
 @Serializable
 data class AgentToolsConfig(
+    val profile: ToolProfileId? = null,
+    val allow: List<String>? = null,
+    val alsoAllow: List<String>? = null,
+    val deny: List<String>? = null,
+    val byProvider: Map<String, ToolPolicyConfig>? = null,
     val enabled: List<String>? = null,
     val disabled: List<String>? = null,
 )
@@ -49,6 +54,7 @@ data class GroupChatConfig(
 data class SubagentsConfig(
     val allowAgents: List<String>? = null,
     val model: AgentModelConfig? = null,
+    val maxSpawnDepth: Int? = null,
 )
 
 @Serializable

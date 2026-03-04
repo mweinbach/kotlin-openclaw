@@ -35,6 +35,7 @@ class SessionPersistence(
         val content: String,
         val name: String? = null,
         val toolCallId: String? = null,
+        val stopReason: String? = null,
         val toolCalls: List<ToolCallEntry>? = null,
         val contentBlocks: List<ContentBlockEntry>? = null,
         val timestamp: Long = System.currentTimeMillis(),
@@ -164,6 +165,7 @@ class SessionPersistence(
             content = entry.content,
             name = entry.name,
             toolCallId = entry.toolCallId,
+            stopReason = entry.stopReason,
             toolCalls = entry.toolCalls?.map {
                 ai.openclaw.core.agent.LlmToolCall(it.id, it.name, it.arguments)
             },
@@ -183,6 +185,7 @@ class SessionPersistence(
             content = message.plainTextContent(),
             name = message.name,
             toolCallId = message.toolCallId,
+            stopReason = message.stopReason,
             toolCalls = message.toolCalls?.map {
                 ToolCallEntry(it.id, it.name, it.arguments)
             },

@@ -64,6 +64,7 @@ data class AcpRuntimeTurnInput(
     val text: String,
     val mode: AcpRuntimePromptMode,
     val requestId: String,
+    val timeoutMs: Long? = null,
     val context: AcpRuntimeTurnContext? = null,
 )
 
@@ -73,6 +74,9 @@ data class AcpRuntimeTurnContext(
     val messageProvider: String? = null,
     val channelId: String? = null,
     val sessionId: String? = null,
+    val senderIsOwner: Boolean? = null,
+    val sandboxed: Boolean? = null,
+    val groupToolPolicy: GroupToolPolicyConfig? = null,
 )
 
 @Serializable
@@ -126,6 +130,10 @@ sealed class AcpRuntimeEvent {
         val toolCallId: String? = null,
         val status: String? = null,
         val title: String? = null,
+        val detail: String? = null,
+        val kind: String? = null,
+        val rawInput: String? = null,
+        val rawOutput: String? = null,
     ) : AcpRuntimeEvent()
 
     @Serializable

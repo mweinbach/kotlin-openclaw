@@ -15,15 +15,19 @@ import ai.openclaw.core.plugins.LlmOutputEvent
 import ai.openclaw.core.plugins.LlmUsage
 import ai.openclaw.core.plugins.PluginHookAgentContext
 import ai.openclaw.core.plugins.PluginHookToolContext
+import ai.openclaw.core.plugins.ToolResultPersistEvent
 import ai.openclaw.core.security.ApprovalDecision
 import ai.openclaw.core.security.ApprovalManager
 import ai.openclaw.core.security.ToolPolicyEnforcer
+import ai.openclaw.core.security.ToolPolicyContext
 import ai.openclaw.core.session.isSubagentSessionKey
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.*
 import java.util.UUID
 
@@ -32,6 +36,12 @@ import java.util.UUID
  */
 class ToolRegistry {
     private val tools = mutableMapOf<String, AgentTool>()
+    private val schemaJson = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = false
+        isLenient = true
+        explicitNulls = false
+    }
 
     fun register(tool: AgentTool) {
         tools[tool.name] = tool
@@ -47,16 +57,180 @@ class ToolRegistry {
         tools.clear()
     }
 
-    fun toDefinitions(): List<LlmToolDefinition> = tools.values.map {
+    fun toDefinitions(allowedToolNames: Set<String>? = null): List<LlmToolDefinition> = filteredTools(allowedToolNames).map {
         LlmToolDefinition(
             name = it.name,
             description = it.description,
-            parameters = it.parametersSchema,
+            parameters = normalizeToolParametersSchema(it.parametersSchema),
         )
     }
 
-    fun toSummaries(): List<SystemPromptBuilder.ToolSummary> = tools.values.map {
+    fun toSummaries(allowedToolNames: Set<String>? = null): List<SystemPromptBuilder.ToolSummary> = filteredTools(allowedToolNames).map {
         SystemPromptBuilder.ToolSummary(name = it.name, description = it.description)
+    }
+
+    private fun filteredTools(allowedToolNames: Set<String>?): List<AgentTool> {
+        if (allowedToolNames.isNullOrEmpty()) return tools.values.toList()
+        val allowed = allowedToolNames.map { it.trim().lowercase() }.toSet()
+        return tools.values.filter { tool -> tool.name.trim().lowercase() in allowed }
+    }
+
+    private fun normalizeToolParametersSchema(schema: String): String {
+        val parsed = runCatching { schemaJson.parseToJsonElement(schema) }.getOrNull() as? JsonObject
+            ?: return schema
+
+        val normalized = when {
+            parsed["type"] == null &&
+                (parsed["properties"] is JsonObject || parsed["required"] is JsonArray) &&
+                parsed["anyOf"] !is JsonArray &&
+                parsed["oneOf"] !is JsonArray -> JsonObject(parsed + ("type" to JsonPrimitive("object")))
+
+            parsed["anyOf"] is JsonArray || parsed["oneOf"] is JsonArray -> flattenUnionSchema(parsed)
+
+            else -> parsed
+        }
+
+        return runCatching {
+            schemaJson.encodeToString(JsonObject.serializer(), normalized)
+        }.getOrElse { schema }
+    }
+
+    private fun flattenUnionSchema(schema: JsonObject): JsonObject {
+        val variants = when {
+            schema["anyOf"] is JsonArray -> schema["anyOf"]!!.jsonArray
+            schema["oneOf"] is JsonArray -> schema["oneOf"]!!.jsonArray
+            else -> return schema
+        }
+
+        val mergedProperties = mutableMapOf<String, JsonElement>()
+        val requiredCounts = mutableMapOf<String, Int>()
+        var objectVariants = 0
+
+        for (variant in variants) {
+            val variantObj = variant as? JsonObject ?: continue
+            val properties = variantObj["properties"] as? JsonObject ?: continue
+            objectVariants += 1
+            for ((key, value) in properties) {
+                val existing = mergedProperties[key]
+                mergedProperties[key] = if (existing == null) {
+                    value
+                } else {
+                    mergePropertySchemas(existing, value)
+                }
+            }
+
+            val required = variantObj["required"] as? JsonArray ?: JsonArray(emptyList())
+            required.forEach { requiredEntry ->
+                val name = requiredEntry.jsonPrimitive.contentOrNull ?: return@forEach
+                requiredCounts[name] = (requiredCounts[name] ?: 0) + 1
+            }
+        }
+
+        val baseRequired = (schema["required"] as? JsonArray)
+            ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+            ?.takeIf { it.isNotEmpty() }
+        val mergedRequired = baseRequired ?: if (objectVariants > 0) {
+            requiredCounts.entries
+                .filter { (_, count) -> count == objectVariants }
+                .map { (key, _) -> key }
+                .takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+
+        val flattened = buildJsonObject {
+            put("type", JsonPrimitive("object"))
+            schema["title"]?.let { put("title", it) }
+            schema["description"]?.let { put("description", it) }
+            putJsonObject("properties") {
+                val source = if (mergedProperties.isNotEmpty()) {
+                    JsonObject(mergedProperties)
+                } else {
+                    schema["properties"] as? JsonObject ?: JsonObject(emptyMap())
+                }
+                for ((key, value) in source) {
+                    put(key, value)
+                }
+            }
+            if (!mergedRequired.isNullOrEmpty()) {
+                putJsonArray("required") {
+                    mergedRequired.forEach { add(JsonPrimitive(it)) }
+                }
+            }
+            put(
+                "additionalProperties",
+                schema["additionalProperties"] ?: JsonPrimitive(true),
+            )
+        }
+
+        return flattened
+    }
+
+    private fun mergePropertySchemas(existing: JsonElement, incoming: JsonElement): JsonElement {
+        val existingEnums = extractEnumValues(existing)
+        val incomingEnums = extractEnumValues(incoming)
+        if (existingEnums.isEmpty() && incomingEnums.isEmpty()) {
+            return existing
+        }
+
+        val uniqueValues = linkedMapOf<String, JsonElement>()
+        (existingEnums + incomingEnums).forEach { enumValue ->
+            val key = enumValue.toString()
+            if (key !in uniqueValues) {
+                uniqueValues[key] = enumValue
+            }
+        }
+
+        val existingObj = existing as? JsonObject
+        val incomingObj = incoming as? JsonObject
+        val title = existingObj?.get("title") ?: incomingObj?.get("title")
+        val description = existingObj?.get("description") ?: incomingObj?.get("description")
+        val defaultValue = existingObj?.get("default") ?: incomingObj?.get("default")
+        val merged = buildJsonObject {
+            if (title != null) put("title", title)
+            if (description != null) put("description", description)
+            if (defaultValue != null) put("default", defaultValue)
+
+            val enumType = inferEnumType(uniqueValues.values.toList())
+            if (enumType != null) {
+                put("type", JsonPrimitive(enumType))
+            }
+            putJsonArray("enum") {
+                uniqueValues.values.forEach { add(it) }
+            }
+        }
+
+        return merged
+    }
+
+    private fun extractEnumValues(schema: JsonElement): List<JsonElement> {
+        val obj = schema as? JsonObject ?: return emptyList()
+
+        val directEnum = obj["enum"] as? JsonArray
+        if (directEnum != null) {
+            return directEnum.toList()
+        }
+
+        obj["const"]?.let { return listOf(it) }
+
+        val variants = (obj["anyOf"] as? JsonArray) ?: (obj["oneOf"] as? JsonArray) ?: return emptyList()
+        return variants.flatMap { extractEnumValues(it) }
+    }
+
+    private fun inferEnumType(values: List<JsonElement>): String? {
+        if (values.isEmpty()) return null
+        val types = values.mapNotNull { value ->
+            when (value) {
+                is JsonPrimitive -> when {
+                    value.isString -> "string"
+                    value.booleanOrNull != null -> "boolean"
+                    value.longOrNull != null || value.doubleOrNull != null -> "number"
+                    else -> null
+                }
+                else -> null
+            }
+        }.toSet()
+        return if (types.size == 1) types.first() else null
     }
 }
 
@@ -69,7 +243,8 @@ class ToolRegistry {
 class AgentRunner(
     private val provider: LlmProvider,
     private val toolRegistry: ToolRegistry = ToolRegistry(),
-    private val maxToolRounds: Int = 30,
+    private val maxToolRounds: Int = 160,
+    private val maxRunAttempts: Int = 32,
     private val contextGuard: ContextGuard = ContextGuard(),
     private val sessionPersistence: SessionPersistence? = null,
     private val systemPromptBuilder: SystemPromptBuilder = SystemPromptBuilder(),
@@ -103,11 +278,16 @@ class AgentRunner(
             runtimeInfo = params.runtimeInfo,
             workspaceDir = params.workspaceDir,
             maxHistoryTurns = params.maxHistoryTurns,
+            timeoutMs = params.timeoutMs,
+            maxRunAttempts = params.maxRunAttempts,
             hookSessionId = params.hookSessionId,
             legacyBeforeAgentStartResult = params.legacyBeforeAgentStartResult,
             trigger = params.turnContext.trigger,
             messageProvider = params.turnContext.messageProvider,
             hookChannelId = params.turnContext.channelId,
+            senderIsOwner = params.turnContext.senderIsOwner,
+            turnSandboxed = params.turnContext.sandboxed,
+            groupToolPolicy = params.turnContext.groupToolPolicy,
         )
     }
 
@@ -131,11 +311,16 @@ class AgentRunner(
         runtimeInfo: SystemPromptBuilder.RuntimeInfo? = null,
         workspaceDir: String? = null,
         maxHistoryTurns: Int? = null,
+        timeoutMs: Long? = null,
+        maxRunAttempts: Int? = null,
         hookSessionId: String? = null,
         legacyBeforeAgentStartResult: BeforeAgentStartResult? = null,
         trigger: String? = null,
         messageProvider: String? = null,
         hookChannelId: String? = null,
+        senderIsOwner: Boolean? = null,
+        turnSandboxed: Boolean? = null,
+        groupToolPolicy: GroupToolPolicyConfig? = null,
     ): Flow<AcpRuntimeEvent> = flow {
         val effectiveRunId = runId?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
         val effectiveHookSessionId = hookSessionId?.trim()?.takeIf { it.isNotEmpty() }
@@ -155,9 +340,10 @@ class AgentRunner(
         var usageInputTotal = 0
         var usageOutputTotal = 0
         var usageCacheReadTotal = 0
-        var usageCacheWriteTotal = 0
-        var usageSeenAny = false
-        var finalModelForHooks = model
+            var usageCacheWriteTotal = 0
+            var usageSeenAny = false
+            var finalModelForHooks = model
+            val startedToolCallIds = mutableSetOf<String>()
 
         try {
             // Load persisted history if available.
@@ -182,10 +368,22 @@ class AgentRunner(
 
             var effectiveModel = model
             finalModelForHooks = effectiveModel
+            var policyContext = buildToolPolicyContext(
+                agentId = agentId,
+                sessionKey = sessionKey,
+                modelProvider = provider.id,
+                modelId = effectiveModel,
+                messageProvider = effectiveMessageProvider,
+                senderIsOwner = senderIsOwner,
+                runtimeInfo = runtimeInfo,
+                turnSandboxed = turnSandboxed,
+                groupToolPolicy = groupToolPolicy,
+            )
+            var allowedToolNames = resolveAllowedToolNames(policyContext)
             var effectiveSystemPrompt = systemPrompt ?: systemPromptBuilder.buildEmbedded(
                 SystemPromptBuilder.EmbeddedPromptConfig(
                     agentIdentity = agentIdentity,
-                    tools = toolRegistry.toSummaries(),
+                    tools = toolRegistry.toSummaries(allowedToolNames),
                     skills = skills,
                     runtimeInfo = runtimeInfo,
                     promptMode = resolvePromptModeForSession(sessionKey),
@@ -193,6 +391,7 @@ class AgentRunner(
                     workspaceDir = workspaceDir ?: ".",
                     modelId = model,
                     provider = provider.id,
+                    extraSystemPrompt = subagentPromptContract(sessionKey),
                 ),
             )
 
@@ -228,6 +427,12 @@ class AgentRunner(
             currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
 
             val latestUserMessage = currentMessages.lastOrNull { it.role == LlmMessage.Role.USER }
+            val historyMessagesForHook = if (latestUserMessage != null) {
+                val lastUserIndex = currentMessages.indexOfLast { it.role == LlmMessage.Role.USER }
+                if (lastUserIndex > 0) currentMessages.subList(0, lastUserIndex) else emptyList()
+            } else {
+                currentMessages
+            }
             val promptImageCount = latestUserMessage
                 ?.normalizedContentBlocks()
                 ?.count { it is LlmContentBlock.ImageUrl }
@@ -243,7 +448,7 @@ class AgentRunner(
                             model = effectiveModel,
                             systemPrompt = effectiveSystemPrompt,
                             prompt = latestUserMessage?.plainTextContent().orEmpty(),
-                            historyMessages = currentMessages.map { it.toHookMessagePayload() },
+                            historyMessages = historyMessagesForHook.map { it.toHookMessagePayload() },
                             imagesCount = promptImageCount,
                         ),
                         ctx = PluginHookAgentContext(
@@ -261,261 +466,533 @@ class AgentRunner(
                 }
             }
 
-            var round = 0
+            val effectiveMaxRunAttempts = (maxRunAttempts ?: this@AgentRunner.maxRunAttempts).coerceAtLeast(1)
+            val turnTimeoutMs = timeoutMs?.takeIf { it > 0L }
+            var runAttempt = 0
+            var lastRetryableError: LlmStreamEvent.Error? = null
             var aborted = false
             emit(AcpRuntimeEvent.Status(text = "Starting turn", tag = "turn_start"))
 
-            while (round < maxToolRounds && !aborted) {
-                round++
-                finalModelForHooks = effectiveModel
-                val request = LlmRequest(
-                    model = effectiveModel,
-                    messages = currentMessages,
-                    tools = toolRegistry.toDefinitions(),
-                    systemPrompt = effectiveSystemPrompt,
-                )
-
-                val textBuffer = StringBuilder()
-                val pendingToolCalls = mutableListOf<LlmStreamEvent.ToolUse>()
-                var streamError: LlmStreamEvent.Error? = null
-                var stopReason: String? = null
-                var usageInputTokens = 0
-                var usageOutputTokens = 0
-                var usageCacheRead = 0
-                var usageCacheWrite = 0
-                var usageSeen = false
-
-                provider.streamCompletion(request).collect { event ->
-                    when (event) {
-                        is LlmStreamEvent.TextDelta -> {
-                            textBuffer.append(event.text)
-                            emit(AcpRuntimeEvent.TextDelta(text = event.text))
-                        }
-                        is LlmStreamEvent.ThinkingDelta -> {
-                            emit(
-                                AcpRuntimeEvent.TextDelta(
-                                    text = event.text,
-                                    stream = AcpRuntimeEvent.StreamType.THOUGHT,
-                                ),
-                            )
-                        }
-                        is LlmStreamEvent.ToolUse -> {
-                            pendingToolCalls.add(event)
-                            emit(
-                                AcpRuntimeEvent.ToolCall(
-                                    text = "Calling ${event.name}",
-                                    toolCallId = event.id,
-                                    title = event.name,
-                                ),
-                            )
-                        }
-                        is LlmStreamEvent.Usage -> {
-                            usageSeen = true
-                            usageSeenAny = true
-                            usageInputTokens += event.inputTokens
-                            usageOutputTokens += event.outputTokens
-                            usageCacheRead += event.cacheRead
-                            usageCacheWrite += event.cacheWrite
-                            emit(
-                                AcpRuntimeEvent.Status(
-                                    text = "Tokens: ${event.inputTokens}+${event.outputTokens}",
-                                    tag = "usage_update",
-                                    used = event.inputTokens + event.outputTokens,
-                                ),
-                            )
-                        }
-                        is LlmStreamEvent.Done -> {
-                            stopReason = event.stopReason
-                        }
-                        is LlmStreamEvent.Error -> {
-                            streamError = event
-                        }
-                    }
-                }
-
-                val llmUsage = if (usageSeen) {
-                    LlmUsage(
-                        input = usageInputTokens,
-                        output = usageOutputTokens,
-                        cacheRead = usageCacheRead,
-                        cacheWrite = usageCacheWrite,
-                        total = usageInputTokens + usageOutputTokens + usageCacheRead + usageCacheWrite,
-                    )
-                } else {
-                    null
-                }
-                val assistantText = textBuffer.toString()
-                if (assistantText.isNotBlank()) {
-                    llmAssistantTexts += assistantText
-                }
-                llmLastAssistantPayload = if (assistantText.isNotEmpty() || pendingToolCalls.isNotEmpty()) {
-                    buildMap {
-                        put("role", "assistant")
-                        put("content", assistantText)
-                        if (pendingToolCalls.isNotEmpty()) {
-                            put(
-                                "toolCalls",
-                                pendingToolCalls.map {
-                                    mapOf(
-                                        "id" to it.id,
-                                        "name" to normalizeToolName(it.name),
-                                        "arguments" to it.input,
-                                    )
-                                },
-                            )
-                        }
-                    }
-                } else {
-                    null
-                }
-                if (llmUsage != null) {
-                    usageInputTotal += llmUsage.input ?: 0
-                    usageOutputTotal += llmUsage.output ?: 0
-                    usageCacheReadTotal += llmUsage.cacheRead ?: 0
-                    usageCacheWriteTotal += llmUsage.cacheWrite ?: 0
-                }
-
-                if (streamError != null) {
+            attemptLoop@ while (runAttempt < effectiveMaxRunAttempts && !aborted) {
+                runAttempt += 1
+                val attemptStartedAt = System.currentTimeMillis()
+                var round = 0
+                if (runAttempt > 1) {
                     emit(
-                        AcpRuntimeEvent.Error(
-                            message = streamError!!.message,
-                            code = streamError!!.code,
-                            retryable = streamError!!.retryable,
+                        AcpRuntimeEvent.Status(
+                            text = "Retrying turn attempt $runAttempt/$effectiveMaxRunAttempts",
+                            tag = "turn_retry",
                         ),
                     )
-                    terminalError = streamError!!.message
-                    aborted = true
-                    return@flow
                 }
 
-                if (pendingToolCalls.isNotEmpty()) {
-                    val assistantMsg = LlmMessage(
-                        role = LlmMessage.Role.ASSISTANT,
-                        content = assistantText,
-                        toolCalls = pendingToolCalls.map {
-                            LlmToolCall(it.id, normalizeToolName(it.name), it.input)
-                        },
+                while (round < maxToolRounds && !aborted) {
+                    round++
+                    finalModelForHooks = effectiveModel
+                    policyContext = policyContext.copy(modelId = effectiveModel)
+                    allowedToolNames = resolveAllowedToolNames(policyContext)
+                    val remainingAttemptTimeoutMs = turnTimeoutMs?.let { timeout ->
+                        (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
+                    }
+                    if (remainingAttemptTimeoutMs != null && remainingAttemptTimeoutMs <= 0L) {
+                        val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                        val timeoutError = LlmStreamEvent.Error(
+                            message = timeoutMessage,
+                            code = "timeout",
+                            retryable = runAttempt < effectiveMaxRunAttempts,
+                        )
+                        if (runAttempt < effectiveMaxRunAttempts) {
+                            lastRetryableError = timeoutError
+                            emit(
+                                AcpRuntimeEvent.Status(
+                                    text = "$timeoutMessage; retrying",
+                                    tag = "turn_timeout_retry",
+                                ),
+                            )
+                            continue@attemptLoop
+                        }
+                        val retryLimitMessage =
+                            "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                        emit(
+                            AcpRuntimeEvent.Error(
+                                message = retryLimitMessage,
+                                code = "retry_limit",
+                                retryable = true,
+                            ),
+                        )
+                        terminalError = retryLimitMessage
+                        aborted = true
+                        return@flow
+                    }
+                    currentMessages = sanitizeToolCallResultPairing(currentMessages).toMutableList()
+                    val request = LlmRequest(
+                        model = effectiveModel,
+                        messages = currentMessages,
+                        tools = toolRegistry.toDefinitions(allowedToolNames),
+                        systemPrompt = effectiveSystemPrompt,
                     )
-                    currentMessages.add(assistantMsg)
-                    persistence?.appendMessage(sessionKey, assistantMsg)
 
-                    for (tc in pendingToolCalls) {
-                        val normalizedToolName = normalizeToolName(tc.name)
-                        val loopCheck = toolLoopDetector?.checkBeforeToolCall(
-                            toolName = normalizedToolName,
-                            input = tc.input,
+                    val textBuffer = StringBuilder()
+                    val pendingToolCalls = mutableListOf<LlmStreamEvent.ToolUse>()
+                    var streamError: LlmStreamEvent.Error? = null
+                    var stopReason: String? = null
+                    var usageInputTokens = 0
+                    var usageOutputTokens = 0
+                    var usageCacheRead = 0
+                    var usageCacheWrite = 0
+                    var usageSeen = false
+
+                    val streamCollection = collectProviderStream(
+                        request = request,
+                        timeoutMs = remainingAttemptTimeoutMs,
+                    ) { event ->
+                        when (event) {
+                            is LlmStreamEvent.TextDelta -> {
+                                textBuffer.append(event.text)
+                                emit(AcpRuntimeEvent.TextDelta(text = event.text))
+                            }
+
+                            is LlmStreamEvent.ThinkingDelta -> {
+                                emit(
+                                    AcpRuntimeEvent.TextDelta(
+                                        text = event.text,
+                                        stream = AcpRuntimeEvent.StreamType.THOUGHT,
+                                    ),
+                                )
+                            }
+
+                            is LlmStreamEvent.ToolUse -> {
+                                pendingToolCalls.add(event)
+                                val normalizedToolName = normalizeToolName(event.name)
+                                if (startedToolCallIds.add(event.id)) {
+                                    val parsedInput = parseToolParams(event.input)
+                                    emit(
+                                        AcpRuntimeEvent.ToolCall(
+                                            text = "Calling $normalizedToolName",
+                                            tag = "tool_call",
+                                            toolCallId = event.id,
+                                            status = "in_progress",
+                                            title = formatToolCallTitle(normalizedToolName, parsedInput),
+                                            detail = "status=in_progress",
+                                            kind = inferToolKind(normalizedToolName),
+                                            rawInput = event.input,
+                                        ),
+                                    )
+                                }
+                            }
+
+                            is LlmStreamEvent.Usage -> {
+                                usageSeen = true
+                                usageSeenAny = true
+                                usageInputTokens += event.inputTokens
+                                usageOutputTokens += event.outputTokens
+                                usageCacheRead += event.cacheRead
+                                usageCacheWrite += event.cacheWrite
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "Tokens: ${event.inputTokens}+${event.outputTokens}",
+                                        tag = "usage_update",
+                                        used = event.inputTokens + event.outputTokens,
+                                    ),
+                                )
+                            }
+
+                            is LlmStreamEvent.Done -> {
+                                stopReason = event.stopReason
+                            }
+
+                            is LlmStreamEvent.Error -> {
+                                streamError = event
+                            }
+                        }
+                    }
+
+                    if (streamCollection.timedOut) {
+                        val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                        val timeoutError = LlmStreamEvent.Error(
+                            message = timeoutMessage,
+                            code = "timeout",
+                            retryable = runAttempt < effectiveMaxRunAttempts,
                         )
-                        if (loopCheck?.critical == true) {
-                            val loopErrorReason =
-                                loopCheck.message ?: "Detected repetitive tool loop for '$normalizedToolName'."
-                            val loopError = formatToolErrorResult(
-                                toolName = normalizedToolName,
-                                error = loopErrorReason,
-                            )
-                            emitAfterToolCall(
-                                toolContext = PluginHookToolContext(
-                                    agentId = agentId,
-                                    sessionKey = sessionKey.takeIf { it.isNotBlank() },
-                                    sessionId = effectiveHookSessionId,
-                                    runId = effectiveRunId,
-                                    toolName = normalizedToolName,
-                                    toolCallId = tc.id,
-                                ),
-                                params = parseToolParams(tc.input),
-                                result = loopError,
-                                error = loopErrorReason,
-                                durationMs = 0L,
-                            )
+                        if (runAttempt < effectiveMaxRunAttempts) {
+                            lastRetryableError = timeoutError
                             emit(
                                 AcpRuntimeEvent.Status(
-                                    text = loopCheck.message
-                                        ?: "Blocked tool call '$normalizedToolName' due to critical loop detection.",
-                                    tag = "tool_loop_blocked",
+                                    text = "$timeoutMessage; retrying",
+                                    tag = "turn_timeout_retry",
                                 ),
                             )
-                            val blockedResult = contextGuard.guardToolResult(loopError, currentMessages)
-                            val blockedToolMsg = LlmMessage(
-                                role = LlmMessage.Role.TOOL,
-                                content = blockedResult,
-                                toolCallId = tc.id,
-                                name = normalizedToolName,
-                            )
-                            currentMessages.add(blockedToolMsg)
-                            persistence?.appendMessage(sessionKey, blockedToolMsg)
-                            continue
+                            continue@attemptLoop
                         }
-                        if (loopCheck?.warning == true && loopCheck.shouldEmitWarning) {
-                            emit(
-                                AcpRuntimeEvent.Status(
-                                    text = loopCheck.message
-                                        ?: "Potential tool loop detected for '$normalizedToolName' (${loopCheck.count} repeated calls)",
-                                    tag = "tool_loop_warning",
-                                ),
-                            )
-                        }
-
-                        toolLoopDetector?.recordToolCall(
-                            toolName = normalizedToolName,
-                            input = tc.input,
-                            toolCallId = tc.id,
+                        val retryLimitMessage =
+                            "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                        emit(
+                            AcpRuntimeEvent.Error(
+                                message = retryLimitMessage,
+                                code = "retry_limit",
+                                retryable = true,
+                            ),
                         )
+                        terminalError = retryLimitMessage
+                        aborted = true
+                        return@flow
+                    }
 
-                        val execution = executeTool(
-                            toolCall = tc,
-                            agentId = agentId,
+                    streamCollection.throwable?.let { thrown ->
+                        if (thrown is CancellationException) throw thrown
+                        streamError = LlmStreamEvent.Error(
+                            message = thrown.message ?: "Provider stream failed",
+                            code = "stream_exception",
+                            retryable = true,
+                        )
+                    }
+
+                    val llmUsage = if (usageSeen) {
+                        LlmUsage(
+                            input = usageInputTokens,
+                            output = usageOutputTokens,
+                            cacheRead = usageCacheRead,
+                            cacheWrite = usageCacheWrite,
+                            total = usageInputTokens + usageOutputTokens + usageCacheRead + usageCacheWrite,
+                        )
+                    } else {
+                        null
+                    }
+                    val assistantText = textBuffer.toString()
+                    if (assistantText.isNotBlank()) {
+                        llmAssistantTexts += assistantText
+                    }
+                    llmLastAssistantPayload = if (assistantText.isNotEmpty() || pendingToolCalls.isNotEmpty()) {
+                        buildMap {
+                            put("role", "assistant")
+                            put("content", assistantText)
+                            stopReason?.let { put("stopReason", it) }
+                            if (pendingToolCalls.isNotEmpty()) {
+                                put(
+                                    "toolCalls",
+                                    pendingToolCalls.map {
+                                        mapOf(
+                                            "id" to it.id,
+                                            "name" to normalizeToolName(it.name),
+                                            "arguments" to it.input,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    } else {
+                        null
+                    }
+                    if (llmUsage != null) {
+                        usageInputTotal += llmUsage.input ?: 0
+                        usageOutputTotal += llmUsage.output ?: 0
+                        usageCacheReadTotal += llmUsage.cacheRead ?: 0
+                        usageCacheWriteTotal += llmUsage.cacheWrite ?: 0
+                    }
+
+                    if (streamError != null) {
+                        val error = streamError!!
+                        if (error.retryable) {
+                            if (runAttempt < effectiveMaxRunAttempts) {
+                                lastRetryableError = error
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = "Provider error: ${error.message}. Retrying attempt ${runAttempt + 1}/$effectiveMaxRunAttempts",
+                                        tag = "turn_retryable_error",
+                                    ),
+                                )
+                                continue@attemptLoop
+                            }
+                            val retryLimitMessage =
+                                "Exceeded retry limit after $runAttempt attempts (last error: ${error.message})"
+                            emit(
+                                AcpRuntimeEvent.Error(
+                                    message = retryLimitMessage,
+                                    code = "retry_limit",
+                                    retryable = true,
+                                ),
+                            )
+                            terminalError = retryLimitMessage
+                            aborted = true
+                            return@flow
+                        }
+                        emit(
+                            AcpRuntimeEvent.Error(
+                                message = error.message,
+                                code = error.code,
+                                retryable = error.retryable,
+                            ),
+                        )
+                        terminalError = error.message
+                        aborted = true
+                        return@flow
+                    }
+
+                    if (pendingToolCalls.isNotEmpty()) {
+                        val assistantMsg = LlmMessage(
+                            role = LlmMessage.Role.ASSISTANT,
+                            content = assistantText,
+                            stopReason = stopReason,
+                            toolCalls = pendingToolCalls.map {
+                                LlmToolCall(it.id, normalizeToolName(it.name), it.input)
+                            },
+                        )
+                        currentMessages.add(assistantMsg)
+                        persistMessage(
+                            persistence = persistence,
                             sessionKey = sessionKey,
-                            sessionId = effectiveHookSessionId,
-                            runId = effectiveRunId,
+                            message = assistantMsg,
+                            toolContext = null,
                         )
-                        if (!execution.skipOutcomeRecord) {
-                            toolLoopDetector?.recordToolCallOutcome(
+
+                        for (tc in pendingToolCalls) {
+                            val normalizedToolName = normalizeToolName(tc.name)
+                            val toolContext = PluginHookToolContext(
+                                agentId = agentId,
+                                sessionKey = sessionKey.takeIf { it.isNotBlank() },
+                                sessionId = effectiveHookSessionId,
+                                runId = effectiveRunId,
+                                toolName = normalizedToolName,
+                                toolCallId = tc.id,
+                            )
+                            val loopCheck = toolLoopDetector?.checkBeforeToolCall(
+                                toolName = normalizedToolName,
+                                input = tc.input,
+                            )
+                            if (loopCheck?.critical == true) {
+                                val loopErrorReason =
+                                    loopCheck.message ?: "Detected repetitive tool loop for '$normalizedToolName'."
+                                val loopError = formatToolErrorResult(
+                                    toolName = normalizedToolName,
+                                    error = loopErrorReason,
+                                )
+                                emitAfterToolCall(
+                                    toolContext = PluginHookToolContext(
+                                        agentId = agentId,
+                                        sessionKey = sessionKey.takeIf { it.isNotBlank() },
+                                        sessionId = effectiveHookSessionId,
+                                        runId = effectiveRunId,
+                                        toolName = normalizedToolName,
+                                        toolCallId = tc.id,
+                                    ),
+                                    params = parseToolParams(tc.input),
+                                    result = loopError,
+                                    error = loopErrorReason,
+                                    durationMs = 0L,
+                                )
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = loopCheck.message
+                                            ?: "Blocked tool call '$normalizedToolName' due to critical loop detection.",
+                                        tag = "tool_loop_blocked",
+                                    ),
+                                )
+                                emit(
+                                    AcpRuntimeEvent.ToolCall(
+                                        text = loopErrorReason,
+                                        tag = "tool_call_update",
+                                        toolCallId = tc.id,
+                                        status = "failed",
+                                        title = normalizedToolName,
+                                        detail = loopErrorReason,
+                                        kind = inferToolKind(normalizedToolName),
+                                        rawOutput = loopError,
+                                    ),
+                                )
+                                val blockedResult = contextGuard.guardToolResult(loopError, currentMessages)
+                                val blockedToolMsg = LlmMessage(
+                                    role = LlmMessage.Role.TOOL,
+                                    content = blockedResult,
+                                    toolCallId = tc.id,
+                                    name = normalizedToolName,
+                                )
+                                currentMessages.add(blockedToolMsg)
+                                persistMessage(
+                                    persistence = persistence,
+                                    sessionKey = sessionKey,
+                                    message = blockedToolMsg,
+                                    toolContext = toolContext,
+                                )
+                                continue
+                            }
+                            if (loopCheck?.warning == true && loopCheck.shouldEmitWarning) {
+                                emit(
+                                    AcpRuntimeEvent.Status(
+                                        text = loopCheck.message
+                                            ?: "Potential tool loop detected for '$normalizedToolName' (${loopCheck.count} repeated calls)",
+                                        tag = "tool_loop_warning",
+                                    ),
+                                )
+                            }
+
+                            toolLoopDetector?.recordToolCall(
                                 toolName = normalizedToolName,
                                 input = tc.input,
                                 toolCallId = tc.id,
-                                result = if (execution.error == null) execution.result else null,
-                                error = execution.error,
+                            )
+
+                            val remainingToolTimeoutMs = turnTimeoutMs?.let { timeout ->
+                                (timeout - (System.currentTimeMillis() - attemptStartedAt)).coerceAtLeast(0L)
+                            }
+                            if (remainingToolTimeoutMs != null && remainingToolTimeoutMs <= 0L) {
+                                val timeoutMessage = "Turn timed out after ${turnTimeoutMs ?: 0L}ms"
+                                val timeoutError = LlmStreamEvent.Error(
+                                    message = timeoutMessage,
+                                    code = "timeout",
+                                    retryable = runAttempt < effectiveMaxRunAttempts,
+                                )
+                                if (runAttempt < effectiveMaxRunAttempts) {
+                                    lastRetryableError = timeoutError
+                                    emit(
+                                        AcpRuntimeEvent.Status(
+                                            text = "$timeoutMessage; retrying",
+                                            tag = "turn_timeout_retry",
+                                        ),
+                                    )
+                                    continue@attemptLoop
+                                }
+                                val retryLimitMessage =
+                                    "Exceeded retry limit after $runAttempt attempts (last error: $timeoutMessage)"
+                                emit(
+                                    AcpRuntimeEvent.Error(
+                                        message = retryLimitMessage,
+                                        code = "retry_limit",
+                                        retryable = true,
+                                    ),
+                                )
+                                terminalError = retryLimitMessage
+                                aborted = true
+                                return@flow
+                            }
+
+                            val execution = executeTool(
+                                toolCall = tc,
+                                agentId = agentId,
+                                sessionKey = sessionKey,
+                                sessionId = effectiveHookSessionId,
+                                runId = effectiveRunId,
+                                workspaceDir = workspaceDir,
+                                policyContext = policyContext,
+                            )
+                            if (!execution.skipOutcomeRecord) {
+                                toolLoopDetector?.recordToolCallOutcome(
+                                    toolName = normalizedToolName,
+                                    input = tc.input,
+                                    toolCallId = tc.id,
+                                    result = if (execution.error == null) execution.result else null,
+                                    error = execution.error,
+                                )
+                            }
+                            emit(
+                                AcpRuntimeEvent.ToolCall(
+                                    text = buildToolCallLifecycleText(
+                                        toolName = normalizedToolName,
+                                        status = execution.status,
+                                        error = execution.error,
+                                    ),
+                                    tag = "tool_call_update",
+                                    toolCallId = tc.id,
+                                    status = execution.status,
+                                    title = normalizedToolName,
+                                    detail = buildToolCallLifecycleText(
+                                        toolName = normalizedToolName,
+                                        status = execution.status,
+                                        error = execution.error,
+                                    ),
+                                    kind = inferToolKind(normalizedToolName),
+                                    rawOutput = execution.result,
+                                ),
+                            )
+                            val result = contextGuard.guardToolResult(execution.result, currentMessages)
+                            val toolMsg = LlmMessage(
+                                role = LlmMessage.Role.TOOL,
+                                content = result,
+                                toolCallId = tc.id,
+                                name = normalizedToolName,
+                            )
+                            currentMessages.add(toolMsg)
+                            persistMessage(
+                                persistence = persistence,
+                                sessionKey = sessionKey,
+                                message = toolMsg,
+                                toolContext = toolContext,
                             )
                         }
-                        val result = contextGuard.guardToolResult(execution.result, currentMessages)
-                        val toolMsg = LlmMessage(
-                            role = LlmMessage.Role.TOOL,
-                            content = result,
-                            toolCallId = tc.id,
-                            name = normalizedToolName,
-                        )
-                        currentMessages.add(toolMsg)
-                        persistence?.appendMessage(sessionKey, toolMsg)
+                    } else {
+                        if (assistantText.isNotEmpty()) {
+                            persistMessage(
+                                persistence = persistence,
+                                sessionKey = sessionKey,
+                                message = LlmMessage(
+                                    role = LlmMessage.Role.ASSISTANT,
+                                    content = assistantText,
+                                    stopReason = stopReason,
+                                ),
+                                toolContext = null,
+                            )
+                        }
+                        completedSuccessfully = true
+                        emit(AcpRuntimeEvent.Done(stopReason = toAcpStopReason(stopReason)))
+                        return@flow
                     }
-                } else {
-                    if (assistantText.isNotEmpty()) {
-                        persistence?.appendMessage(
-                            sessionKey,
-                            LlmMessage(
-                                role = LlmMessage.Role.ASSISTANT,
-                                content = assistantText,
+
+                    if (!contextGuard.fitsInContext(currentMessages)) {
+                        currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
+                        emit(
+                            AcpRuntimeEvent.Status(
+                                text = "Context compacted",
+                                tag = "context_compacted",
                             ),
                         )
                     }
-                    completedSuccessfully = true
-                    emit(AcpRuntimeEvent.Done(stopReason = stopReason ?: "end_turn"))
-                    return@flow
                 }
 
-                if (!contextGuard.fitsInContext(currentMessages)) {
-                    currentMessages = contextGuard.trimToFit(currentMessages).toMutableList()
+                if (aborted) {
+                    break
+                }
+                val roundLimitError = LlmStreamEvent.Error(
+                    message = "Exceeded maximum tool call rounds ($maxToolRounds)",
+                    code = "tool_round_limit",
+                    retryable = runAttempt < effectiveMaxRunAttempts,
+                )
+                if (runAttempt < effectiveMaxRunAttempts) {
+                    lastRetryableError = roundLimitError
                     emit(
                         AcpRuntimeEvent.Status(
-                            text = "Context compacted",
-                            tag = "context_compacted",
+                            text = "${roundLimitError.message}; retrying",
+                            tag = "tool_round_limit_retry",
                         ),
                     )
+                    continue
                 }
+                val retryLimitMessage =
+                    "Exceeded retry limit after $runAttempt attempts (last error: ${roundLimitError.message})"
+                terminalError = retryLimitMessage
+                emit(
+                    AcpRuntimeEvent.Error(
+                        message = retryLimitMessage,
+                        code = "retry_limit",
+                        retryable = true,
+                    ),
+                )
+                return@flow
             }
 
-            if (!aborted) {
-                val errorMessage = "Exceeded maximum tool call rounds ($maxToolRounds)"
-                terminalError = errorMessage
-                emit(AcpRuntimeEvent.Error(message = errorMessage))
+            if (!aborted && terminalError == null && !completedSuccessfully) {
+                val fallbackError = lastRetryableError
+                val retryLimitMessage = if (fallbackError != null) {
+                    "Exceeded retry limit after $effectiveMaxRunAttempts attempts (last error: ${fallbackError.message})"
+                } else {
+                    "Exceeded retry limit after $effectiveMaxRunAttempts attempts"
+                }
+                terminalError = retryLimitMessage
+                emit(
+                    AcpRuntimeEvent.Error(
+                        message = retryLimitMessage,
+                        code = "retry_limit",
+                        retryable = true,
+                    ),
+                )
             }
         } finally {
             hookDispatchScope.launch {
@@ -581,12 +1058,40 @@ class AgentRunner(
     /**
      * Execute a single tool call with policy and approval checks.
      */
+    private suspend fun collectProviderStream(
+        request: LlmRequest,
+        timeoutMs: Long?,
+        onEvent: suspend (LlmStreamEvent) -> Unit,
+    ): StreamCollectionResult {
+        return if (timeoutMs != null && timeoutMs > 0L) {
+            val runResult = withTimeoutOrNull(timeoutMs) {
+                runCatching {
+                    provider.streamCompletion(request).collect { event -> onEvent(event) }
+                }
+            }
+            when {
+                runResult == null -> StreamCollectionResult(timedOut = true)
+                runResult.isFailure -> StreamCollectionResult(throwable = runResult.exceptionOrNull())
+                else -> StreamCollectionResult()
+            }
+        } else {
+            runCatching {
+                provider.streamCompletion(request).collect { event -> onEvent(event) }
+            }.fold(
+                onSuccess = { StreamCollectionResult() },
+                onFailure = { StreamCollectionResult(throwable = it) },
+            )
+        }
+    }
+
     private suspend fun executeTool(
         toolCall: LlmStreamEvent.ToolUse,
         agentId: String,
         sessionKey: String,
         sessionId: String,
         runId: String,
+        workspaceDir: String?,
+        policyContext: ToolPolicyContext,
     ): ToolExecutionOutcome {
         val startedAt = System.currentTimeMillis()
         val toolName = normalizeToolName(toolCall.name)
@@ -631,6 +1136,7 @@ class AgentRunner(
                 result = result,
                 error = blockedReason,
                 skipOutcomeRecord = true,
+                status = "failed",
             )
         }
         val overriddenParams = beforeToolCall?.params
@@ -643,7 +1149,15 @@ class AgentRunner(
             effectiveInput = encodeToolParams(effectiveParams)
         }
 
-        val policyResult = toolPolicyEnforcer?.check(toolName, agentId, sessionKey)
+        val policyResult = toolPolicyEnforcer?.check(
+            toolName = toolName,
+            context = policyContext.copy(
+                agentId = agentId,
+                sessionKey = sessionKey,
+            ),
+            includeRateLimit = true,
+            recordAudit = true,
+        )
         if (policyResult?.allowed == false) {
             val policyError = "Tool '$toolName' denied by policy: ${policyResult.reason}"
             val result = formatToolErrorResult(toolName = toolName, error = policyError)
@@ -654,7 +1168,7 @@ class AgentRunner(
                 error = policyError,
                 durationMs = System.currentTimeMillis() - startedAt,
             )
-            return ToolExecutionOutcome(result = result, error = policyError)
+            return ToolExecutionOutcome(result = result, error = policyError, status = "failed")
         }
 
         val approvalDecision = if (approvalManager != null) {
@@ -679,9 +1193,11 @@ class AgentRunner(
                 val tool = toolRegistry.get(toolName) ?: toolRegistry.get(toolCall.name.trim())
                 if (tool != null) {
                     try {
-                        val output = tool.execute(effectiveInput, ToolContext(sessionKey, agentId))
+                        val output = tool.execute(effectiveInput, ToolContext(sessionKey, agentId, workspaceDir))
                         extractErrorMessage(output)?.let { executionError = it }
                         output
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
                         val message = e.message ?: e::class.simpleName ?: "Tool execution failed"
                         executionError = message
@@ -702,7 +1218,11 @@ class AgentRunner(
             error = executionError,
             durationMs = System.currentTimeMillis() - startedAt,
         )
-        return ToolExecutionOutcome(result = result, error = executionError)
+        return ToolExecutionOutcome(
+            result = result,
+            error = executionError,
+            status = classifyToolCallStatus(executionError),
+        )
     }
 
     private suspend fun resolvePromptBuildHookResult(
@@ -816,6 +1336,39 @@ class AgentRunner(
         }
         return json.encodeToString(JsonObject.serializer(), payload)
     }
+
+    private fun classifyToolCallStatus(error: String?): String {
+        if (error.isNullOrBlank()) return "completed"
+        return "failed"
+    }
+
+    private fun isBlockedToolError(error: String): Boolean {
+        val normalized = error.trim().lowercase()
+        if (normalized.isEmpty()) return false
+        return normalized.contains("denied by policy") ||
+            normalized.contains("denied by approval policy") ||
+            normalized.contains("timed out waiting for approval") ||
+            normalized.contains("blocked by plugin hook") ||
+            normalized.contains("tool loop blocked") ||
+            normalized.contains("critical loop detection")
+    }
+
+    private fun buildToolCallLifecycleText(
+        toolName: String,
+        status: String,
+        error: String?,
+    ): String {
+        val normalizedStatus = status.trim().lowercase().ifEmpty { "completed" }
+        return when (normalizedStatus) {
+            "completed" -> "Completed $toolName"
+            "failed" -> if (error != null && isBlockedToolError(error)) {
+                error.trim().ifEmpty { "Blocked $toolName" }
+            } else {
+                error?.trim().takeUnless { it.isNullOrEmpty() } ?: "Tool '$toolName' failed"
+            }
+            else -> error?.trim().takeUnless { it.isNullOrEmpty() } ?: "Tool '$toolName' failed"
+        }
+    }
     private fun parseToolParams(input: String): Map<String, Any?> {
         val parsed = runCatching { json.parseToJsonElement(input) }.getOrNull() as? JsonObject
             ?: return emptyMap()
@@ -889,6 +1442,7 @@ class AgentRunner(
         }
         name?.let { put("name", it) }
         toolCallId?.let { put("toolCallId", it) }
+        stopReason?.let { put("stopReason", it) }
         toolCalls?.takeIf { it.isNotEmpty() }?.let { calls ->
             put(
                 "toolCalls",
@@ -912,8 +1466,287 @@ class AgentRunner(
         }
     }
 
+    private fun normalizeStopReason(stopReason: String?): String? {
+        return stopReason?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun toAcpStopReason(stopReason: String?): String {
+        return when (normalizeStopReason(stopReason)) {
+            "max_tokens" -> "max_tokens"
+            else -> "end_turn"
+        }
+    }
+
+    private fun formatToolCallTitle(name: String, args: Map<String, Any?>): String {
+        if (args.isEmpty()) return name
+        val argSummary = args.entries.joinToString(", ") { (key, value) ->
+            val raw = when (value) {
+                null -> "null"
+                is String -> value
+                else -> value.toString()
+            }
+            val safe = if (raw.length > 100) "${raw.take(100)}..." else raw
+            "$key: $safe"
+        }
+        return "$name: $argSummary"
+    }
+
+    private fun inferToolKind(name: String?): String {
+        val normalized = name?.trim()?.lowercase().orEmpty()
+        if (normalized.isEmpty()) return "other"
+        return when {
+            "read" in normalized -> "read"
+            "write" in normalized || "edit" in normalized -> "edit"
+            "delete" in normalized || "remove" in normalized -> "delete"
+            "move" in normalized || "rename" in normalized -> "move"
+            "search" in normalized || "find" in normalized -> "search"
+            "exec" in normalized || "run" in normalized || "bash" in normalized -> "execute"
+            "fetch" in normalized || "http" in normalized -> "fetch"
+            else -> "other"
+        }
+    }
+
+    private fun shouldSkipSyntheticToolResult(stopReason: String?): Boolean {
+        return when (normalizeStopReason(stopReason)) {
+            "error", "aborted", "cancelled", "canceled" -> true
+            else -> false
+        }
+    }
+
+    /**
+     * Repairs transcript parity for providers that require strict tool_call/tool_result adjacency.
+     * - Moves matching tool results directly after assistant tool calls
+     * - Drops orphan and duplicate tool results
+     * - Inserts synthetic error results for missing tool call ids
+     */
+    private fun sanitizeToolCallResultPairing(messages: List<LlmMessage>): List<LlmMessage> {
+        if (messages.isEmpty()) return messages
+
+        val sanitized = mutableListOf<LlmMessage>()
+        val emittedToolResultIds = mutableSetOf<String>()
+        var changed = false
+
+        var i = 0
+        while (i < messages.size) {
+            val message = messages[i]
+            if (message.role != LlmMessage.Role.ASSISTANT) {
+                if (message.role == LlmMessage.Role.TOOL) {
+                    changed = true
+                } else {
+                    sanitized += message
+                }
+                i += 1
+                continue
+            }
+
+            val assistantToolCalls = message.toolCalls
+                ?.mapNotNull { call ->
+                    val trimmedId = call.id.trim()
+                    if (trimmedId.isEmpty()) {
+                        changed = true
+                        null
+                    } else {
+                        val normalizedName = normalizeToolName(call.name)
+                        if (normalizedName != call.name) {
+                            changed = true
+                        }
+                        call.copy(id = trimmedId, name = normalizedName)
+                    }
+                }
+                ?: emptyList()
+
+            val normalizedAssistantMessage = if (assistantToolCalls.isNotEmpty()) {
+                val normalizedStopReason = normalizeStopReason(message.stopReason)
+                if (normalizedStopReason != message.stopReason) {
+                    changed = true
+                }
+                message.copy(
+                    stopReason = normalizedStopReason,
+                    toolCalls = assistantToolCalls,
+                )
+            } else if (!message.toolCalls.isNullOrEmpty()) {
+                changed = true
+                val normalizedStopReason = normalizeStopReason(message.stopReason)
+                if (normalizedStopReason != message.stopReason) {
+                    changed = true
+                }
+                message.copy(
+                    stopReason = normalizedStopReason,
+                    toolCalls = null,
+                )
+            } else {
+                val normalizedStopReason = normalizeStopReason(message.stopReason)
+                if (normalizedStopReason != message.stopReason) {
+                    changed = true
+                }
+                message.copy(stopReason = normalizedStopReason)
+            }
+
+            if (assistantToolCalls.isEmpty()) {
+                sanitized += normalizedAssistantMessage
+                i += 1
+                continue
+            }
+
+            sanitized += normalizedAssistantMessage
+
+            val callIds = assistantToolCalls.map { it.id }.toSet()
+            val callNamesById = assistantToolCalls.associate { it.id to it.name }
+            val spanResultsById = mutableMapOf<String, LlmMessage>()
+            val remainder = mutableListOf<LlmMessage>()
+
+            var j = i + 1
+            while (j < messages.size) {
+                val next = messages[j]
+                if (next.role == LlmMessage.Role.ASSISTANT) {
+                    break
+                }
+                if (next.role == LlmMessage.Role.TOOL) {
+                    val toolCallId = next.toolCallId?.trim().takeUnless { it.isNullOrEmpty() }
+                    if (toolCallId != null && callIds.contains(toolCallId)) {
+                        if (emittedToolResultIds.contains(toolCallId) || spanResultsById.containsKey(toolCallId)) {
+                            changed = true
+                        } else {
+                            val normalizedToolResult = normalizeToolResultMessage(
+                                message = next,
+                                fallbackName = callNamesById[toolCallId],
+                            )
+                            if (normalizedToolResult != next) {
+                                changed = true
+                            }
+                            spanResultsById[toolCallId] = normalizedToolResult
+                            emittedToolResultIds.add(toolCallId)
+                        }
+                    } else {
+                        changed = true
+                    }
+                } else {
+                    remainder += next
+                }
+                j += 1
+            }
+
+            if (spanResultsById.isNotEmpty() && remainder.isNotEmpty()) {
+                changed = true
+            }
+
+            val skipSyntheticResults = shouldSkipSyntheticToolResult(normalizedAssistantMessage.stopReason)
+            for (call in assistantToolCalls) {
+                val existingResult = spanResultsById[call.id]
+                if (existingResult != null) {
+                    sanitized += existingResult
+                } else if (skipSyntheticResults) {
+                    changed = true
+                } else {
+                    changed = true
+                    val synthetic = createSyntheticMissingToolResult(call.id, call.name)
+                    emittedToolResultIds.add(call.id)
+                    sanitized += synthetic
+                }
+            }
+
+            sanitized += remainder
+            i = j
+        }
+
+        return if (changed) sanitized else messages
+    }
+
+    private fun normalizeToolResultMessage(message: LlmMessage, fallbackName: String?): LlmMessage {
+        val normalizedToolCallId = message.toolCallId?.trim()
+        val normalizedToolName = message.name
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(::normalizeToolName)
+            ?: fallbackName
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let(::normalizeToolName)
+            ?: "unknown"
+        return message.copy(
+            toolCallId = normalizedToolCallId,
+            name = normalizedToolName,
+        )
+    }
+
+    private fun createSyntheticMissingToolResult(toolCallId: String, toolName: String): LlmMessage {
+        val normalizedToolName = normalizeToolName(toolName)
+        val error = "Missing tool result in transcript history; inserted synthetic error result."
+        return LlmMessage(
+            role = LlmMessage.Role.TOOL,
+            content = formatToolErrorResult(normalizedToolName, error),
+            toolCallId = toolCallId,
+            name = normalizedToolName,
+        )
+    }
+
+    private suspend fun persistMessage(
+        persistence: SessionPersistence?,
+        sessionKey: String,
+        message: LlmMessage,
+        toolContext: PluginHookToolContext?,
+    ) {
+        if (persistence == null || sessionKey.isBlank()) return
+        var messageToPersist = message
+        if (message.role == LlmMessage.Role.TOOL && toolContext != null) {
+            val transformed = try {
+                hookRunner?.runToolResultPersist(
+                    event = ToolResultPersistEvent(
+                        message = message,
+                        toolName = toolContext.toolName,
+                        toolCallId = toolContext.toolCallId,
+                        runId = toolContext.runId,
+                    ),
+                    ctx = toolContext,
+                )?.message
+            } catch (err: Throwable) {
+                logHookWarning("tool_result_persist hook failed: ${err.message}")
+                null
+            }
+            if (transformed != null) {
+                messageToPersist = transformed
+            }
+        }
+        persistence.appendMessage(sessionKey, messageToPersist)
+    }
+
     private fun logHookWarning(message: String) {
         System.err.println("[AgentRunner] $message")
+    }
+
+    private fun buildToolPolicyContext(
+        agentId: String,
+        sessionKey: String,
+        modelProvider: String?,
+        modelId: String?,
+        messageProvider: String?,
+        senderIsOwner: Boolean?,
+        runtimeInfo: SystemPromptBuilder.RuntimeInfo?,
+        turnSandboxed: Boolean?,
+        groupToolPolicy: GroupToolPolicyConfig?,
+    ): ToolPolicyContext {
+        return ToolPolicyContext(
+            agentId = agentId,
+            sessionKey = sessionKey,
+            modelProvider = modelProvider,
+            modelId = modelId,
+            messageProvider = messageProvider,
+            senderIsOwner = senderIsOwner,
+            sandboxed = turnSandboxed ?: runtimeInfo?.sandboxed,
+            groupPolicy = groupToolPolicy,
+        )
+    }
+
+    private fun resolveAllowedToolNames(policyContext: ToolPolicyContext): Set<String> {
+        val enforcer = toolPolicyEnforcer ?: return toolRegistry.names()
+        return toolRegistry.names().filter { toolName ->
+            enforcer.check(
+                toolName = toolName,
+                context = policyContext,
+                includeRateLimit = false,
+                recordAudit = false,
+            ).allowed
+        }.toSet()
     }
 
     private fun resolvePromptModeForSession(sessionKey: String): SystemPromptBuilder.PromptMode {
@@ -924,10 +1757,25 @@ class AgentRunner(
         }
     }
 
+    private fun subagentPromptContract(sessionKey: String): String? {
+        if (!isSubagentSessionKey(sessionKey)) return null
+        return buildString {
+            append("## Subagent Contract\n")
+            append("Focus on delegated execution and return concise outcomes to the parent agent.\n")
+            append("Do not poll subagent/session lists in loops; rely on push completion and on-demand checks.\n")
+        }
+    }
+
     private data class ToolExecutionOutcome(
         val result: String,
         val error: String? = null,
         val skipOutcomeRecord: Boolean = false,
+        val status: String = "completed",
+    )
+
+    private data class StreamCollectionResult(
+        val timedOut: Boolean = false,
+        val throwable: Throwable? = null,
     )
 
     private data class PromptHookResult(
@@ -1000,12 +1848,16 @@ class EmbeddedAcpRuntime(
                             runId = input.requestId,
                             sessionKey = session.sessionKey,
                             agentId = session.agentId,
+                            timeoutMs = input.timeoutMs,
                             hookSessionId = input.context?.sessionId ?: session.hookSessionId,
                             turnContext = EmbeddedTurnContext(
                                 trigger = input.context?.trigger,
                                 messageProvider = input.context?.messageProvider,
                                 channelId = input.context?.channelId,
                                 sessionId = input.context?.sessionId,
+                                senderIsOwner = input.context?.senderIsOwner,
+                                sandboxed = input.context?.sandboxed,
+                                groupToolPolicy = input.context?.groupToolPolicy,
                             ),
                         ),
                     ).collect { event ->

@@ -28,46 +28,18 @@ fun evaluateToolPolicy(
     config: OpenClawConfig,
     agentId: String? = null,
 ): ToolPolicyResult {
-    val globalDeny = config.tools?.deny
-    val globalAllow = config.tools?.allow
-    val globalAlsoAllow = config.tools?.alsoAllow
-
-    // 1. Global deny list (highest priority)
-    if (globalDeny != null && toolName in globalDeny) {
-        return ToolPolicyResult(allowed = false, reason = "denied by global tools.deny")
-    }
-
-    // 2. Agent-specific tool config
-    if (agentId != null) {
-        val agentConfig = config.agents?.list?.firstOrNull { it.id == agentId }
-        val agentTools = agentConfig?.tools
-        if (agentTools != null) {
-            val disabled = agentTools.disabled
-            if (disabled != null && toolName in disabled) {
-                return ToolPolicyResult(allowed = false, reason = "disabled for agent $agentId")
-            }
-            val enabled = agentTools.enabled
-            if (enabled != null) {
-                return if (toolName in enabled) {
-                    ToolPolicyResult(allowed = true, reason = "enabled for agent $agentId")
-                } else {
-                    ToolPolicyResult(allowed = false, reason = "not in enabled tools for agent $agentId")
-                }
-            }
-        }
-    }
-
-    // 3. Global allow list
-    if (globalAllow != null) {
-        val allowed = toolName in globalAllow || (globalAlsoAllow != null && toolName in globalAlsoAllow)
-        return ToolPolicyResult(
-            allowed = allowed,
-            reason = if (allowed) "global allow list" else "not in global allow list",
-        )
-    }
-
-    // 4. No restrictions = allowed
-    return ToolPolicyResult(allowed = true, reason = "no restrictions")
+    val enforcer = ToolPolicyEnforcer(config)
+    val result = enforcer.check(
+        toolName = toolName,
+        agentId = agentId,
+        sessionKey = null,
+        includeRateLimit = false,
+        recordAudit = false,
+    )
+    return ToolPolicyResult(
+        allowed = result.allowed,
+        reason = result.reason,
+    )
 }
 
 /**

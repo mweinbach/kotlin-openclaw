@@ -13,10 +13,13 @@ import ai.openclaw.core.plugins.PluginHookName
 import ai.openclaw.core.plugins.PluginHookRegistration
 import ai.openclaw.core.plugins.PluginHookToolContext
 import ai.openclaw.core.plugins.PluginRegistry
+import ai.openclaw.core.plugins.ToolResultPersistEvent
+import ai.openclaw.core.plugins.ToolResultPersistResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -139,5 +142,101 @@ class AgentRunnerToolHookParityTest {
         val errorText = events.filterIsInstance<ai.openclaw.core.model.AcpRuntimeEvent.Error>()
             .joinToString("\n") { it.message }
         assertTrue(errorText.isEmpty())
+    }
+
+    @Test
+    fun `tool result persist hook can transform persisted tool message`() = runTest {
+        val tempDir = Files.createTempDirectory("tool-result-persist-test")
+        val registry = PluginRegistry().apply {
+            registerHook(
+                PluginHookRegistration<suspend (ToolResultPersistEvent, PluginHookToolContext) -> ToolResultPersistResult?>(
+                    pluginId = "hook-tool-result-persist",
+                    hookName = PluginHookName.TOOL_RESULT_PERSIST,
+                    handler = { event, _ ->
+                        ToolResultPersistResult(
+                            message = event.message.copy(content = "persisted-from-hook"),
+                        )
+                    },
+                ),
+            )
+        }
+
+        val tool = CapturingEchoTool()
+        val tools = ToolRegistry().apply { register(tool) }
+        val persistence = SessionPersistence(tempDir.toString())
+        val runner = AgentRunner(
+            provider = TwoRoundProvider(),
+            toolRegistry = tools,
+            hookRunner = HookRunner(registry),
+            sessionPersistence = persistence,
+        )
+
+        val sessionKey = "agent:main:direct:tool-result-persist"
+        runner.runTurn(
+            messages = listOf(LlmMessage(role = LlmMessage.Role.USER, content = "go")),
+            model = "test-model",
+            sessionKey = sessionKey,
+        ).toList()
+
+        val (_, persistedMessages) = persistence.load(sessionKey)
+        val persistedTool = persistedMessages.firstOrNull { it.role == LlmMessage.Role.TOOL }
+        assertNotNull(persistedTool)
+        assertEquals("persisted-from-hook", persistedTool.content)
+    }
+
+    @Test
+    fun `tool result persist hooks chain message transformations sequentially`() = runTest {
+        val tempDir = Files.createTempDirectory("tool-result-persist-chain-test")
+        var secondHookSawContent: String? = null
+        val registry = PluginRegistry().apply {
+            registerHook(
+                PluginHookRegistration<suspend (ToolResultPersistEvent, PluginHookToolContext) -> ToolResultPersistResult?>(
+                    pluginId = "hook-tool-result-persist-first",
+                    hookName = PluginHookName.TOOL_RESULT_PERSIST,
+                    priority = 10,
+                    handler = { event, _ ->
+                        ToolResultPersistResult(
+                            message = event.message.copy(content = "first"),
+                        )
+                    },
+                ),
+            )
+            registerHook(
+                PluginHookRegistration<suspend (ToolResultPersistEvent, PluginHookToolContext) -> ToolResultPersistResult?>(
+                    pluginId = "hook-tool-result-persist-second",
+                    hookName = PluginHookName.TOOL_RESULT_PERSIST,
+                    priority = 5,
+                    handler = { event, _ ->
+                        secondHookSawContent = event.message.content
+                        ToolResultPersistResult(
+                            message = event.message.copy(content = "${event.message.content}+second"),
+                        )
+                    },
+                ),
+            )
+        }
+
+        val tool = CapturingEchoTool()
+        val tools = ToolRegistry().apply { register(tool) }
+        val persistence = SessionPersistence(tempDir.toString())
+        val runner = AgentRunner(
+            provider = TwoRoundProvider(),
+            toolRegistry = tools,
+            hookRunner = HookRunner(registry),
+            sessionPersistence = persistence,
+        )
+
+        val sessionKey = "agent:main:direct:tool-result-persist-chain"
+        runner.runTurn(
+            messages = listOf(LlmMessage(role = LlmMessage.Role.USER, content = "go")),
+            model = "test-model",
+            sessionKey = sessionKey,
+        ).toList()
+
+        assertEquals("first", secondHookSawContent)
+        val (_, persistedMessages) = persistence.load(sessionKey)
+        val persistedTool = persistedMessages.firstOrNull { it.role == LlmMessage.Role.TOOL }
+        assertNotNull(persistedTool)
+        assertEquals("first+second", persistedTool.content)
     }
 }

@@ -14,7 +14,7 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun MessageBubble(
     message: ChatMessage,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
 ) {
     val isUser = message.role == "user"
 
@@ -51,7 +51,7 @@ fun MessageBubble(
                 // Tool calls
                 if (message.toolCalls.isNotEmpty()) {
                     for (toolCall in message.toolCalls) {
-                        ToolCallCard(toolName = toolCall)
+                        ToolCallCard(toolCall = toolCall)
                         Spacer(modifier = Modifier.height(6.dp))
                     }
                 }
@@ -81,7 +81,14 @@ fun MessageBubble(
 }
 
 @Composable
-private fun ToolCallCard(toolName: String) {
+private fun ToolCallCard(toolCall: ChatToolCall) {
+    val statusLabel = toolCall.status.replace('_', ' ')
+    val statusColor = when (toolCall.status.lowercase()) {
+        "completed" -> MaterialTheme.colorScheme.primary
+        "blocked", "failed", "error" -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
     OutlinedCard(
         shape = RoundedCornerShape(8.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -89,11 +96,28 @@ private fun ToolCallCard(toolName: String) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
         ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = toolCall.title,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (!toolCall.detail.isNullOrBlank() && toolCall.detail != toolCall.title) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = toolCall.detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = toolName,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = statusLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = statusColor,
             )
         }
     }

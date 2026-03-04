@@ -22,6 +22,10 @@ class GeminiProvider(
     private val baseUrl: String = "https://generativelanguage.googleapis.com/v1beta",
     private val client: OkHttpClient = OkHttpClient(),
 ) : LlmProvider {
+    private data class InlineImage(
+        val mimeType: String,
+        val data: String,
+    )
 
     override val id = "gemini"
 
@@ -72,7 +76,17 @@ class GeminiProvider(
                                             addJsonObject { put("text", block.text) }
                                         }
                                         is LlmContentBlock.ImageUrl -> {
-                                            addJsonObject { put("text", "[image] ${block.url}") }
+                                            val inlineImage = parseInlineImage(block)
+                                            if (inlineImage != null) {
+                                                addJsonObject {
+                                                    putJsonObject("inlineData") {
+                                                        put("mimeType", inlineImage.mimeType)
+                                                        put("data", inlineImage.data)
+                                                    }
+                                                }
+                                            } else {
+                                                addJsonObject { put("text", "[image] ${block.url}") }
+                                            }
                                         }
                                     }
                                 }
@@ -110,7 +124,7 @@ class GeminiProvider(
                                 addJsonObject {
                                     put("name", tool.name)
                                     put("description", tool.description)
-                                    put("parameters", Json.parseToJsonElement(tool.parameters))
+                                    put("parameters", cleanSchemaForGemini(Json.parseToJsonElement(tool.parameters)))
                                 }
                             }
                         }
@@ -126,7 +140,7 @@ class GeminiProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val response = client.newCall(httpRequest).execute()
+        val response = client.newCall(httpRequest).executeCancellable()
         try {
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
@@ -261,5 +275,192 @@ class GeminiProvider(
     companion object {
         /** Atomic counter for generating unique tool call IDs across all Gemini requests. */
         private val toolCallCounter = AtomicLong(0)
+        private val dataUrlPattern = Regex("^data:([^;,]+)?(;base64),(.+)$", RegexOption.IGNORE_CASE)
+        private val geminiUnsupportedSchemaKeywords = setOf(
+            "patternProperties",
+            "additionalProperties",
+            "\$schema",
+            "\$id",
+            "\$ref",
+            "\$defs",
+            "definitions",
+            "examples",
+            "minLength",
+            "maxLength",
+            "minimum",
+            "maximum",
+            "multipleOf",
+            "pattern",
+            "format",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "minProperties",
+            "maxProperties",
+        )
+    }
+
+    private fun parseInlineImage(block: LlmContentBlock.ImageUrl): InlineImage? {
+        val url = block.url.trim()
+        if (!url.startsWith("data:", ignoreCase = true)) return null
+        val match = dataUrlPattern.matchEntire(url) ?: return null
+        if (match.groupValues[2].lowercase() != ";base64") return null
+        val mimeType = block.mimeType?.takeIf { it.isNotBlank() }
+            ?: match.groupValues[1].ifBlank { "application/octet-stream" }
+        val data = match.groupValues[3].trim()
+        if (data.isEmpty()) return null
+        return InlineImage(mimeType = mimeType, data = data)
+    }
+
+    private fun cleanSchemaForGemini(schema: JsonElement): JsonElement {
+        return when (schema) {
+            is JsonObject -> cleanSchemaObjectForGemini(schema)
+            is JsonArray -> JsonArray(schema.map { cleanSchemaForGemini(it) })
+            else -> schema
+        }
+    }
+
+    private fun cleanSchemaObjectForGemini(schema: JsonObject): JsonElement {
+        if (schema["\$ref"] != null) {
+            return buildJsonObject {
+                copySchemaMeta(schema)
+            }
+        }
+
+        val cleanedEntries = mutableMapOf<String, JsonElement>()
+        for ((key, value) in schema) {
+            if (geminiUnsupportedSchemaKeywords.contains(key)) continue
+
+            when {
+                key == "const" -> {
+                    cleanedEntries["enum"] = JsonArray(listOf(value))
+                }
+                key == "type" && value is JsonArray -> {
+                    val nonNullTypes = value.mapNotNull { it.jsonPrimitive.contentOrNull }.filter { it != "null" }
+                    when {
+                        nonNullTypes.isEmpty() -> Unit
+                        nonNullTypes.size == 1 -> cleanedEntries[key] = JsonPrimitive(nonNullTypes.first())
+                        else -> cleanedEntries[key] = JsonArray(nonNullTypes.map { JsonPrimitive(it) })
+                    }
+                }
+                key == "properties" -> {
+                    cleanedEntries[key] = if (value is JsonObject) {
+                        buildJsonObject {
+                            for ((propKey, propValue) in value) {
+                                put(propKey, cleanSchemaForGemini(propValue))
+                            }
+                        }
+                    } else {
+                        JsonObject(emptyMap())
+                    }
+                }
+                key == "items" -> {
+                    cleanedEntries[key] = when (value) {
+                        is JsonObject, is JsonArray -> cleanSchemaForGemini(value)
+                        else -> value
+                    }
+                }
+                key == "anyOf" || key == "oneOf" || key == "allOf" -> {
+                    cleanedEntries[key] = if (value is JsonArray) {
+                        JsonArray(value.map { cleanSchemaForGemini(it) })
+                    } else {
+                        value
+                    }
+                }
+                else -> {
+                    cleanedEntries[key] = cleanSchemaForGemini(value)
+                }
+            }
+        }
+
+        var cleaned = JsonObject(cleanedEntries)
+        cleaned = simplifyUnionForGemini(cleaned, "anyOf")
+        cleaned = simplifyUnionForGemini(cleaned, "oneOf")
+        return cleaned
+    }
+
+    private fun simplifyUnionForGemini(schema: JsonObject, key: String): JsonObject {
+        val variantsRaw = schema[key] as? JsonArray ?: return schema
+        val variants = variantsRaw.filterNot { isNullSchemaVariant(it) }
+        if (variants.isEmpty()) {
+            return JsonObject(schema.filterKeys { it != key })
+        }
+
+        val flattenedLiteral = tryFlattenLiteralUnion(variants)
+        if (flattenedLiteral != null) {
+            return mergeSchemaMeta(schema, flattenedLiteral)
+        }
+
+        if (variants.size == 1 && variants.first() is JsonObject) {
+            return mergeSchemaMeta(schema, variants.first() as JsonObject)
+        }
+
+        val firstObject = variants.firstOrNull { it is JsonObject } as? JsonObject
+        if (firstObject != null) {
+            val fallback = buildJsonObject {
+                firstObject["type"]?.let { put("type", it) }
+            }
+            return mergeSchemaMeta(schema, fallback)
+        }
+
+        return JsonObject(schema.filterKeys { it != key })
+    }
+
+    private fun tryFlattenLiteralUnion(variants: List<JsonElement>): JsonObject? {
+        if (variants.isEmpty()) return null
+        val values = mutableListOf<JsonElement>()
+        var commonType: String? = null
+
+        for (variant in variants) {
+            val obj = variant as? JsonObject ?: return null
+            val value = when {
+                obj["const"] != null -> obj["const"]!!
+                obj["enum"] is JsonArray && obj["enum"]!!.jsonArray.size == 1 -> obj["enum"]!!.jsonArray.first()
+                else -> return null
+            }
+            val variantType = obj["type"]?.jsonPrimitive?.contentOrNull ?: return null
+            if (commonType == null) {
+                commonType = variantType
+            } else if (commonType != variantType) {
+                return null
+            }
+            values += value
+        }
+
+        return buildJsonObject {
+            put("type", JsonPrimitive(commonType!!))
+            putJsonArray("enum") {
+                values.forEach { add(it) }
+            }
+        }
+    }
+
+    private fun isNullSchemaVariant(variant: JsonElement): Boolean {
+        val obj = variant as? JsonObject ?: return false
+        if (obj["const"] == JsonNull) return true
+        val enumArray = obj["enum"] as? JsonArray
+        if (enumArray != null && enumArray.size == 1 && enumArray.first() == JsonNull) return true
+        val typeElement = obj["type"]
+        if (typeElement?.jsonPrimitive?.contentOrNull == "null") return true
+        if (typeElement is JsonArray) {
+            val values = typeElement.mapNotNull { it.jsonPrimitive.contentOrNull }
+            if (values.size == 1 && values.first() == "null") return true
+        }
+        return false
+    }
+
+    private fun mergeSchemaMeta(base: JsonObject, target: JsonObject): JsonObject {
+        return buildJsonObject {
+            for ((key, value) in target) {
+                put(key, value)
+            }
+            copySchemaMeta(base)
+        }
+    }
+
+    private fun JsonObjectBuilder.copySchemaMeta(schema: JsonObject) {
+        schema["description"]?.let { put("description", it) }
+        schema["title"]?.let { put("title", it) }
+        schema["default"]?.let { put("default", it) }
     }
 }

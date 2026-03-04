@@ -2,6 +2,7 @@ package ai.openclaw.runtime.engine
 
 import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.model.DEFAULT_AGENT_ID
+import ai.openclaw.core.model.GroupToolPolicyConfig
 import ai.openclaw.core.model.IdentityConfig
 import ai.openclaw.core.plugins.BeforeAgentStartResult
 
@@ -14,6 +15,9 @@ data class EmbeddedTurnContext(
     val messageProvider: String? = null,
     val channelId: String? = null,
     val sessionId: String? = null,
+    val senderIsOwner: Boolean? = null,
+    val sandboxed: Boolean? = null,
+    val groupToolPolicy: GroupToolPolicyConfig? = null,
 )
 
 /**
@@ -33,6 +37,8 @@ data class EmbeddedRunParams(
     val runtimeInfo: SystemPromptBuilder.RuntimeInfo? = null,
     val workspaceDir: String? = null,
     val maxHistoryTurns: Int? = null,
+    val timeoutMs: Long? = null,
+    val maxRunAttempts: Int? = null,
     val hookSessionId: String? = null,
     val legacyBeforeAgentStartResult: BeforeAgentStartResult? = null,
     val turnContext: EmbeddedTurnContext = EmbeddedTurnContext(),

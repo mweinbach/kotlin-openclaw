@@ -1,7 +1,7 @@
 package ai.openclaw.runtime.gateway
 
 import kotlinx.serialization.json.*
-import kotlin.test.Test
+import org.junit.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 

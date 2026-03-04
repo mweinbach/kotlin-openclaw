@@ -46,6 +46,13 @@ data class ToolLoopDetectionConfig(
 )
 
 @Serializable
+data class ExecApplyPatchConfig(
+    val enabled: Boolean? = null,
+    val workspaceOnly: Boolean? = null,
+    val allowModels: List<String>? = null,
+)
+
+@Serializable
 data class ExecToolConfig(
     val host: String? = null,
     val security: String? = null,
@@ -60,6 +67,7 @@ data class ExecToolConfig(
     val cleanupMs: Int? = null,
     val notifyOnExit: Boolean? = null,
     val notifyOnExitEmptySuccess: Boolean? = null,
+    val applyPatch: ExecApplyPatchConfig? = null,
 )
 
 @Serializable

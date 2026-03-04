@@ -394,7 +394,23 @@ class GatewayServer(
 
             // Stream events to the requesting connection
             serverScope.launch {
+                var agentSeq = 0
+                suspend fun sendAgentEvent(stream: String, data: JsonObject) {
+                    agentSeq += 1
+                    val payload = buildAgentEventPayload(
+                        runId = requestId,
+                        sessionKey = sessionKey,
+                        seq = agentSeq,
+                        stream = stream,
+                        data = data,
+                    )
+                    sendTo(context.connectionId, "agent.event", payload)
+                }
                 try {
+                    sendAgentEvent(
+                        stream = "lifecycle",
+                        data = buildJsonObject { put("phase", "start") },
+                    )
                     chatHandler(ChatSendParams(
                         sessionKey = sessionKey,
                         agentId = agentId,
@@ -406,40 +422,15 @@ class GatewayServer(
                         deliver = deliver,
                         requestId = requestId,
                     )).collect { event ->
-                        val eventJson = when (event) {
-                            is AcpRuntimeEvent.TextDelta -> buildJsonObject {
-                                put("type", "text_delta")
-                                put("text", event.text)
-                                put("sessionKey", sessionKey)
-                                put("requestId", requestId)
-                            }
-                            is AcpRuntimeEvent.ToolCall -> buildJsonObject {
-                                put("type", "tool_call")
-                                put("text", event.text)
-                                put("title", event.title)
-                                put("sessionKey", sessionKey)
-                                put("requestId", requestId)
-                            }
-                            is AcpRuntimeEvent.Done -> buildJsonObject {
-                                put("type", "done")
-                                put("sessionKey", sessionKey)
-                                put("requestId", requestId)
-                                event.stopReason?.let { put("stopReason", it) }
-                            }
-                            is AcpRuntimeEvent.Error -> buildJsonObject {
-                                put("type", "error")
-                                put("message", event.message)
-                                put("sessionKey", sessionKey)
-                                put("requestId", requestId)
-                            }
-                            is AcpRuntimeEvent.Status -> buildJsonObject {
-                                put("type", "status")
-                                put("text", event.text)
-                                put("sessionKey", sessionKey)
-                                put("requestId", requestId)
-                            }
-                        }
+                        val eventJson = buildChatEventPayload(
+                            event = event,
+                            sessionKey = sessionKey,
+                            requestId = requestId,
+                        )
                         sendTo(context.connectionId, "chat.event", eventJson)
+                        buildAgentStreamPayload(event)?.let { mapped ->
+                            sendAgentEvent(stream = mapped.stream, data = mapped.data)
+                        }
                     }
                 } catch (e: Exception) {
                     sendTo(context.connectionId, "chat.event", buildJsonObject {
@@ -448,6 +439,13 @@ class GatewayServer(
                         put("sessionKey", sessionKey)
                         put("requestId", requestId)
                     })
+                    sendAgentEvent(
+                        stream = "lifecycle",
+                        data = buildJsonObject {
+                            put("phase", "error")
+                            put("error", e.message ?: "Unknown error")
+                        },
+                    )
                 }
             }
 
@@ -491,5 +489,81 @@ class GatewayServer(
                 }
             }
         }
+    }
+
+    internal fun buildChatEventPayload(
+        event: AcpRuntimeEvent,
+        sessionKey: String,
+        requestId: String,
+    ): JsonObject {
+        return when (event) {
+            is AcpRuntimeEvent.TextDelta -> buildJsonObject {
+                put("type", "text_delta")
+                put("text", event.text)
+                event.stream?.let { put("stream", it.name.lowercase()) }
+                event.tag?.let { put("tag", it) }
+                put("sessionKey", sessionKey)
+                put("requestId", requestId)
+            }
+            is AcpRuntimeEvent.ToolCall -> buildJsonObject {
+                put("type", "tool_call")
+                put("text", event.text)
+                event.title?.let { put("title", it) }
+                event.tag?.let { put("tag", it) }
+                event.toolCallId?.let { put("toolCallId", it) }
+                normalizeToolStatus(event.status)?.let { put("status", it) }
+                buildToolDetail(event)?.let { put("detail", it) }
+                event.kind?.let { put("kind", it) }
+                event.rawInput?.let { put("rawInput", it) }
+                event.rawOutput?.let { put("rawOutput", it) }
+                put("sessionKey", sessionKey)
+                put("requestId", requestId)
+            }
+            is AcpRuntimeEvent.Done -> buildJsonObject {
+                put("type", "done")
+                put("sessionKey", sessionKey)
+                put("requestId", requestId)
+                event.stopReason?.let { put("stopReason", it) }
+            }
+            is AcpRuntimeEvent.Error -> buildJsonObject {
+                put("type", "error")
+                put("message", event.message)
+                event.code?.let { put("code", it) }
+                event.retryable?.let { put("retryable", it) }
+                put("sessionKey", sessionKey)
+                put("requestId", requestId)
+            }
+            is AcpRuntimeEvent.Status -> buildJsonObject {
+                put("type", "status")
+                put("text", event.text)
+                event.tag?.let { put("tag", it) }
+                event.used?.let { put("used", it) }
+                event.size?.let { put("size", it) }
+                put("sessionKey", sessionKey)
+                put("requestId", requestId)
+            }
+        }
+    }
+
+    private fun normalizeToolStatus(status: String?): String? {
+        val normalized = status?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+        return when (normalized) {
+            "started", "running", "inprogress" -> "in_progress"
+            "done", "success", "succeeded", "complete" -> "completed"
+            "denied", "blocked", "timeout", "timed_out", "failure", "error" -> "failed"
+            else -> normalized
+        }
+    }
+
+    private fun buildToolDetail(event: AcpRuntimeEvent.ToolCall): String? {
+        event.detail?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        val parts = mutableListOf<String>()
+        event.title?.trim()?.takeIf { it.isNotEmpty() }?.let { parts += it }
+        normalizeToolStatus(event.status)?.let { parts += "status=$it" }
+        val text = event.text.trim()
+        if (text.isNotEmpty() && parts.none { it.equals(text, ignoreCase = true) }) {
+            parts += text
+        }
+        return parts.joinToString(" | ").takeIf { it.isNotEmpty() }
     }
 }

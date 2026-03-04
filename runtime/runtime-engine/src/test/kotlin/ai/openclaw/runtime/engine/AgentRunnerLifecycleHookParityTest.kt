@@ -90,7 +90,7 @@ class AgentRunnerLifecycleHookParityTest {
                         llmInputCalls++
                         seenRunId = event.runId
                         seenSessionId = event.sessionId
-                        assertTrue(event.historyMessages.isNotEmpty())
+                        assertEquals(0, event.historyMessages.size)
                     },
                 ),
             )

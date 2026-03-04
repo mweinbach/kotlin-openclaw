@@ -23,7 +23,14 @@ data class ChatMessage(
     val role: String,
     val content: String,
     val isStreaming: Boolean = false,
-    val toolCalls: List<String> = emptyList(),
+    val toolCalls: List<ChatToolCall> = emptyList(),
+)
+
+data class ChatToolCall(
+    val id: String,
+    val title: String,
+    val status: String = "in_progress",
+    val detail: String? = null,
 )
 
 class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
@@ -78,17 +85,53 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
             currentModelId = header?.model ?: engine.preferredModelForAgent(currentAgentId)
             conversationHistory.clear()
             conversationHistory.addAll(loadedMessages)
-                messages = loadedMessages.mapNotNull { msg ->
-                    when (msg.role) {
-                        LlmMessage.Role.USER -> ChatMessage(role = "user", content = msg.plainTextContent())
-                        LlmMessage.Role.ASSISTANT -> ChatMessage(
+            val reconstructed = mutableListOf<ChatMessage>()
+            for ((index, msg) in loadedMessages.withIndex()) {
+                when (msg.role) {
+                    LlmMessage.Role.USER -> {
+                        reconstructed += ChatMessage(role = "user", content = msg.plainTextContent())
+                    }
+                    LlmMessage.Role.ASSISTANT -> {
+                        reconstructed += ChatMessage(
                             role = "assistant",
                             content = msg.plainTextContent(),
-                            toolCalls = msg.toolCalls?.map { it.name } ?: emptyList(),
+                            toolCalls = msg.toolCalls?.mapIndexed { toolIndex, toolCall ->
+                                val toolTitle = toolCall.name.trim().ifEmpty { "tool" }
+                                val toolId = toolCall.id.trim().ifEmpty { "persisted:$toolIndex:$toolTitle" }
+                                ChatToolCall(
+                                    id = toolId,
+                                    title = toolTitle,
+                                    status = "in_progress",
+                                )
+                            } ?: emptyList(),
                         )
-                        else -> null
                     }
+                    LlmMessage.Role.TOOL -> {
+                        val toolCallId = msg.toolCallId?.trim().takeUnless { it.isNullOrEmpty() }
+                            ?: "persisted_tool_${index}_${msg.name ?: "tool"}"
+                        val toolTitle = msg.name?.trim().takeUnless { it.isNullOrEmpty() } ?: "tool"
+                        val detail = msg.plainTextContent().trim()
+                            .takeIf { it.isNotEmpty() }
+                            ?.let { text -> if (text.length > 280) "${text.take(280)}..." else text }
+                        val toolStatus = inferPersistedToolStatus(msg.plainTextContent())
+                        val persistedToolCall = ChatToolCall(
+                            id = toolCallId,
+                            title = toolTitle,
+                            status = toolStatus,
+                            detail = detail,
+                        )
+                        if (!mergePersistedToolCall(reconstructed, persistedToolCall)) {
+                            reconstructed += ChatMessage(
+                                role = "assistant",
+                                content = "",
+                                toolCalls = listOf(persistedToolCall),
+                            )
+                        }
+                    }
+                    else -> Unit
                 }
+            }
+            messages = reconstructed
         }
     }
 
@@ -125,7 +168,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
 
         // Stream assistant response
         isLoading = true
-        val assistantToolCalls = mutableListOf<String>()
+        val assistantToolCalls = linkedMapOf<String, ChatToolCall>()
         val responseBuilder = StringBuilder()
 
         // Add a streaming placeholder
@@ -148,20 +191,17 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                                 role = "assistant",
                                 content = responseBuilder.toString(),
                                 isStreaming = true,
-                                toolCalls = assistantToolCalls.toList(),
+                                toolCalls = assistantToolCalls.values.toList(),
                             )
                         }
                         is AcpRuntimeEvent.ToolCall -> {
-                            val toolName = event.title ?: event.text
-                            if (toolName.isNotBlank()) {
-                                assistantToolCalls.add(toolName)
-                                messages = messages.dropLast(1) + ChatMessage(
-                                    role = "assistant",
-                                    content = responseBuilder.toString(),
-                                    isStreaming = true,
-                                    toolCalls = assistantToolCalls.toList(),
-                                )
-                            }
+                            val mergedToolCalls = applyToolCallEvent(assistantToolCalls, event)
+                            messages = messages.dropLast(1) + ChatMessage(
+                                role = "assistant",
+                                content = responseBuilder.toString(),
+                                isStreaming = true,
+                                toolCalls = mergedToolCalls,
+                            )
                         }
                         is AcpRuntimeEvent.Status -> {
                             // Status updates are informational; no UI change needed
@@ -172,7 +212,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                                 role = "assistant",
                                 content = finalContent,
                                 isStreaming = false,
-                                toolCalls = assistantToolCalls.toList(),
+                                toolCalls = assistantToolCalls.values.toList(),
                             )
                             val assistantMessage = LlmMessage(
                                 role = LlmMessage.Role.ASSISTANT,
@@ -191,7 +231,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                                     role = "assistant",
                                     content = responseBuilder.toString(),
                                     isStreaming = false,
-                                    toolCalls = assistantToolCalls.toList(),
+                                    toolCalls = assistantToolCalls.values.toList(),
                                 )
                             }
                             isLoading = false
@@ -206,7 +246,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                             role = "assistant",
                             content = finalContent,
                             isStreaming = false,
-                            toolCalls = assistantToolCalls.toList(),
+                            toolCalls = assistantToolCalls.values.toList(),
                         )
                         val assistantMessage = LlmMessage(
                             role = LlmMessage.Role.ASSISTANT,
@@ -257,4 +297,131 @@ class ChatViewModelFactory(private val engine: AgentEngine) : ViewModelProvider.
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return ChatViewModel(engine) as T
     }
+}
+
+internal fun applyToolCallEvent(
+    toolCalls: LinkedHashMap<String, ChatToolCall>,
+    event: AcpRuntimeEvent.ToolCall,
+): List<ChatToolCall> {
+    val title = resolveToolCallTitle(event)
+    val id = resolveToolCallId(event, toolCalls, title)
+    val normalizedStatus = normalizeToolCallStatus(
+        rawStatus = event.status,
+        rawTag = event.tag,
+        eventText = event.text,
+    )
+    val detail = event.detail?.trim()?.takeIf { it.isNotEmpty() }
+        ?: event.text.trim().takeIf { it.isNotEmpty() }
+    val existing = toolCalls[id]
+    val mergedStatus = when {
+        normalizedStatus == null && existing != null -> existing.status
+        normalizedStatus == null -> "in_progress"
+        existing != null && existing.status != "in_progress" && normalizedStatus == "in_progress" -> existing.status
+        else -> normalizedStatus
+    }
+    val merged = ChatToolCall(
+        id = id,
+        title = title.ifBlank { existing?.title ?: "tool" },
+        status = mergedStatus,
+        detail = detail ?: existing?.detail,
+    )
+    if (existing == merged) {
+        return toolCalls.values.toList()
+    }
+    toolCalls[id] = merged
+    return toolCalls.values.toList()
+}
+
+internal fun normalizeToolCallStatus(
+    rawStatus: String?,
+    rawTag: String?,
+    eventText: String?,
+): String? {
+    val status = rawStatus?.trim()?.lowercase().orEmpty()
+    if (status.isNotEmpty()) {
+        return when (status) {
+            "in_progress", "running", "started", "start" -> "in_progress"
+            "completed", "complete", "done", "success", "succeeded" -> "completed"
+            "blocked", "denied", "timeout", "timed_out", "failed", "failure", "error" -> "failed"
+            else -> status
+        }
+    }
+
+    val text = eventText?.trim()?.lowercase().orEmpty()
+    if (text.contains("error") || text.contains("fail")) {
+        return "failed"
+    }
+    if (text.contains("denied") || text.contains("timed out") || text.contains("blocked")) {
+        return "failed"
+    }
+    return null
+}
+
+private fun resolveToolCallId(
+    event: AcpRuntimeEvent.ToolCall,
+    existing: LinkedHashMap<String, ChatToolCall>,
+    title: String,
+): String {
+    event.toolCallId?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    val fallback = buildFallbackToolCallId(event, title)
+    if (fallback in existing) return fallback
+    return fallback
+}
+
+private fun resolveToolCallTitle(event: AcpRuntimeEvent.ToolCall): String {
+    val explicitTitle = event.title?.trim().orEmpty()
+    if (explicitTitle.isNotEmpty()) return explicitTitle
+
+    val text = event.text.trim()
+    if (text.isEmpty()) return "tool"
+    val normalizedPrefixes = listOf("calling ", "completed ", "blocked ")
+    for (prefix in normalizedPrefixes) {
+        if (text.startsWith(prefix, ignoreCase = true)) {
+            return text.substring(prefix.length).trim().ifEmpty { "tool" }
+        }
+    }
+    return text
+}
+
+private fun buildFallbackToolCallId(event: AcpRuntimeEvent.ToolCall, title: String): String {
+    val stableTitle = title.trim().lowercase().ifEmpty { "tool" }
+    val key = listOfNotNull(
+        stableTitle,
+        event.detail?.trim()?.takeIf { it.isNotEmpty() },
+    ).joinToString("|")
+    if (key.isBlank()) return "tool_fallback"
+    val digest = key.hashCode().toUInt().toString(16)
+    return "tool_fallback_$digest"
+}
+
+private fun inferPersistedToolStatus(result: String): String {
+    val normalized = result.trim().lowercase()
+    if (normalized.isEmpty()) return "completed"
+    if (normalized.contains("\"status\":\"error\"") || normalized.contains("\"error\"")) {
+        return "failed"
+    }
+    if (normalized.startsWith("error:")) return "failed"
+    return "completed"
+}
+
+private fun mergePersistedToolCall(
+    messages: MutableList<ChatMessage>,
+    toolCall: ChatToolCall,
+): Boolean {
+    for (index in messages.indices.reversed()) {
+        val message = messages[index]
+        if (message.role != "assistant") continue
+        val toolIndex = message.toolCalls.indexOfFirst { it.id == toolCall.id }
+        if (toolIndex < 0) continue
+        val mergedToolCalls = message.toolCalls.toMutableList()
+        val existing = mergedToolCalls[toolIndex]
+        mergedToolCalls[toolIndex] = existing.copy(
+            title = existing.title.ifBlank { toolCall.title },
+            status = toolCall.status,
+            detail = toolCall.detail ?: existing.detail,
+        )
+        messages[index] = message.copy(toolCalls = mergedToolCalls)
+        return true
+    }
+    return false
 }

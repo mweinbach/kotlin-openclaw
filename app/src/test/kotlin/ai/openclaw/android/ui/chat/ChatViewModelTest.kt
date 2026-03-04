@@ -1,6 +1,7 @@
 package ai.openclaw.android.ui.chat
 
 import ai.openclaw.android.AgentEngine
+import ai.openclaw.core.model.AcpRuntimeEvent
 import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.Dispatchers
@@ -136,5 +137,83 @@ class ChatViewModelTest {
     fun `sessionHeaders starts empty`() {
         val vm = ChatViewModel(engine)
         assertTrue(vm.sessionHeaders.value.isEmpty())
+    }
+
+    @Test
+    fun `applyToolCallEvent merges updates by toolCallId`() {
+        val toolCalls = linkedMapOf<String, ChatToolCall>()
+
+        applyToolCallEvent(
+            toolCalls = toolCalls,
+            event = AcpRuntimeEvent.ToolCall(
+                text = "Calling read",
+                tag = "tool_call",
+                toolCallId = "call_1",
+                status = "in_progress",
+                title = "read",
+            ),
+        )
+        applyToolCallEvent(
+            toolCalls = toolCalls,
+            event = AcpRuntimeEvent.ToolCall(
+                text = "Completed read",
+                tag = "tool_call_update",
+                toolCallId = "call_1",
+                status = "completed",
+                title = "read",
+            ),
+        )
+
+        assertEquals(1, toolCalls.size)
+        val merged = toolCalls["call_1"]
+        assertNotNull(merged)
+        assertEquals("completed", merged.status)
+        assertEquals("read", merged.title)
+    }
+
+    @Test
+    fun `normalizeToolCallStatus infers failed from update text`() {
+        val status = normalizeToolCallStatus(
+            rawStatus = null,
+            rawTag = "tool_call_update",
+            eventText = "Tool call denied by policy",
+        )
+        assertEquals("failed", status)
+    }
+
+    @Test
+    fun `normalizeToolCallStatus infers completed from update tag`() {
+        val status = normalizeToolCallStatus(
+            rawStatus = null,
+            rawTag = "tool_call_update",
+            eventText = "Completed read",
+        )
+        assertNull(status)
+    }
+
+    @Test
+    fun `applyToolCallEvent merges no-id updates using fallback ids`() {
+        val toolCalls = linkedMapOf<String, ChatToolCall>()
+        applyToolCallEvent(
+            toolCalls = toolCalls,
+            event = AcpRuntimeEvent.ToolCall(
+                text = "Calling read",
+                tag = "tool_call",
+                title = "read",
+                status = "in_progress",
+            ),
+        )
+        applyToolCallEvent(
+            toolCalls = toolCalls,
+            event = AcpRuntimeEvent.ToolCall(
+                text = "Completed read",
+                tag = "tool_call_update",
+                title = "read",
+                status = "completed",
+            ),
+        )
+
+        assertEquals(1, toolCalls.size)
+        assertEquals("completed", toolCalls.values.first().status)
     }
 }

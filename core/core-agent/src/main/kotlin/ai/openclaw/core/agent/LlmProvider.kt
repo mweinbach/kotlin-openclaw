@@ -40,6 +40,7 @@ data class LlmMessage(
     val content: String = "",
     val name: String? = null,
     val toolCallId: String? = null,
+    val stopReason: String? = null,
     val toolCalls: List<LlmToolCall>? = null,
     val contentBlocks: List<LlmContentBlock>? = null,
 ) {

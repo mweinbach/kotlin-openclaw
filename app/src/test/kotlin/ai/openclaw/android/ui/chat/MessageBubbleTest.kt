@@ -107,12 +107,21 @@ class MessageBubbleTest {
                     message = ChatMessage(
                         role = "assistant",
                         content = "Using tool...",
-                        toolCalls = listOf("search_web"),
+                        toolCalls = listOf(
+                            ChatToolCall(
+                                id = "call_1",
+                                title = "search_web",
+                                status = "completed",
+                                detail = "Completed search_web",
+                            ),
+                        ),
                     ),
                 )
             }
         }
 
         composeTestRule.onNodeWithText("Using tool...").assertIsDisplayed()
+        composeTestRule.onNodeWithText("search_web").assertIsDisplayed()
+        composeTestRule.onNodeWithText("completed").assertIsDisplayed()
     }
 }

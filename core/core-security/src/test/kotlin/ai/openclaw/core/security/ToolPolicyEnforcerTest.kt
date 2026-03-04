@@ -29,8 +29,8 @@ class ToolPolicyEnforcerTest {
     @Test
     fun `allows all tools in FULL profile with no restrictions`() {
         val enforcer = ToolPolicyEnforcer(configWith(profile = ToolProfileId.FULL))
-        assertTrue(enforcer.check("read_file").allowed)
-        assertTrue(enforcer.check("browser_navigate").allowed)
+        assertTrue(enforcer.check("read").allowed)
+        assertTrue(enforcer.check("browser").allowed)
         assertTrue(enforcer.check("custom_tool").allowed)
     }
 
@@ -41,41 +41,41 @@ class ToolPolicyEnforcerTest {
             deny = listOf("dangerous_tool"),
         ))
         assertFalse(enforcer.check("dangerous_tool").allowed)
-        assertTrue(enforcer.check("read_file").allowed)
+        assertTrue(enforcer.check("read").allowed)
     }
 
     @Test
     fun `allows only global allow list when set`() {
         val enforcer = ToolPolicyEnforcer(configWith(
             profile = ToolProfileId.FULL,
-            allow = listOf("read_file", "write_file"),
+            allow = listOf("read", "write"),
         ))
-        assertTrue(enforcer.check("read_file").allowed)
-        assertTrue(enforcer.check("write_file").allowed)
-        assertFalse(enforcer.check("execute_command").allowed)
+        assertTrue(enforcer.check("read").allowed)
+        assertTrue(enforcer.check("write").allowed)
+        assertFalse(enforcer.check("exec").allowed)
     }
 
     @Test
     fun `alsoAllow extends allow list`() {
         val enforcer = ToolPolicyEnforcer(configWith(
             profile = ToolProfileId.FULL,
-            allow = listOf("read_file"),
-            alsoAllow = listOf("write_file"),
+            allow = listOf("read"),
+            alsoAllow = listOf("write"),
         ))
-        assertTrue(enforcer.check("read_file").allowed)
-        assertTrue(enforcer.check("write_file").allowed)
-        assertFalse(enforcer.check("execute_command").allowed)
+        assertTrue(enforcer.check("read").allowed)
+        assertTrue(enforcer.check("write").allowed)
+        assertFalse(enforcer.check("exec").allowed)
     }
 
     @Test
     fun `deny takes priority over allow`() {
         val enforcer = ToolPolicyEnforcer(configWith(
             profile = ToolProfileId.FULL,
-            deny = listOf("read_file"),
-            allow = listOf("read_file", "write_file"),
+            deny = listOf("read"),
+            allow = listOf("read", "write"),
         ))
-        assertFalse(enforcer.check("read_file").allowed)
-        assertTrue(enforcer.check("write_file").allowed)
+        assertFalse(enforcer.check("read").allowed)
+        assertTrue(enforcer.check("write").allowed)
     }
 
     @Test
@@ -84,12 +84,12 @@ class ToolPolicyEnforcerTest {
             profile = ToolProfileId.FULL,
             agents = listOf(AgentConfig(
                 id = "bot",
-                tools = AgentToolsConfig(disabled = listOf("execute_command")),
+                tools = AgentToolsConfig(disabled = listOf("exec")),
             )),
         )
         val enforcer = ToolPolicyEnforcer(config)
-        assertFalse(enforcer.check("execute_command", agentId = "bot").allowed)
-        assertTrue(enforcer.check("read_file", agentId = "bot").allowed)
+        assertFalse(enforcer.check("exec", agentId = "bot").allowed)
+        assertTrue(enforcer.check("read", agentId = "bot").allowed)
     }
 
     @Test
@@ -98,21 +98,46 @@ class ToolPolicyEnforcerTest {
             profile = ToolProfileId.FULL,
             agents = listOf(AgentConfig(
                 id = "restricted",
-                tools = AgentToolsConfig(enabled = listOf("read_file")),
+                tools = AgentToolsConfig(enabled = listOf("read")),
             )),
         )
         val enforcer = ToolPolicyEnforcer(config)
-        assertTrue(enforcer.check("read_file", agentId = "restricted").allowed)
-        assertFalse(enforcer.check("write_file", agentId = "restricted").allowed)
+        assertTrue(enforcer.check("read", agentId = "restricted").allowed)
+        assertFalse(enforcer.check("write", agentId = "restricted").allowed)
     }
 
     @Test
     fun `minimal profile restricts tool set`() {
-        val result = ToolPolicyEnforcer.checkProfile("browser_navigate", ToolProfileId.MINIMAL)
+        val result = ToolPolicyEnforcer.checkProfile("browser", ToolProfileId.MINIMAL)
         assertFalse(result.allowed)
 
-        val result2 = ToolPolicyEnforcer.checkProfile("read_file", ToolProfileId.MINIMAL)
+        val result2 = ToolPolicyEnforcer.checkProfile("read", ToolProfileId.MINIMAL)
         assertTrue(result2.allowed)
+    }
+
+    @Test
+    fun `glob deny patterns apply to tool names`() {
+        val enforcer = ToolPolicyEnforcer(
+            configWith(
+                profile = ToolProfileId.FULL,
+                deny = listOf("web_*"),
+            ),
+        )
+        assertFalse(enforcer.check("web_search").allowed)
+        assertFalse(enforcer.check("web_fetch").allowed)
+        assertTrue(enforcer.check("read").allowed)
+    }
+
+    @Test
+    fun `allowing exec also allows apply_patch`() {
+        val enforcer = ToolPolicyEnforcer(
+            configWith(
+                profile = ToolProfileId.FULL,
+                allow = listOf("exec"),
+            ),
+        )
+        assertTrue(enforcer.check("exec").allowed)
+        assertTrue(enforcer.check("apply_patch").allowed)
     }
 
     @Test

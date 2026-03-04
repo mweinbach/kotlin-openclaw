@@ -1,5 +1,6 @@
 package ai.openclaw.core.plugins
 
+import ai.openclaw.core.agent.LlmMessage
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
@@ -231,6 +232,17 @@ data class AfterToolCallEvent(
     val result: Any? = null,
     val error: String? = null,
     val durationMs: Long? = null,
+)
+
+data class ToolResultPersistEvent(
+    val message: LlmMessage,
+    val toolName: String? = null,
+    val toolCallId: String? = null,
+    val runId: String? = null,
+)
+
+data class ToolResultPersistResult(
+    val message: LlmMessage? = null,
 )
 
 data class SessionStartEvent(

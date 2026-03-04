@@ -139,7 +139,7 @@ class OpenAiProvider(
             }
         }
 
-        val response = client.newCall(requestBuilder.build()).execute()
+        val response = client.newCall(requestBuilder.build()).executeCancellable()
         try {
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"

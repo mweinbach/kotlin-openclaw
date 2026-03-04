@@ -59,8 +59,10 @@ class AgentRunnerPromptParityTest {
         val prompt = provider.lastRequest?.systemPrompt
         assertNotNull(prompt)
         assertTrue(prompt.contains("# Skills"))
-        assertTrue(prompt.contains("# Runtime Information"))
+        assertTrue(prompt.contains("## Runtime"))
+        assertTrue(prompt.contains("Runtime:"))
         assertTrue(prompt.contains("## Workspace"))
+        assertTrue(prompt.contains("## Subagent Contract"))
     }
 
     @Test

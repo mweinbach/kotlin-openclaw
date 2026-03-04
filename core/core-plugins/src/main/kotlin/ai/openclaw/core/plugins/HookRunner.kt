@@ -250,6 +250,33 @@ class HookRunner(
         runVoidHook(PluginHookName.AFTER_TOOL_CALL, event, ctx)
     }
 
+    suspend fun runToolResultPersist(
+        event: ToolResultPersistEvent,
+        ctx: PluginHookToolContext,
+    ): ToolResultPersistResult? {
+        val hooks = registry.getHooksForName<suspend (ToolResultPersistEvent, PluginHookToolContext) -> ToolResultPersistResult?>(
+            PluginHookName.TOOL_RESULT_PERSIST,
+        )
+        if (hooks.isEmpty()) return null
+
+        var currentMessage = event.message
+        for (hook in hooks) {
+            try {
+                val result = hook.handler.invoke(
+                    event.copy(message = currentMessage),
+                    ctx,
+                )
+                if (result?.message != null) {
+                    currentMessage = result.message
+                }
+            } catch (err: Throwable) {
+                handleHookError(PluginHookName.TOOL_RESULT_PERSIST, hook.pluginId, err)
+            }
+        }
+
+        return ToolResultPersistResult(message = currentMessage)
+    }
+
     // =========================================================================
     // Session Hooks
     // =========================================================================

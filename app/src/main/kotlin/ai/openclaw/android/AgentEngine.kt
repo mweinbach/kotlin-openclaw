@@ -47,6 +47,7 @@ import ai.openclaw.runtime.engine.SkillsTool
 import ai.openclaw.runtime.engine.SystemPromptBuilder
 import ai.openclaw.runtime.engine.ToolLoopDetector
 import ai.openclaw.runtime.engine.ToolRegistry
+import ai.openclaw.runtime.engine.tools.CodingToolsModule
 import ai.openclaw.runtime.gateway.ChannelManager
 import ai.openclaw.runtime.gateway.GatewayServer
 import ai.openclaw.runtime.memory.MemoryManager
@@ -118,10 +119,19 @@ class AgentEngine(private val context: Context) {
     val approvalManager: ApprovalManager by lazy {
         ApprovalManager(
             policy = object : ai.openclaw.core.security.ApprovalPolicy {
-                override fun requiresApproval(toolName: String, agentId: String, sessionKey: String): Boolean {
-                    return ConfigBasedApprovalPolicy(config.approvals)
-                        .requiresApproval(toolName, agentId, sessionKey)
+                override fun requiresApproval(
+                    toolName: String,
+                    toolInput: String,
+                    agentId: String,
+                    sessionKey: String,
+                ): Boolean {
+                    return ConfigBasedApprovalPolicy(config.approvals, config.tools)
+                        .requiresApproval(toolName, toolInput, agentId, sessionKey)
                 }
+            },
+            metadataProvider = { toolName, toolInput ->
+                ConfigBasedApprovalPolicy(config.approvals, config.tools)
+                    .approvalMetadata(toolName, toolInput)
             },
         )
     }
@@ -593,6 +603,11 @@ class AgentEngine(private val context: Context) {
             var retryableFailure: AcpRuntimeEvent.Error? = null
             var completed = false
 
+            val runtimeInfoForTurn = buildRuntimeInfo(
+                agentId = resolvedAgentId,
+                modelId = routedModel,
+                channelContext = channelContext,
+            )
             runner.runTurn(
                 EmbeddedRunParams(
                     messages = messages,
@@ -604,7 +619,7 @@ class AgentEngine(private val context: Context) {
                     agentIdentity = resolveAgentConfig(resolvedAgentId)?.identity,
                     channelContext = channelContext,
                     skills = promptSkills,
-                    runtimeInfo = buildRuntimeInfo(),
+                    runtimeInfo = runtimeInfoForTurn,
                     workspaceDir = terminalWorkingDirectory(),
                     hookSessionId = hookSessionId,
                     legacyBeforeAgentStartResult = legacyModelResolve,
@@ -613,6 +628,9 @@ class AgentEngine(private val context: Context) {
                         messageProvider = effectiveMessageProvider,
                         channelId = effectiveChannelId,
                         sessionId = hookSessionId,
+                        senderIsOwner = null,
+                        sandboxed = runtimeInfoForTurn.sandboxed,
+                        groupToolPolicy = null,
                     ),
                 ),
             ).collect { event ->
@@ -768,9 +786,14 @@ class AgentEngine(private val context: Context) {
             }
 
             "ollama" -> {
+                val apiKey = resolveProviderApiKey(
+                    aliases = listOf("ollama"),
+                    providerConfig = providerConfig,
+                )
                 providerRegistry.register(
                     OllamaProvider(
                         baseUrl = providerConfig?.baseUrl ?: "http://localhost:11434",
+                        apiKey = apiKey,
                     ),
                 )
             }
@@ -907,6 +930,26 @@ class AgentEngine(private val context: Context) {
 
     private fun registerTools() {
         toolRegistry.clear()
+
+        val toolsConfig = config.tools
+        val execConfig = toolsConfig?.exec
+        val workspaceOnly = toolsConfig?.fs?.workspaceOnly != false
+        val applyPatchConfig = execConfig?.applyPatch
+        val applyPatchEnabled = applyPatchConfig?.enabled == true
+        val applyPatchWorkspaceOnly = workspaceOnly || applyPatchConfig?.workspaceOnly != false
+
+        CodingToolsModule.registerAll(
+            registry = toolRegistry,
+            config = CodingToolsModule.Config(
+                workspaceDir = terminalWorkingDirectory(),
+                workspaceOnly = workspaceOnly,
+                applyPatchEnabled = applyPatchEnabled,
+                applyPatchWorkspaceOnly = applyPatchWorkspaceOnly,
+                execTimeoutSec = execConfig?.timeoutSec?.coerceAtLeast(1) ?: 120,
+                execYieldMs = execConfig?.backgroundMs?.toLong()?.coerceAtLeast(0L) ?: 10_000L,
+                processCleanupMs = execConfig?.cleanupMs?.toLong()?.coerceAtLeast(1L) ?: 300_000L,
+            ),
+        )
 
         DeviceToolsModule.registerAll(
             registry = toolRegistry,
@@ -1171,12 +1214,58 @@ class AgentEngine(private val context: Context) {
         }
     }
 
-    private fun buildRuntimeInfo(): SystemPromptBuilder.RuntimeInfo {
+    private fun buildRuntimeInfo(
+        agentId: String,
+        modelId: String? = null,
+        channelContext: SystemPromptBuilder.ChannelContext? = null,
+    ): SystemPromptBuilder.RuntimeInfo {
+        val agentConfig = resolveAgentConfig(agentId)
+        val sandboxMode = agentConfig?.sandbox?.mode ?: config.agents?.defaults?.sandbox?.mode
+        val sandboxed = isSandboxedMode(sandboxMode)
+        val acpEnabled = config.acp?.enabled != false
+        val elevatedEnabled = config.tools?.elevated?.enabled == true
+        val elevatedAllowed = sandboxed && elevatedEnabled
+        val sandboxContainerWorkspaceDir = System.getenv("OPENCLAW_SANDBOX_WORKDIR")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        val capabilities = buildList {
+            if (channelContext?.supportsReactions == true) add("reactions")
+            if (channelContext?.supportsThreads == true) add("threads")
+            if (channelContext?.supportsRichText == true) add("rich_text")
+        }
+        val preferredDefaultModel = preferredModelForAgent(agentId)
         return SystemPromptBuilder.RuntimeInfo(
             os = "Android ${android.os.Build.VERSION.RELEASE}",
             arch = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
             host = android.os.Build.MODEL,
+            agentId = agentId,
+            repoRoot = terminalWorkingDirectory(),
+            model = modelId,
+            defaultModel = preferredDefaultModel,
+            node = System.getenv("NODE_VERSION"),
+            shell = System.getenv("SHELL"),
+            channel = channelContext?.channelId,
+            capabilities = capabilities,
+            thinking = "off",
+            reasoning = "off",
             timezone = java.util.TimeZone.getDefault().id,
+            currentTime = java.time.Instant.now().toString(),
+            sandboxed = sandboxed,
+            acpEnabled = acpEnabled,
+            elevatedEnabled = elevatedEnabled,
+            elevatedAllowed = elevatedAllowed,
+            sandboxContainerWorkspaceDir = sandboxContainerWorkspaceDir,
+        )
+    }
+
+    private fun isSandboxedMode(mode: String?): Boolean {
+        val normalized = mode?.trim()?.lowercase() ?: return false
+        return normalized !in setOf(
+            "off",
+            "none",
+            "host",
+            "disabled",
+            "false",
         )
     }
 

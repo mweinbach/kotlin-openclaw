@@ -1,7 +1,9 @@
 package ai.openclaw.core.security
 
 import ai.openclaw.core.model.ApprovalsConfig
+import ai.openclaw.core.model.ExecToolConfig
 import ai.openclaw.core.model.ExecApprovalForwardingConfig
+import ai.openclaw.core.model.ExpandedToolsConfig
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -29,7 +31,7 @@ class ApprovalManagerTest {
     @Test
     fun `config policy with exec enabled requires approval for exec tool`() = runTest {
         val config = ApprovalsConfig(exec = ExecApprovalForwardingConfig(enabled = true))
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 500)
 
         // Launch approval check in background
@@ -57,7 +59,7 @@ class ApprovalManagerTest {
     @Test
     fun `deny returns denied decision`() = runTest {
         val config = ApprovalsConfig(exec = ExecApprovalForwardingConfig(enabled = true))
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 5000)
 
         val result = kotlinx.coroutines.CompletableDeferred<ApprovalDecision>()
@@ -79,7 +81,7 @@ class ApprovalManagerTest {
     @Test
     fun `timeout returns timed-out decision`() = runTest {
         val config = ApprovalsConfig(exec = ExecApprovalForwardingConfig(enabled = true))
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 100)
 
         val decision = manager.checkApproval("exec", "ls", "main", "session-1")
@@ -89,7 +91,7 @@ class ApprovalManagerTest {
     @Test
     fun `non-exec tools are auto-approved even with policy`() = runTest {
         val config = ApprovalsConfig(exec = ExecApprovalForwardingConfig(enabled = true))
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy)
         val decision = manager.checkApproval("read_file", "{}", "main", "session-1")
         assertEquals(ApprovalDecision.APPROVED, decision)
@@ -103,7 +105,7 @@ class ApprovalManagerTest {
                 agentFilter = listOf("restricted-agent"),
             )
         )
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy)
 
         // main agent should auto-approve
@@ -114,7 +116,7 @@ class ApprovalManagerTest {
     @Test
     fun `events are emitted for approval requests`() = runTest {
         val config = ApprovalsConfig(exec = ExecApprovalForwardingConfig(enabled = true))
-        val policy = ConfigBasedApprovalPolicy(config)
+        val policy = ConfigBasedApprovalPolicy(config, ExpandedToolsConfig(exec = ExecToolConfig(ask = "always")))
         val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 100)
 
         val events = mutableListOf<ApprovalEvent>()
@@ -134,5 +136,67 @@ class ApprovalManagerTest {
         assertTrue(events.any { it is ApprovalEvent.ApprovalResolved })
 
         collectJob.cancel()
+    }
+
+    @Test
+    fun `ask off auto approves exec`() = runTest {
+        val policy = ConfigBasedApprovalPolicy(
+            config = null,
+            toolsConfig = ExpandedToolsConfig(exec = ExecToolConfig(ask = "off")),
+        )
+        val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 100)
+        val decision = manager.checkApproval("exec", """{"command":"rm -rf /"}""", "main", "session-1")
+        assertEquals(ApprovalDecision.APPROVED, decision)
+    }
+
+    @Test
+    fun `ask on-miss skips approval for safe bin hits`() = runTest {
+        val policy = ConfigBasedApprovalPolicy(
+            config = null,
+            toolsConfig = ExpandedToolsConfig(
+                exec = ExecToolConfig(
+                    ask = "on-miss",
+                    safeBins = listOf("ls", "cat"),
+                ),
+            ),
+        )
+        val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 100)
+        val decision = manager.checkApproval("exec", """{"command":"ls -la"}""", "main", "session-1")
+        assertEquals(ApprovalDecision.APPROVED, decision)
+    }
+
+    @Test
+    fun `ask on-miss requires approval on safe bin miss`() = runTest {
+        val policy = ConfigBasedApprovalPolicy(
+            config = null,
+            toolsConfig = ExpandedToolsConfig(
+                exec = ExecToolConfig(
+                    ask = "on-miss",
+                    safeBins = listOf("ls"),
+                ),
+            ),
+        )
+        val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 80)
+        val decision = manager.checkApproval("exec", """{"command":"curl https://example.com"}""", "main", "session-1")
+        assertEquals(ApprovalDecision.TIMED_OUT, decision)
+    }
+
+    @Test
+    fun `ask on-miss supports glob and special character safeBins`() = runTest {
+        val policy = ConfigBasedApprovalPolicy(
+            config = null,
+            toolsConfig = ExpandedToolsConfig(
+                exec = ExecToolConfig(
+                    ask = "on-miss",
+                    safeBins = listOf("/usr/bin/g++", "/opt/tools/*++"),
+                ),
+            ),
+        )
+        val manager = ApprovalManager(policy = policy, defaultTimeoutMs = 100)
+        val exact = manager.checkApproval("exec", """{"command":"/usr/bin/g++ -v"}""", "main", "session-1")
+        assertEquals(ApprovalDecision.APPROVED, exact)
+
+        val wildcard = manager.checkApproval("exec", """{"command":"/opt/tools/clang++ --version"}""", "main", "session-1")
+        assertEquals(ApprovalDecision.APPROVED, wildcard)
     }
 }
