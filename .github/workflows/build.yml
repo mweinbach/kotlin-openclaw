@@ -62,15 +62,41 @@ jobs:
           GRADLE_OPTS: -Xmx4g -XX:MaxMetaspaceSize=512m
         run: ./gradlew :app:assembleRelease -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
 
+      - name: Verify APK is signed
+        run: |
+          set -euo pipefail
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "Signed APK not found at $APK_PATH"
+            echo "Available files:"
+            ls -lah app/build/outputs/apk/release || true
+            exit 1
+          fi
+
+          SDK_DIR="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_DIR" ]; then
+            echo "ANDROID_HOME/ANDROID_SDK_ROOT is not set"
+            exit 1
+          fi
+
+          APKSIGNER="$(find "$SDK_DIR/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found under $SDK_DIR/build-tools"
+            exit 1
+          fi
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK_PATH"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: openclaw-release
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
 
       - name: Publish APK to GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/release/*.apk
+          files: app/build/outputs/apk/release/app-release.apk
           generate_release_notes: true
