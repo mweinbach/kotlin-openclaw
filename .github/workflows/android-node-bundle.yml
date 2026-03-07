@@ -22,20 +22,15 @@ on:
 permissions:
   contents: write
 
-env:
-  DEFAULT_TERMUX_REF: master
-  DEFAULT_RELEASE_TAG: toolchain-node-android-arm64
-  DEFAULT_COREPACK_VERSION: "0.34.6"
-
 jobs:
   build-and-publish:
     name: Build Android arm64 Node Bundle
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      TERMUX_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.termux_ref || env.DEFAULT_TERMUX_REF }}
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || env.DEFAULT_RELEASE_TAG }}
-      COREPACK_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.corepack_version || env.DEFAULT_COREPACK_VERSION }}
+      TERMUX_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.termux_ref || 'master' }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || 'toolchain-node-android-arm64' }}
+      COREPACK_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.corepack_version || '0.34.6' }}
 
     steps:
       - name: Checkout repository
