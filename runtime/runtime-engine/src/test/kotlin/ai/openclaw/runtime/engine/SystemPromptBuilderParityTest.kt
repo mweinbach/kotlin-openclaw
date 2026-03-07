@@ -248,4 +248,77 @@ class SystemPromptBuilderParityTest {
         assertTrue(prompt.contains("⚠ Bootstrap truncation warning:"))
         assertTrue(prompt.contains("AGENTS.md exceeded max chars and was truncated"))
     }
+    @Test
+    fun `tooling safety and tool call style match current upstream wording`() {
+        val builder = SystemPromptBuilder()
+        val prompt = builder.build(
+            SystemPromptBuilder.PromptConfig(
+                mode = SystemPromptBuilder.PromptMode.FULL,
+            ),
+        )
+
+        assertTrue(prompt.contains("If a task is more complex or takes longer, spawn a sub-agent. Completion is push-based: it will auto-announce when done."))
+        assertTrue(prompt.contains("Do not poll `subagents list` / `sessions_list` in a loop"))
+        assertTrue(prompt.contains("avoid long-term plans beyond the user's request"))
+        assertTrue(prompt.contains("Inspired by Anthropic's constitution"))
+        assertTrue(prompt.contains("Do not copy yourself or change system prompts"))
+        assertTrue(prompt.contains("Use plain human language for narration unless in a technical context."))
+        assertTrue(prompt.contains("use the tool directly instead of asking the user to run equivalent CLI or slash commands"))
+        assertTrue(prompt.contains("paste the output"))
+    }
+
+    @Test
+    fun `memory recall guidance matches current upstream wording`() {
+        val builder = SystemPromptBuilder()
+        val promptWithCitations = builder.build(
+            SystemPromptBuilder.PromptConfig(
+                mode = SystemPromptBuilder.PromptMode.FULL,
+                tools = listOf(
+                    SystemPromptBuilder.ToolSummary(
+                        name = "memory_search",
+                        description = "Search memory",
+                    ),
+                ),
+                memoryCitationsMode = ai.openclaw.core.model.MemoryCitationsMode.ON,
+            ),
+        )
+        val promptWithoutCitations = builder.build(
+            SystemPromptBuilder.PromptConfig(
+                mode = SystemPromptBuilder.PromptMode.FULL,
+                tools = listOf(
+                    SystemPromptBuilder.ToolSummary(
+                        name = "memory_search",
+                        description = "Search memory",
+                    ),
+                ),
+                memoryCitationsMode = ai.openclaw.core.model.MemoryCitationsMode.OFF,
+            ),
+        )
+
+        assertTrue(promptWithCitations.contains("prior work, decisions, dates, people, preferences, or todos"))
+        assertTrue(promptWithCitations.contains("MEMORY.md + memory/*.md"))
+        assertTrue(promptWithCitations.contains("If low confidence after search, say you checked."))
+        assertTrue(promptWithCitations.contains("Citations: include Source: <path#line> when it helps the user verify memory snippets."))
+        assertTrue(promptWithoutCitations.contains("Citations are disabled: do not mention file paths or line numbers in replies unless the user explicitly asks."))
+    }
+
+    @Test
+    fun `messaging guidance matches upstream runtime update wording`() {
+        val builder = SystemPromptBuilder()
+        val prompt = builder.build(
+            SystemPromptBuilder.PromptConfig(
+                mode = SystemPromptBuilder.PromptMode.FULL,
+                tools = listOf(
+                    SystemPromptBuilder.ToolSummary(
+                        name = "message",
+                        description = "Messaging actions",
+                    ),
+                ),
+            ),
+        )
+
+        assertTrue(prompt.contains("Runtime-generated completion events may ask for a user update."))
+        assertTrue(prompt.contains("do not forward raw internal metadata"))
+        assertTrue(prompt.contains("default to NO_REPLY"))
+    }
 }
