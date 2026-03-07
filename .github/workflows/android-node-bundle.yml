@@ -62,7 +62,7 @@ jobs:
               raise SystemExit("Could not find TERMUX_APP__PACKAGE_NAME assignment to patch")
           path.write_text(text.replace(original, replacement, 1))
           PY
-          rg -n 'TERMUX_APP__PACKAGE_NAME=' tmp/termux-packages/scripts/properties.sh
+          grep -n 'TERMUX_APP__PACKAGE_NAME=' tmp/termux-packages/scripts/properties.sh
 
       - name: Build Termux packages
         working-directory: tmp/termux-packages
