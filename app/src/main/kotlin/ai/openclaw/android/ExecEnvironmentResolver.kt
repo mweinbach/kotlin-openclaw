@@ -46,6 +46,7 @@ class ExecEnvironmentResolver(
         workspaceDir: String,
         managedNodePath: String? = null,
         managedPathPrepend: List<String> = emptyList(),
+        managedEnvironmentOverrides: Map<String, String> = emptyMap(),
     ): ResolvedExecEnvironment = withContext(Dispatchers.IO) {
         val inherited = LinkedHashMap(inheritedEnvProvider())
         val shellPath = detectShellPath(inherited)
@@ -65,6 +66,7 @@ class ExecEnvironmentResolver(
         val merged = LinkedHashMap<String, String>()
         merged.putAll(inherited)
         merged.putAll(shellEnv)
+        merged.putAll(managedEnvironmentOverrides)
         merged.putAll(config.env?.vars.orEmpty())
 
         val prependEntries = mutableListOf<String>()

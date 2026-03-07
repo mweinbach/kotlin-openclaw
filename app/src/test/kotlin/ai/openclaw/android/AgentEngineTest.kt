@@ -266,6 +266,56 @@ class AgentEngineTest {
     }
 
     @Test
+    fun `configureManagedNodeCustomBundle persists bundle config and marks toolchain supported`() = runTest {
+        val downloadUrl = "https://example.test/node-android-arm64.tar.xz"
+        val sha256 = "a".repeat(64)
+
+        engine.configureManagedNodeCustomBundle(
+            downloadUrl = downloadUrl,
+            sha256 = sha256,
+        )
+
+        val savedConfig = engine.currentManagedNodeToolchainConfig()
+        val status = engine.currentToolchainStatus()
+
+        assertEquals(downloadUrl, savedConfig.downloadUrl)
+        assertEquals(sha256, savedConfig.sha256)
+        assertTrue(status.nodeSupported)
+    }
+
+    @Test
+    fun `currentToolchainStatus reports android release bundle support on arm64`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val arm64Engine = AgentEngine(context) { ctx, client ->
+            ManagedToolchainManager(
+                context = ctx,
+                client = client,
+                platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+            )
+        }
+
+        val status = arm64Engine.currentToolchainStatus()
+
+        assertTrue(status.nodeSupported)
+        assertTrue(status.nodeMessage?.contains("GitHub Releases") == true)
+    }
+
+    @Test
+    fun `clearManagedNodeCustomBundle removes saved bundle config`() = runTest {
+        engine.configureManagedNodeCustomBundle(
+            downloadUrl = "https://example.test/node-android-arm64.tar.xz",
+            sha256 = "b".repeat(64),
+        )
+
+        engine.clearManagedNodeCustomBundle()
+
+        val savedConfig = engine.currentManagedNodeToolchainConfig()
+
+        assertEquals(null, savedConfig.downloadUrl)
+        assertEquals(null, savedConfig.sha256)
+    }
+
+    @Test
     fun `startBackgroundRuntime starts gateway owned channels and stopBackgroundRuntime stops them`() = runTest {
         engine.saveConfig(
             OpenClawConfig(

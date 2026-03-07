@@ -37,7 +37,9 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
         val availableBins: List<String> = emptyList(),
         val missingEssentialBins: List<String> = emptyList(),
         val missingRecommendedBins: List<String> = emptyList(),
-        val toolchainInstallInProgress: Boolean = false,
+        val customNodeDownloadUrl: String? = null,
+        val customNodeSha256: String? = null,
+        val toolchainActionInProgress: Boolean = false,
         val lastError: String? = null,
     )
 
@@ -63,6 +65,7 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
                 val cronJobs = engine.cronScheduler.list()
                 val plugins = engine.pluginRegistry.allRecords()
                 val toolchainStatus = engine.currentToolchainStatus()
+                val managedNodeConfig = engine.currentManagedNodeToolchainConfig()
 
                 DashboardState(
                     backgroundRuntimeActive = engine.isBackgroundRuntimeActive(),
@@ -86,7 +89,9 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
                     availableBins = toolchainStatus.availableBins,
                     missingEssentialBins = toolchainStatus.missingEssentialBins,
                     missingRecommendedBins = toolchainStatus.missingRecommendedBins,
-                    toolchainInstallInProgress = _state.value.toolchainInstallInProgress,
+                    customNodeDownloadUrl = managedNodeConfig.downloadUrl,
+                    customNodeSha256 = managedNodeConfig.sha256,
+                    toolchainActionInProgress = _state.value.toolchainActionInProgress,
                     lastError = null,
                 )
             }.onSuccess { freshState ->
@@ -99,16 +104,58 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
 
     fun installManagedNode() {
         viewModelScope.launch(Dispatchers.IO) {
-            _state.value = _state.value.copy(toolchainInstallInProgress = true, lastError = null)
+            _state.value = _state.value.copy(toolchainActionInProgress = true, lastError = null)
             runCatching {
                 engine.installManagedNode()
             }.onFailure { error ->
                 _state.value = _state.value.copy(
-                    toolchainInstallInProgress = false,
+                    toolchainActionInProgress = false,
                     lastError = error.message ?: "Managed Node install failed",
                 )
             }.onSuccess {
-                _state.value = _state.value.copy(toolchainInstallInProgress = false)
+                _state.value = _state.value.copy(toolchainActionInProgress = false)
+                refresh()
+            }
+        }
+    }
+
+    fun saveCustomManagedNodeBundle(
+        downloadUrl: String,
+        sha256: String,
+        installAfterSave: Boolean,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.value = _state.value.copy(toolchainActionInProgress = true, lastError = null)
+            runCatching {
+                engine.configureManagedNodeCustomBundle(
+                    downloadUrl = downloadUrl,
+                    sha256 = sha256,
+                    installAfterSave = installAfterSave,
+                )
+            }.onFailure { error ->
+                _state.value = _state.value.copy(
+                    toolchainActionInProgress = false,
+                    lastError = error.message ?: "Failed to save custom Node bundle",
+                )
+            }.onSuccess {
+                _state.value = _state.value.copy(toolchainActionInProgress = false)
+                refresh()
+            }
+        }
+    }
+
+    fun clearCustomManagedNodeBundle() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.value = _state.value.copy(toolchainActionInProgress = true, lastError = null)
+            runCatching {
+                engine.clearManagedNodeCustomBundle()
+            }.onFailure { error ->
+                _state.value = _state.value.copy(
+                    toolchainActionInProgress = false,
+                    lastError = error.message ?: "Failed to clear custom Node bundle",
+                )
+            }.onSuccess {
+                _state.value = _state.value.copy(toolchainActionInProgress = false)
                 refresh()
             }
         }

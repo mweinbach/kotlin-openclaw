@@ -9,6 +9,8 @@ import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
+import org.tukaani.xz.LZMA2Options
+import org.tukaani.xz.XZOutputStream
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -32,6 +34,8 @@ class ManagedToolchainManagerTest {
     fun setup() {
         context = ApplicationProvider.getApplicationContext()
         context.filesDir.resolve("toolchains").deleteRecursively()
+        context.filesDir.resolve("usr").deleteRecursively()
+        context.filesDir.resolve("home").deleteRecursively()
     }
 
     @Test
@@ -118,6 +122,7 @@ class ManagedToolchainManagerTest {
             workspaceDir = context.filesDir.absolutePath,
             managedNodePath = activation.nodePath,
             managedPathPrepend = activation.prependPaths,
+            managedEnvironmentOverrides = activation.environmentOverrides,
         )
         val status = manager.buildStatus(activation, resolved)
 
@@ -178,6 +183,151 @@ class ManagedToolchainManagerTest {
         assertTrue(activation.prependPaths.isNotEmpty())
     }
 
+    @Test
+    fun `prepare reports android github release support when no custom bundle is configured`() = runTest {
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+            platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+        )
+
+        val activation = manager.prepare(OpenClawConfig())
+
+        assertTrue(activation.nodeSupported)
+        assertTrue(activation.nodeMessage?.contains("GitHub Releases") == true)
+    }
+
+    @Test
+    fun `installNode supports official linux tar xz archives`() = runTest {
+        val version = "v22.22.0"
+        val archiveName = "node-$version-linux-x64.tar.xz"
+        val archiveBytes = createTarXzArchive(
+            entries = listOf(
+                TarEntry(
+                    path = "node-$version-linux-x64/bin/node",
+                    content = "#!/bin/sh\necho $version\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+            ),
+        )
+        val sha256 = sha256(archiveBytes)
+        val baseUrl = "https://example.test/dist"
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+            platformDetector = { ToolchainPlatform(os = "linux", arch = "x64") },
+            downloadToFile = { url, target ->
+                assertEquals("$baseUrl/$version/$archiveName", url)
+                target.writeBytes(archiveBytes)
+            },
+            downloadText = { url ->
+                assertEquals("$baseUrl/$version/SHASUMS256.txt", url)
+                "$sha256  $archiveName\n"
+            },
+            nowProvider = { Instant.parse("2026-03-07T00:00:00Z") },
+        )
+        val config = OpenClawConfig(
+            tools = ExpandedToolsConfig(
+                exec = ExecToolConfig(
+                    managed = ManagedExecToolchainsConfig(
+                        node = ManagedNodeToolchainConfig(
+                            version = version.removePrefix("v"),
+                            baseUrl = baseUrl,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val activation = manager.installNode(config)
+
+        assertTrue(activation.nodeSupported)
+        assertNotNull(activation.nodePath)
+        assertTrue(File(activation.nodePath!!).exists())
+    }
+
+    @Test
+    fun `installNode installs android bundle into app prefix and exports runtime env`() = runTest {
+        val version = "v25.3.0"
+        val archiveName = "openclaw-node-$version-android-arm64.tar.xz"
+        val archiveBytes = createTarXzArchive(
+            entries = listOf(
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/bin/node",
+                    content = "#!/bin/sh\necho $version\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    content = "console.log('npm');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/npm/bin/npx-cli.js",
+                    content = "console.log('npx');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/corepack/dist/corepack.js",
+                    content = "console.log('corepack');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/etc/tls/cert.pem",
+                    content = "cert".toByteArray(),
+                ),
+            ),
+        )
+        val sha256 = sha256(archiveBytes)
+        val baseUrl = "https://example.test/releases/download/toolchain-node-android-arm64"
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+            platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+            downloadToFile = { url, target ->
+                assertEquals("$baseUrl/$archiveName", url)
+                target.writeBytes(archiveBytes)
+            },
+            downloadText = { url ->
+                assertEquals("$baseUrl/$archiveName.sha256", url)
+                "$sha256  $archiveName\n"
+            },
+            nowProvider = { Instant.parse("2026-03-07T00:00:00Z") },
+        )
+        val config = OpenClawConfig(
+            tools = ExpandedToolsConfig(
+                exec = ExecToolConfig(
+                    managed = ManagedExecToolchainsConfig(
+                        node = ManagedNodeToolchainConfig(
+                            version = version.removePrefix("v"),
+                            baseUrl = baseUrl,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val activation = manager.installNode(config)
+        val nodePath = activation.nodePath
+        assertNotNull(nodePath)
+        assertEquals(context.filesDir.resolve("usr/bin/node").absolutePath, nodePath)
+        assertTrue(context.filesDir.resolve("usr/bin/sh").exists())
+        assertTrue(context.filesDir.resolve("usr/bin/env").exists())
+        assertTrue(context.filesDir.resolve("home").isDirectory)
+
+        val resolved = ExecEnvironmentResolver().resolve(
+            config = config,
+            workspaceDir = context.filesDir.absolutePath,
+            managedNodePath = activation.nodePath,
+            managedPathPrepend = activation.prependPaths,
+            managedEnvironmentOverrides = activation.environmentOverrides,
+        )
+
+        assertEquals(context.filesDir.resolve("usr").absolutePath, resolved.environment["PREFIX"])
+        assertEquals(context.filesDir.resolve("home").absolutePath, resolved.environment["HOME"])
+        assertEquals(context.filesDir.resolve("usr/tmp").absolutePath, resolved.environment["TMPDIR"])
+        assertEquals(context.filesDir.resolve("usr/lib").absolutePath, resolved.environment["LD_LIBRARY_PATH"])
+        assertEquals(context.filesDir.resolve("usr/etc/tls/cert.pem").absolutePath, resolved.environment["SSL_CERT_FILE"])
+        assertTrue(resolved.nodePath?.endsWith("/usr/bin/node") == true)
+    }
+
     private data class TarEntry(
         val path: String,
         val content: ByteArray,
@@ -187,26 +337,41 @@ class ManagedToolchainManagerTest {
     private fun createTarGzArchive(entries: List<TarEntry>): ByteArray {
         val out = ByteArrayOutputStream()
         GZIPOutputStream(out).use { gzip ->
-            for (entry in entries) {
-                writeTarHeader(
-                    output = gzip,
-                    path = entry.path,
-                    size = entry.content.size.toLong(),
-                    mode = entry.mode.toLong(),
-                )
-                gzip.write(entry.content)
-                val padding = ((512 - (entry.content.size % 512)) % 512)
-                if (padding > 0) {
-                    gzip.write(ByteArray(padding))
-                }
-            }
-            gzip.write(ByteArray(1024))
+            writeTarArchive(gzip, entries)
         }
         return out.toByteArray()
     }
 
+    private fun createTarXzArchive(entries: List<TarEntry>): ByteArray {
+        val out = ByteArrayOutputStream()
+        XZOutputStream(out, LZMA2Options()).use { xz ->
+            writeTarArchive(xz, entries)
+        }
+        return out.toByteArray()
+    }
+
+    private fun writeTarArchive(
+        output: java.io.OutputStream,
+        entries: List<TarEntry>,
+    ) {
+        for (entry in entries) {
+            writeTarHeader(
+                output = output,
+                path = entry.path,
+                size = entry.content.size.toLong(),
+                mode = entry.mode.toLong(),
+            )
+            output.write(entry.content)
+            val padding = ((512 - (entry.content.size % 512)) % 512)
+            if (padding > 0) {
+                output.write(ByteArray(padding))
+            }
+        }
+        output.write(ByteArray(1024))
+    }
+
     private fun writeTarHeader(
-        output: GZIPOutputStream,
+        output: java.io.OutputStream,
         path: String,
         size: Long,
         mode: Long,

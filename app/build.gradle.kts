@@ -126,6 +126,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
+    implementation("org.tukaani:xz:1.9")
 
     // Testing
     testImplementation(libs.junit)

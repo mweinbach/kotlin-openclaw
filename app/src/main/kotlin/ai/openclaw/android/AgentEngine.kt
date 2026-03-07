@@ -29,6 +29,8 @@ import ai.openclaw.core.model.ChannelsConfig
 import ai.openclaw.core.model.ChatType
 import ai.openclaw.core.model.DiscordAccountConfig
 import ai.openclaw.core.model.DiscordConfig
+import ai.openclaw.core.model.ExecToolConfig
+import ai.openclaw.core.model.ExpandedToolsConfig
 import ai.openclaw.core.model.GoogleChatAccountConfig
 import ai.openclaw.core.model.GoogleChatConfig
 import ai.openclaw.core.model.IMessageConfig
@@ -44,6 +46,8 @@ import ai.openclaw.core.model.MattermostConfig
 import ai.openclaw.core.model.ModelProviderAuthMode
 import ai.openclaw.core.model.ModelDefinitionConfig
 import ai.openclaw.core.model.ModelProviderConfig
+import ai.openclaw.core.model.ManagedExecToolchainsConfig
+import ai.openclaw.core.model.ManagedNodeToolchainConfig
 import ai.openclaw.core.model.NostrAccountConfig
 import ai.openclaw.core.model.NostrConfig
 import ai.openclaw.core.model.OpenClawConfig
@@ -294,6 +298,82 @@ class AgentEngine(
             ensureConfigLoaded()
             managedToolchainActivation = managedToolchainManager.installNode(config)
             refreshExecEnvironment()
+            return managedToolchainStatus
+        }
+    }
+
+    suspend fun currentManagedNodeToolchainConfig(): ManagedNodeToolchainConfig {
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            return config.tools?.exec?.managed?.node ?: ManagedNodeToolchainConfig()
+        }
+    }
+
+    suspend fun configureManagedNodeCustomBundle(
+        downloadUrl: String,
+        sha256: String,
+        installAfterSave: Boolean = false,
+    ): ManagedToolchainStatus {
+        val normalizedUrl = downloadUrl.trim()
+        val normalizedSha = sha256.trim().lowercase()
+        require(normalizedUrl.isNotEmpty()) { "Download URL cannot be blank" }
+        require(normalizedUrl.startsWith("https://") || normalizedUrl.startsWith("http://")) {
+            "Download URL must start with http:// or https://"
+        }
+        require(SHA256_HEX.matches(normalizedSha)) {
+            "SHA-256 must be exactly 64 hexadecimal characters"
+        }
+
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            val currentTools = config.tools ?: ExpandedToolsConfig()
+            val currentExec = currentTools.exec ?: ExecToolConfig()
+            val currentManaged = currentExec.managed ?: ManagedExecToolchainsConfig()
+            val currentNode = currentManaged.node ?: ManagedNodeToolchainConfig()
+            val updatedNode = currentNode.copy(
+                downloadUrl = normalizedUrl,
+                sha256 = normalizedSha,
+            )
+            saveConfigInternal(
+                config.copy(
+                    tools = currentTools.copy(
+                        exec = currentExec.copy(
+                            managed = currentManaged.copy(node = updatedNode),
+                        ),
+                    ),
+                ),
+            )
+            if (installAfterSave) {
+                managedToolchainActivation = managedToolchainManager.installNode(config)
+                refreshExecEnvironment()
+            }
+            return managedToolchainStatus
+        }
+    }
+
+    suspend fun clearManagedNodeCustomBundle(): ManagedToolchainStatus {
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            val currentTools = config.tools ?: ExpandedToolsConfig()
+            val currentExec = currentTools.exec ?: ExecToolConfig()
+            val currentManaged = currentExec.managed ?: ManagedExecToolchainsConfig()
+            val currentNode = currentManaged.node ?: ManagedNodeToolchainConfig()
+            val updatedNode = currentNode.copy(
+                downloadUrl = null,
+                sha256 = null,
+            )
+            saveConfigInternal(
+                config.copy(
+                    tools = currentTools.copy(
+                        exec = currentExec.copy(
+                            managed = currentManaged.copy(node = updatedNode),
+                        ),
+                    ),
+                ),
+            )
             return managedToolchainStatus
         }
     }
@@ -2370,6 +2450,7 @@ class AgentEngine(
             workspaceDir = terminalWorkingDirectory(),
             managedNodePath = managedToolchainActivation.nodePath,
             managedPathPrepend = managedToolchainActivation.prependPaths,
+            managedEnvironmentOverrides = managedToolchainActivation.environmentOverrides,
         )
         managedToolchainStatus = managedToolchainManager.buildStatus(
             activation = managedToolchainActivation,
@@ -2406,6 +2487,7 @@ class AgentEngine(
         private const val CODEX_ACCOUNT_ID_KEY = "codex_account_id"
         private const val CODEX_EMAIL_KEY = "codex_email"
         private const val CODEX_EXPIRY_MARGIN_MS = 60_000L
+        private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
         private val DEFAULT_PROVIDER_ORDER = listOf(
             "anthropic",
             "openai",

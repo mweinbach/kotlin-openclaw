@@ -41,6 +41,13 @@ fun DashboardScreen(engine: AgentEngine) {
     val scrollState = rememberScrollState()
     var toolbarExpanded by remember { mutableStateOf(true) }
     var contentVisible by remember { mutableStateOf(false) }
+    var showToolchainSetupDetails by remember { mutableStateOf(false) }
+    var customBundleUrl by remember(state.customNodeDownloadUrl) {
+        mutableStateOf(state.customNodeDownloadUrl.orEmpty())
+    }
+    var customBundleSha by remember(state.customNodeSha256) {
+        mutableStateOf(state.customNodeSha256.orEmpty())
+    }
     val haptic = LocalHapticFeedback.current
     val context = LocalContext.current
 
@@ -140,7 +147,7 @@ fun DashboardScreen(engine: AgentEngine) {
                         state.nodeActive && !state.nodeVersion.isNullOrBlank() -> "Node ${state.nodeVersion}"
                         state.nodeActive -> "Node available"
                         state.nodeSupported -> "Node missing"
-                        else -> "Custom Node bundle required"
+                        else -> "Setup required"
                     },
                     trailing = {
                         StatusIndicator(
@@ -195,24 +202,164 @@ fun DashboardScreen(engine: AgentEngine) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (state.nodeSupported) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Button(
-                            enabled = !state.toolchainInstallInProgress,
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    if (!state.customNodeDownloadUrl.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Custom bundle configured.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    val customBundleUrlTrimmed = customBundleUrl.trim()
+                    val customBundleShaTrimmed = customBundleSha.trim().lowercase()
+                    val customBundleValid = customBundleUrlTrimmed.startsWith("https://") ||
+                        customBundleUrlTrimmed.startsWith("http://")
+                    val customBundleShaValid = customBundleShaTrimmed.matches(Regex("^[0-9a-f]{64}$"))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        enabled = !state.toolchainActionInProgress,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (state.nodeSupported) {
                                 viewModel.installManagedNode()
+                            } else {
+                                showToolchainSetupDetails = true
+                            }
+                        },
+                    ) {
+                        Text(
+                            if (state.toolchainActionInProgress) {
+                                "Working..."
+                            } else if (state.nodeInstalled) {
+                                "Reinstall Node"
+                            } else if (state.nodeSupported) {
+                                "Install Node"
+                            } else {
+                                "Setup Node"
                             },
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        enabled = !state.toolchainActionInProgress,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            showToolchainSetupDetails = !showToolchainSetupDetails
+                        },
+                    ) {
+                        Text(
+                            if (showToolchainSetupDetails) {
+                                "Hide Custom Bundle"
+                            } else if (state.customNodeDownloadUrl.isNullOrBlank()) {
+                                "Configure Custom Bundle"
+                            } else {
+                                "Edit Custom Bundle"
+                            },
+                        )
+                    }
+                    if (showToolchainSetupDetails) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        HorizontalDivider()
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "Custom Android Bundle",
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Save a verified Node bundle URL and SHA-256 here. Once saved, this device can use that bundle for managed installs.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "nvm is shell-based and installs desktop/server Node distributions, so it is not a direct on-device Android solution inside the app sandbox.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = customBundleUrl,
+                            onValueChange = { customBundleUrl = it },
+                            label = { Text("Bundle URL") },
+                            placeholder = { Text("https://example.com/node-android-arm64.tar.xz") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !state.toolchainActionInProgress,
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = customBundleSha,
+                            onValueChange = { customBundleSha = it },
+                            label = { Text("SHA-256") },
+                            placeholder = { Text("64 hex characters") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !state.toolchainActionInProgress,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Supported archive types: .zip, .tar.gz, and .tar.xz. The bundle must contain node plus npm/npx/corepack or the standard Node companion scripts.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if ((customBundleUrlTrimmed.isNotEmpty() && !customBundleValid) ||
+                            (customBundleShaTrimmed.isNotEmpty() && !customBundleShaValid)
                         ) {
+                            Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                if (state.toolchainInstallInProgress) {
-                                    "Installing..."
-                                } else if (state.nodeInstalled) {
-                                    "Reinstall Node"
-                                } else {
-                                    "Install Node"
-                                },
+                                text = "Enter an http(s) URL and a 64-character SHA-256 hash.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
                             )
+                        }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                enabled = !state.toolchainActionInProgress &&
+                                    !state.customNodeDownloadUrl.isNullOrBlank(),
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    customBundleUrl = ""
+                                    customBundleSha = ""
+                                    viewModel.clearCustomManagedNodeBundle()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Clear")
+                            }
+                            OutlinedButton(
+                                enabled = !state.toolchainActionInProgress &&
+                                    customBundleValid &&
+                                    customBundleShaValid,
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.saveCustomManagedNodeBundle(
+                                        downloadUrl = customBundleUrlTrimmed,
+                                        sha256 = customBundleShaTrimmed,
+                                        installAfterSave = false,
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Save Setup")
+                            }
+                            Button(
+                                enabled = !state.toolchainActionInProgress &&
+                                    customBundleValid &&
+                                    customBundleShaValid,
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.saveCustomManagedNodeBundle(
+                                        downloadUrl = customBundleUrlTrimmed,
+                                        sha256 = customBundleShaTrimmed,
+                                        installAfterSave = true,
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Save + Install")
+                            }
                         }
                     }
                 }
@@ -332,4 +479,5 @@ fun DashboardScreen(engine: AgentEngine) {
             }
         }
     }
+
 }

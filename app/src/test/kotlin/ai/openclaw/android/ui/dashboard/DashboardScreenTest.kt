@@ -4,6 +4,7 @@ import ai.openclaw.android.AgentEngine
 import android.app.Application
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Before
@@ -28,7 +29,13 @@ class DashboardScreenTest {
         context.filesDir.resolve("config").deleteRecursively()
         context.filesDir.resolve("sessions").deleteRecursively()
         context.filesDir.resolve("cron").deleteRecursively()
-        engine = AgentEngine(context)
+        engine = AgentEngine(context) { ctx, client ->
+            ai.openclaw.android.ManagedToolchainManager(
+                context = ctx,
+                client = client,
+                platformDetector = { ai.openclaw.android.ToolchainPlatform(os = "android", arch = "arm64") },
+            )
+        }
         engine.loadConfig()
     }
 
@@ -85,5 +92,30 @@ class DashboardScreenTest {
         }
 
         composeTestRule.onNodeWithText("Toolchains").assertExists()
+    }
+
+    @Test
+    fun `dashboard screen shows install node action when managed install is available`() {
+        composeTestRule.setContent {
+            ai.openclaw.android.ui.theme.OpenClawTheme {
+                DashboardScreen(engine = engine)
+            }
+        }
+
+        composeTestRule.waitUntil(timeoutMillis = 5_000) {
+            composeTestRule.onAllNodesWithText("Install Node").fetchSemanticsNodes().isNotEmpty()
+        }
+        composeTestRule.onNodeWithText("Install Node").assertExists()
+    }
+
+    @Test
+    fun `dashboard screen shows custom bundle setup action`() {
+        composeTestRule.setContent {
+            ai.openclaw.android.ui.theme.OpenClawTheme {
+                DashboardScreen(engine = engine)
+            }
+        }
+
+        composeTestRule.onNodeWithText("Configure Custom Bundle").assertExists()
     }
 }

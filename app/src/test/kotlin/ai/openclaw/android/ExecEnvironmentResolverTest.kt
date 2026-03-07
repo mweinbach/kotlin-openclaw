@@ -58,6 +58,10 @@ class ExecEnvironmentResolverTest {
                     ),
                 ),
                 workspaceDir = workspaceDir.absolutePath,
+                managedEnvironmentOverrides = mapOf(
+                    "PREFIX" to "/managed/usr",
+                    "HOME" to "/managed/home",
+                ),
             )
 
             val pathEntries = resolved.environment.getValue("PATH").split(File.pathSeparator)
@@ -66,6 +70,8 @@ class ExecEnvironmentResolverTest {
             assertTrue(pathEntries.contains("/shell/bin"))
             assertEquals("1", resolved.environment["FROM_SHELL"])
             assertEquals("bar", resolved.environment["FOO"])
+            assertEquals("/managed/usr", resolved.environment["PREFIX"])
+            assertEquals("/managed/home", resolved.environment["HOME"])
             assertEquals(nodeBinary.absolutePath, resolved.nodePath)
             assertEquals("v18.77.0", resolved.nodeVersion)
             assertEquals("v18.77.0", resolved.environment["NODE_VERSION"])

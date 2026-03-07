@@ -9,6 +9,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.tukaani.xz.XZInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
@@ -52,6 +53,7 @@ data class ToolchainPlatform(
 data class ManagedToolchainActivation(
     val nodePath: String? = null,
     val prependPaths: List<String> = emptyList(),
+    val environmentOverrides: Map<String, String> = emptyMap(),
     val nodeRecord: ManagedNodeInstallRecord? = null,
     val nodeSupported: Boolean = false,
     val nodeMessage: String? = null,
@@ -101,7 +103,7 @@ private data class ManagedNodeInstallRequest(
 )
 
 class ManagedToolchainManager(
-    context: Context,
+    private val context: Context,
     private val client: OkHttpClient,
     private val platformDetector: () -> ToolchainPlatform = { ToolchainPlatform.detect() },
     private val downloadToFile: suspend (url: String, target: File) -> Unit = { url, target ->
@@ -144,9 +146,10 @@ class ManagedToolchainManager(
         ManagedToolchainActivation(
             nodePath = nodeRecord?.nodePath,
             prependPaths = listOfNotNull(nodeRecord?.binDir),
+            environmentOverrides = nodeRecord?.let(::buildEnvironmentOverrides).orEmpty(),
             nodeRecord = nodeRecord,
             nodeSupported = request != null,
-            nodeMessage = nodeMessage,
+            nodeMessage = nodeMessage ?: defaultNodeMessage(request, nodeRecord),
         )
     }
 
@@ -159,6 +162,7 @@ class ManagedToolchainManager(
         ManagedToolchainActivation(
             nodePath = record.nodePath,
             prependPaths = listOf(record.binDir),
+            environmentOverrides = buildEnvironmentOverrides(record),
             nodeRecord = record,
             nodeSupported = true,
             nodeMessage = null,
@@ -203,6 +207,10 @@ class ManagedToolchainManager(
         state: ManagedToolchainState,
     ): ManagedNodeInstallRecord {
         val resolvedRequest = request ?: resolveNodeInstallRequest(config)
+        if (resolvedRequest.platform.os == ANDROID_PLATFORM) {
+            return installAndroidNodeInternal(resolvedRequest, state)
+        }
+
         val existing = state.node
             ?.takeIf(::isRecordUsable)
             ?.takeIf {
@@ -273,6 +281,89 @@ class ManagedToolchainManager(
         return record
     }
 
+    private suspend fun installAndroidNodeInternal(
+        request: ManagedNodeInstallRequest,
+        state: ManagedToolchainState,
+    ): ManagedNodeInstallRecord {
+        val existing = state.node
+            ?.takeIf(::isRecordUsable)
+            ?.takeIf {
+                it.version == request.version &&
+                    it.platform == request.platform.label &&
+                    it.sourceUrl == request.url
+            }
+        if (existing != null) {
+            return existing
+        }
+
+        val archiveFile = downloadsDir.resolve(request.archiveName)
+        val stagingDir = toolchainsDir.resolve("android-node-rootfs.tmp")
+        val finalPrefixDir = context.filesDir.resolve(ANDROID_PREFIX_SUBDIR)
+        val finalHomeDir = context.filesDir.resolve(ANDROID_HOME_SUBDIR)
+
+        stagingDir.deleteRecursively()
+        archiveFile.parentFile?.mkdirs()
+
+        downloadToFile(request.url, archiveFile)
+        val expectedSha = request.sha256
+            ?.takeIf { it.isNotBlank() }
+            ?: fetchSha256(request)
+        val actualSha = sha256(archiveFile)
+        require(actualSha.equals(expectedSha, ignoreCase = true)) {
+            "Managed Node checksum mismatch for ${request.archiveName}"
+        }
+
+        extractArchive(archiveFile, stagingDir)
+        val bundleRoot = locateDistributionRoot(stagingDir)
+        val stagedPrefixDir = locateAndroidPrefixRoot(bundleRoot)
+        val stagedNodeBinary = locateNodeBinary(stagedPrefixDir)
+        require(stagedNodeBinary.exists()) {
+            "Managed Android Node bundle did not produce a node binary"
+        }
+
+        val stagedBinDir = stagedNodeBinary.parentFile
+            ?: error("Managed Android Node bundle is missing a bin directory")
+        ensureExecutable(stagedNodeBinary)
+        ensureNodeCompanionBinaries(stagedPrefixDir, stagedBinDir)
+        ensureAndroidCompatBinaries(stagedBinDir)
+
+        finalPrefixDir.deleteRecursively()
+        require(moveDirectory(stagedPrefixDir, finalPrefixDir)) {
+            "Failed to finalize managed Android Node install"
+        }
+
+        finalHomeDir.mkdirs()
+        finalPrefixDir.resolve("tmp").mkdirs()
+        finalHomeDir.resolve(".npm").mkdirs()
+        finalHomeDir.resolve(".cache/corepack").mkdirs()
+
+        val finalNodeBinary = locateNodeBinary(finalPrefixDir)
+        val finalBinDir = finalNodeBinary.parentFile
+            ?: error("Managed Android Node install is missing a finalized bin directory")
+        ensureNodeCompanionBinaries(finalPrefixDir, finalBinDir)
+        ensureAndroidCompatBinaries(finalBinDir)
+
+        val record = ManagedNodeInstallRecord(
+            version = request.version,
+            platform = request.platform.label,
+            installDir = finalPrefixDir.absolutePath,
+            distRoot = finalPrefixDir.absolutePath,
+            binDir = finalBinDir.absolutePath,
+            nodePath = finalBinDir.resolve("node").absolutePath,
+            npmPath = finalBinDir.resolve("npm").takeIf(File::exists)?.absolutePath,
+            npxPath = finalBinDir.resolve("npx").takeIf(File::exists)?.absolutePath,
+            corepackPath = finalBinDir.resolve("corepack").takeIf(File::exists)?.absolutePath,
+            sourceUrl = request.url,
+            sha256 = actualSha,
+            installedAt = nowProvider().toString(),
+        )
+
+        saveState(state.copy(node = record))
+        archiveFile.delete()
+        stagingDir.deleteRecursively()
+        return record
+    }
+
     private fun resolveNodeInstallRequest(config: OpenClawConfig): ManagedNodeInstallRequest {
         val nodeConfig = config.tools?.exec?.managed?.node
         require(nodeConfig?.enabled != false) {
@@ -297,15 +388,34 @@ class ManagedToolchainManager(
             )
         }
 
-        require(platform.os in setOf("darwin", "linux")) {
-            "No built-in Node bundle for ${platform.label}. Configure tools.exec.managed.node.downloadUrl and sha256."
-        }
-        require(platform.arch in setOf("x64", "arm64")) {
-            "No built-in Node bundle for ${platform.label}. Configure tools.exec.managed.node.downloadUrl and sha256."
+        if (platform.os == ANDROID_PLATFORM) {
+            require(platform.arch == ANDROID_RELEASE_ARCH) {
+                unsupportedBuiltInMessage(platform)
+            }
+            val baseUrl = normalizeBaseUrl(nodeConfig, platform)
+            val archiveName = androidBundleArchiveName(version, platform)
+            return ManagedNodeInstallRequest(
+                version = version,
+                platform = platform,
+                url = "$baseUrl/$archiveName",
+                sha256 = nodeConfig?.sha256?.trim()?.takeIf { it.isNotEmpty() },
+                shasumsUrl = "$baseUrl/$archiveName.sha256",
+                archiveName = archiveName,
+            )
         }
 
-        val baseUrl = normalizeBaseUrl(nodeConfig)
-        val archiveName = "node-$version-${platform.os}-${platform.arch}.tar.gz"
+        require(platform.os in setOf("darwin", "linux")) {
+            unsupportedBuiltInMessage(platform)
+        }
+        require(platform.arch in setOf("x64", "arm64")) {
+            unsupportedBuiltInMessage(platform)
+        }
+
+        val baseUrl = normalizeBaseUrl(nodeConfig, platform)
+        val archiveName = when (platform.os) {
+            "linux" -> "node-$version-${platform.os}-${platform.arch}.tar.xz"
+            else -> "node-$version-${platform.os}-${platform.arch}.tar.gz"
+        }
         return ManagedNodeInstallRequest(
             version = version,
             platform = platform,
@@ -316,8 +426,15 @@ class ManagedToolchainManager(
         )
     }
 
-    private fun normalizeBaseUrl(nodeConfig: ManagedNodeToolchainConfig?): String {
-        val raw = nodeConfig?.baseUrl?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_NODE_BASE_URL
+    private fun normalizeBaseUrl(
+        nodeConfig: ManagedNodeToolchainConfig?,
+        platform: ToolchainPlatform,
+    ): String {
+        val raw = nodeConfig?.baseUrl?.trim()?.takeIf { it.isNotEmpty() }
+            ?: when (platform.os) {
+                ANDROID_PLATFORM -> DEFAULT_ANDROID_NODE_BASE_URL
+                else -> DEFAULT_NODE_BASE_URL
+            }
         return raw.trimEnd('/')
     }
 
@@ -325,10 +442,19 @@ class ManagedToolchainManager(
         val shasumsUrl = request.shasumsUrl
             ?: error("A SHA-256 checksum is required for ${request.archiveName}")
         val checksums = downloadText(shasumsUrl)
-        val line = checksums.lineSequence()
-            .firstOrNull { it.trim().endsWith(request.archiveName) }
-            ?: error("Could not find checksum for ${request.archiveName}")
-        return line.substringBefore(' ').trim()
+        val trimmedLines = checksums.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+        val matchingLine = trimmedLines.firstOrNull { it.endsWith(request.archiveName) }
+        if (matchingLine != null) {
+            return matchingLine.substringBefore(' ').trim()
+        }
+        val singleValue = trimmedLines.singleOrNull()?.substringBefore(' ')?.trim()
+        if (singleValue != null && SHA256_HEX.matches(singleValue)) {
+            return singleValue
+        }
+        error("Could not find checksum for ${request.archiveName}")
     }
 
     private fun loadState(): ManagedToolchainState {
@@ -372,6 +498,7 @@ class ManagedToolchainManager(
         when {
             name.endsWith(".zip") -> unzip(archiveFile, targetDir)
             name.endsWith(".tar.gz") || name.endsWith(".tgz") -> untarGz(archiveFile, targetDir)
+            name.endsWith(".tar.xz") || name.endsWith(".txz") -> untarXz(archiveFile, targetDir)
             else -> error("Unsupported managed toolchain archive: ${archiveFile.name}")
         }
     }
@@ -400,44 +527,66 @@ class ManagedToolchainManager(
 
     private fun untarGz(archiveFile: File, targetDir: File) {
         GZIPInputStream(archiveFile.inputStream().buffered()).use { gzip ->
-            while (true) {
-                val header = ByteArray(TAR_BLOCK_SIZE)
-                val read = gzip.readFully(header)
-                if (read == 0 || header.all { it == 0.toByte() }) break
-                require(read == TAR_BLOCK_SIZE) {
-                    "Truncated tar archive while installing managed Node"
+            untar(gzip, targetDir)
+        }
+    }
+
+    private fun untarXz(archiveFile: File, targetDir: File) {
+        XZInputStream(archiveFile.inputStream().buffered()).use { xz ->
+            untar(xz, targetDir)
+        }
+    }
+
+    private fun untar(input: InputStream, targetDir: File) {
+        while (true) {
+            val header = ByteArray(TAR_BLOCK_SIZE)
+            val read = input.readFully(header)
+            if (read == 0 || header.all { it == 0.toByte() }) break
+            require(read == TAR_BLOCK_SIZE) {
+                "Truncated tar archive while installing managed Node"
+            }
+
+            val name = parseTarString(header, 0, 100)
+            if (name.isBlank()) break
+            val prefix = parseTarString(header, 345, 155)
+            val fullName = listOf(prefix, name).filter { it.isNotBlank() }.joinToString("/")
+            val typeFlag = header[156].toInt().toChar()
+            val size = parseTarOctal(header, 124, 12)
+            val mode = parseTarOctal(header, 100, 8)
+            val output = safeExtractFile(targetDir, fullName)
+
+            when (typeFlag) {
+                '5' -> output.mkdirs()
+                '2' -> {
+                    skipFully(input, size)
                 }
-
-                val name = parseTarString(header, 0, 100)
-                if (name.isBlank()) break
-                val prefix = parseTarString(header, 345, 155)
-                val fullName = listOf(prefix, name).filter { it.isNotBlank() }.joinToString("/")
-                val typeFlag = header[156].toInt().toChar()
-                val size = parseTarOctal(header, 124, 12)
-                val mode = parseTarOctal(header, 100, 8)
-                val output = safeExtractFile(targetDir, fullName)
-
-                when (typeFlag) {
-                    '5' -> output.mkdirs()
-                    '2' -> {
-                        skipFully(gzip, size)
+                else -> {
+                    output.parentFile?.mkdirs()
+                    output.outputStream().buffered().use { sink ->
+                        copyFixed(input, sink, size)
                     }
-                    else -> {
-                        output.parentFile?.mkdirs()
-                        output.outputStream().buffered().use { sink ->
-                            copyFixed(gzip, sink, size)
-                        }
-                        if ((mode and 0b001_001_001L) != 0L || output.parentFile?.name == "bin") {
-                            ensureExecutable(output)
-                        }
+                    if ((mode and 0b001_001_001L) != 0L || output.parentFile?.name == "bin") {
+                        ensureExecutable(output)
                     }
-                }
-
-                val padding = ((TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE).toInt()
-                if (padding > 0) {
-                    skipFully(gzip, padding.toLong())
                 }
             }
+
+            val padding = ((TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE).toInt()
+            if (padding > 0) {
+                skipFully(input, padding.toLong())
+            }
+        }
+    }
+
+    private fun unsupportedBuiltInMessage(platform: ToolchainPlatform): String {
+        return if (platform.os == "android") {
+            if (platform.arch == ANDROID_RELEASE_ARCH) {
+                "OpenClaw publishes a managed Android Node bundle for ${platform.label}. Publish the GitHub release asset or configure tools.exec.managed.node.downloadUrl and sha256 for a custom bundle."
+            } else {
+                "OpenClaw only publishes a built-in Android Node bundle for android-$ANDROID_RELEASE_ARCH. Configure tools.exec.managed.node.downloadUrl and sha256 for a custom ${platform.label} bundle."
+            }
+        } else {
+            "No built-in Node bundle for ${platform.label}. Configure tools.exec.managed.node.downloadUrl and sha256."
         }
     }
 
@@ -458,6 +607,16 @@ class ManagedToolchainManager(
         val rootNode = distRoot.resolve("node")
         if (rootNode.exists()) return rootNode
         error("Managed Node install is missing a node binary under ${distRoot.absolutePath}")
+    }
+
+    private fun locateAndroidPrefixRoot(root: File): File {
+        val nestedPrefix = root.resolve(ANDROID_PREFIX_SUBDIR)
+        if (nestedPrefix.resolve("bin/node").exists()) return nestedPrefix
+        if (root.resolve("bin/node").exists()) return root
+        error(
+            "Managed Android Node bundle must contain $ANDROID_PREFIX_SUBDIR/bin/node " +
+                "under ${root.absolutePath}",
+        )
     }
 
     private fun ensureNodeCompanionBinaries(distRoot: File, binDir: File) {
@@ -483,6 +642,34 @@ class ManagedToolchainManager(
                 ensureExecutable(binFile)
             }
         }
+    }
+
+    private fun ensureAndroidCompatBinaries(binDir: File) {
+        ensureProxyBinary(binDir.resolve("sh"), "/system/bin/sh")
+        ensureProxyBinary(binDir.resolve("env"), "/system/bin/env")
+    }
+
+    private fun ensureProxyBinary(target: File, delegatePath: String) {
+        if (!target.exists()) {
+            target.parentFile?.mkdirs()
+            target.writeText(
+                """
+                #!/system/bin/sh
+                exec $delegatePath "${'$'}@"
+                """.trimIndent(),
+            )
+        }
+        ensureExecutable(target)
+    }
+
+    private fun moveDirectory(source: File, destination: File): Boolean {
+        destination.parentFile?.mkdirs()
+        if (source.renameTo(destination)) {
+            return true
+        }
+        if (!source.exists()) return false
+        source.copyRecursively(destination, overwrite = true)
+        return source.deleteRecursively()
     }
 
     private fun safeExtractFile(root: File, entryName: String): File {
@@ -566,12 +753,66 @@ class ManagedToolchainManager(
         }
     }
 
+    private fun buildEnvironmentOverrides(record: ManagedNodeInstallRecord): Map<String, String> {
+        if (!record.platform.startsWith("$ANDROID_PLATFORM-")) {
+            return emptyMap()
+        }
+
+        val prefixDir = File(record.distRoot)
+        val homeDir = context.filesDir.resolve(ANDROID_HOME_SUBDIR)
+        val tmpDir = prefixDir.resolve("tmp")
+        val certFile = prefixDir.resolve("etc/tls/cert.pem")
+        val npmCacheDir = homeDir.resolve(".npm")
+        val corepackHomeDir = homeDir.resolve(".cache/corepack")
+        return buildMap {
+            put("PREFIX", prefixDir.absolutePath)
+            put("TERMUX_PREFIX", prefixDir.absolutePath)
+            put("HOME", homeDir.absolutePath)
+            put("TMPDIR", tmpDir.absolutePath)
+            put("LD_LIBRARY_PATH", prefixDir.resolve("lib").absolutePath)
+            put("npm_config_cache", npmCacheDir.absolutePath)
+            put("COREPACK_HOME", corepackHomeDir.absolutePath)
+            if (certFile.exists()) {
+                put("SSL_CERT_FILE", certFile.absolutePath)
+                put("NODE_EXTRA_CA_CERTS", certFile.absolutePath)
+            }
+        }
+    }
+
+    private fun defaultNodeMessage(
+        request: ManagedNodeInstallRequest?,
+        nodeRecord: ManagedNodeInstallRecord?,
+    ): String? {
+        if (nodeRecord != null || request == null) {
+            return null
+        }
+        return if (request.platform.os == ANDROID_PLATFORM) {
+            "Managed Android Node bundle available from OpenClaw GitHub Releases."
+        } else {
+            null
+        }
+    }
+
     companion object {
-        private const val DEFAULT_NODE_VERSION = "v22.22.0"
+        private const val DEFAULT_NODE_VERSION = "v25.3.0"
         private const val DEFAULT_NODE_BASE_URL = "https://nodejs.org/dist"
+        private const val DEFAULT_ANDROID_NODE_BASE_URL =
+            "https://github.com/mweinbach/kotlin-openclaw/releases/download/toolchain-node-android-arm64"
+        private const val ANDROID_PLATFORM = "android"
+        private const val ANDROID_RELEASE_ARCH = "arm64"
+        private const val ANDROID_PREFIX_SUBDIR = "usr"
+        private const val ANDROID_HOME_SUBDIR = "home"
         private const val TAR_BLOCK_SIZE = 512
         private val ESSENTIAL_JS_BINS = listOf("node", "npm", "npx", "corepack")
         private val RECOMMENDED_HOST_BINS = listOf("git", "rg")
+        private val SHA256_HEX = Regex("^[0-9a-fA-F]{64}$")
+
+        private fun androidBundleArchiveName(
+            version: String,
+            platform: ToolchainPlatform,
+        ): String {
+            return "openclaw-node-$version-${platform.os}-${platform.arch}.tar.xz"
+        }
 
         private suspend fun defaultDownloadToFile(
             client: OkHttpClient,
