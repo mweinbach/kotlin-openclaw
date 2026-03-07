@@ -9,7 +9,7 @@ COREPACK_VERSION="${COREPACK_VERSION:-0.34.6}"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-mweinbach/kotlin-openclaw}"
 RELEASE_TAG="${RELEASE_TAG:-toolchain-node-android-arm64}"
 MANIFEST_NAME="${MANIFEST_NAME:-openclaw-node-android-arm64.json}"
-RUNTIME_PACKAGES="${RUNTIME_PACKAGES:-nodejs npm libc++ openssl c-ares libicu libsqlite zlib ca-certificates resolv-conf}"
+RUNTIME_PACKAGES="${RUNTIME_PACKAGES:-nodejs npm ripgrep libc++ openssl c-ares libicu libsqlite zlib ca-certificates resolv-conf pcre2}"
 
 PACKAGE_PREFIX="data/data/${ANDROID_PACKAGE_NAME}/files"
 ROOTFS_PREFIX="/data/data/${ANDROID_PACKAGE_NAME}/files"
