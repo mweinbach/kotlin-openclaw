@@ -4,17 +4,59 @@ import android.content.Context
 import android.net.Uri
 import ai.openclaw.android.auth.CodexOauthManager
 import ai.openclaw.android.security.SharedPreferencesSecretStore
+import ai.openclaw.channels.core.ChannelPlugin
+import ai.openclaw.channels.discord.DiscordChannel
+import ai.openclaw.channels.irc.IrcChannel
+import ai.openclaw.channels.line.LineChannel
+import ai.openclaw.channels.mattermost.MattermostChannel
+import ai.openclaw.channels.matrix.MatrixChannel
+import ai.openclaw.channels.msteams.MSTeamsChannel
+import ai.openclaw.channels.nostr.NostrChannel
+import ai.openclaw.channels.signal.SignalChannel
+import ai.openclaw.channels.slack.SlackChannel
+import ai.openclaw.channels.telegram.TelegramChannel
+import ai.openclaw.channels.webchat.WebChatChannel
 import ai.openclaw.core.agent.LlmMessage
 import ai.openclaw.core.model.AcpRuntimeEvent
+import ai.openclaw.core.model.AppRuntimeConfig
 import ai.openclaw.core.model.AgentConfig
 import ai.openclaw.core.model.AgentDefaultsConfig
 import ai.openclaw.core.model.AgentModelConfig
 import ai.openclaw.core.model.AgentsConfig
 import ai.openclaw.core.model.AuthProfileConfig
+import ai.openclaw.core.model.ChannelId
+import ai.openclaw.core.model.ChannelsConfig
+import ai.openclaw.core.model.ChatType
+import ai.openclaw.core.model.DiscordAccountConfig
+import ai.openclaw.core.model.DiscordConfig
+import ai.openclaw.core.model.GoogleChatAccountConfig
+import ai.openclaw.core.model.GoogleChatConfig
+import ai.openclaw.core.model.IMessageConfig
+import ai.openclaw.core.model.InboundMessage
+import ai.openclaw.core.model.IrcAccountConfig
+import ai.openclaw.core.model.IrcConfig
+import ai.openclaw.core.model.LineAccountConfig
+import ai.openclaw.core.model.LineConfig
+import ai.openclaw.core.model.MatrixConfig
+import ai.openclaw.core.model.MSTeamsConfig
+import ai.openclaw.core.model.MattermostAccountConfig
+import ai.openclaw.core.model.MattermostConfig
 import ai.openclaw.core.model.ModelProviderAuthMode
+import ai.openclaw.core.model.ModelDefinitionConfig
 import ai.openclaw.core.model.ModelProviderConfig
+import ai.openclaw.core.model.NostrAccountConfig
+import ai.openclaw.core.model.NostrConfig
 import ai.openclaw.core.model.OpenClawConfig
+import ai.openclaw.core.model.OutboundMessage
 import ai.openclaw.core.model.SecretInput
+import ai.openclaw.core.model.SignalAccountConfig
+import ai.openclaw.core.model.SignalConfig
+import ai.openclaw.core.model.SlackAccountConfig
+import ai.openclaw.core.model.SlackConfig
+import ai.openclaw.core.model.TelegramAccountConfig
+import ai.openclaw.core.model.TelegramConfig
+import ai.openclaw.core.model.WebChatConfig
+import ai.openclaw.core.model.WhatsAppConfig
 import ai.openclaw.core.model.DEFAULT_AGENT_ID
 import ai.openclaw.core.plugins.BeforeAgentStartEvent
 import ai.openclaw.core.plugins.BeforeModelResolveEvent
@@ -51,6 +93,7 @@ import ai.openclaw.runtime.engine.TranscriptRepairPolicy
 import ai.openclaw.runtime.engine.ToolLoopDetector
 import ai.openclaw.runtime.engine.ToolRegistry
 import ai.openclaw.runtime.engine.tools.CodingToolsModule
+import ai.openclaw.runtime.engine.tools.runtime.ProcessRegistry
 import ai.openclaw.runtime.gateway.ChannelManager
 import ai.openclaw.runtime.gateway.GatewayServer
 import ai.openclaw.runtime.memory.MemoryManager
@@ -72,23 +115,42 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
 
 /**
  * Central engine wiring all OpenClaw subsystems together.
  */
-class AgentEngine(private val context: Context) {
+class AgentEngine(
+    private val context: Context,
+    managedToolchainManagerFactory: (Context, OkHttpClient) -> ManagedToolchainManager = { ctx, client ->
+        ManagedToolchainManager(ctx, client = client)
+    },
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val initMutex = Mutex()
 
     private var initialized = false
     private var pluginsStarted = false
     private var cronStarted = false
+    private var backgroundRuntimeActive = false
 
     private var gatewayHost: String = DEFAULT_GATEWAY_HOST
     private var gatewayPort: Int = DEFAULT_GATEWAY_PORT
     private var gatewayServerInternal: GatewayServer? = null
     private val codexOauthManager by lazy { CodexOauthManager(context.applicationContext) }
     private val _codexOauthEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    private val sharedHttpClient = OkHttpClient()
+    private val gatewayHttpClient = sharedHttpClient.newBuilder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
+    private val managedToolchainManager = managedToolchainManagerFactory(context, sharedHttpClient)
+    private var processRegistry: ProcessRegistry? = null
+    private var defaultStoppedChannelKeys: Set<String> = emptySet()
+    private val execEnvironmentResolver = ExecEnvironmentResolver()
+    private var execEnvironment = ResolvedExecEnvironment.fromSystem()
+    private var managedToolchainActivation = ManagedToolchainActivation()
+    private var managedToolchainStatus = ManagedToolchainStatus()
 
     val providerRegistry = ProviderRegistry()
     val pluginRegistry = PluginRegistry()
@@ -180,15 +242,79 @@ class AgentEngine(private val context: Context) {
     }
 
     /**
-     * Initialize the engine and background subsystems.
+     * Initialize the foreground engine state without implicitly enabling
+     * long-lived background services.
      */
     suspend fun initialize() {
         initMutex.withLock {
-            if (initialized) return
             ensureStorageStructure()
             ensureConfigLoaded()
-            applyRuntimeConfiguration(notifyPluginReload = false, startGateway = true)
+            applyRuntimeConfiguration(notifyPluginReload = initialized && pluginsStarted)
             initialized = true
+        }
+    }
+
+    suspend fun startBackgroundRuntime() {
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            backgroundRuntimeActive = true
+            applyRuntimeConfiguration(notifyPluginReload = initialized && pluginsStarted)
+            initialized = true
+        }
+    }
+
+    suspend fun stopBackgroundRuntime() {
+        initMutex.withLock {
+            backgroundRuntimeActive = false
+            syncBackgroundRuntimeState()
+        }
+    }
+
+    fun isBackgroundRuntimeActive(): Boolean = backgroundRuntimeActive
+
+    fun isGatewayRunning(): Boolean = gatewayServerInternal?.isRunning == true
+
+    fun currentShellEnvironment(): Map<String, String> = execEnvironment.environment
+
+    fun currentShellPath(): String = execEnvironment.shellPath
+
+    suspend fun currentToolchainStatus(): ManagedToolchainStatus {
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            refreshExecEnvironment()
+            return managedToolchainStatus
+        }
+    }
+
+    suspend fun installManagedNode(): ManagedToolchainStatus {
+        initMutex.withLock {
+            ensureStorageStructure()
+            ensureConfigLoaded()
+            managedToolchainActivation = managedToolchainManager.installNode(config)
+            refreshExecEnvironment()
+            return managedToolchainStatus
+        }
+    }
+
+    fun keepAliveInBackgroundEnabled(): Boolean {
+        ensureConfigLoaded()
+        return config.appRuntime?.keepAliveInBackground == true
+    }
+
+    suspend fun setKeepAliveInBackground(enabled: Boolean) {
+        ensureConfigLoaded()
+        val updatedConfig = config.copy(
+            appRuntime = (config.appRuntime ?: AppRuntimeConfig()).copy(
+                keepAliveInBackground = enabled,
+            ),
+        )
+        initMutex.withLock {
+            if (!enabled) {
+                backgroundRuntimeActive = false
+            }
+            saveConfigInternal(updatedConfig)
         }
     }
 
@@ -200,7 +326,7 @@ class AgentEngine(private val context: Context) {
             initMutex.withLock {
                 ensureStorageStructure()
                 loadConfig()
-                applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
+                applyRuntimeConfiguration(notifyPluginReload = initialized && pluginsStarted)
                 initialized = true
             }
         }
@@ -215,14 +341,23 @@ class AgentEngine(private val context: Context) {
         configLoaded = true
         scope.launch {
             initMutex.withLock {
-                applyRuntimeConfiguration(notifyPluginReload = pluginsStarted, startGateway = true)
+                applyRuntimeConfiguration(notifyPluginReload = initialized && pluginsStarted)
                 initialized = true
             }
         }
     }
 
+    private suspend fun saveConfigInternal(newConfig: OpenClawConfig) {
+        configManager.save(newConfig)
+        config = newConfig
+        configLoaded = true
+        applyRuntimeConfiguration(notifyPluginReload = initialized && pluginsStarted)
+        initialized = true
+    }
+
     data class CodexOauthStatus(
         val tokenSet: Boolean,
+        val apiAccessReady: Boolean,
         val accountId: String?,
         val email: String?,
         val expiresAtMs: Long?,
@@ -251,10 +386,18 @@ class AgentEngine(private val context: Context) {
                 accessToken = session.accessToken,
                 accountId = session.accountId,
                 refreshToken = session.refreshToken,
+                idToken = session.idToken,
                 expiresAtMs = session.expiresAtMs,
                 email = session.email,
+                apiKey = session.apiKey,
             )
-            _codexOauthEvents.tryEmit("Codex OAuth connected.")
+            _codexOauthEvents.tryEmit(
+                if (session.apiKey.isNullOrBlank()) {
+                    "Codex OAuth connected, but API credential exchange was unavailable."
+                } else {
+                    "Codex OAuth connected."
+                },
+            )
             true
         }.getOrElse { error ->
             _codexOauthEvents.tryEmit(error.message ?: "Codex OAuth failed.")
@@ -269,7 +412,9 @@ class AgentEngine(private val context: Context) {
         if (canonical == "openai") {
             secretStore.deleteSecret(CODEX_OAUTH_TOKEN_KEY)
             secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+            secretStore.deleteSecret(CODEX_OAUTH_ID_TOKEN_KEY)
             secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+            secretStore.deleteSecret(CODEX_OAUTH_API_KEY_KEY)
             secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
             secretStore.deleteSecret(CODEX_EMAIL_KEY)
         }
@@ -292,12 +437,8 @@ class AgentEngine(private val context: Context) {
                 profiles = updatedProfiles,
             ),
         )
-        configManager.save(updatedConfig)
-        config = updatedConfig
-
         initMutex.withLock {
-            registerProviders()
-            ensureGatewayServer(startGateway = true)
+            saveConfigInternal(updatedConfig)
             initialized = true
         }
     }
@@ -306,8 +447,10 @@ class AgentEngine(private val context: Context) {
         accessToken: String,
         accountId: String?,
         refreshToken: String? = null,
+        idToken: String? = null,
         expiresAtMs: Long? = null,
         email: String? = null,
+        apiKey: String? = null,
     ) {
         ensureConfigLoaded()
         val token = accessToken.trim()
@@ -316,11 +459,25 @@ class AgentEngine(private val context: Context) {
         secretStore.storeSecret(CODEX_OAUTH_TOKEN_KEY, token, SecretCategory.LLM_API_KEY)
         if (!refreshToken.isNullOrBlank()) {
             secretStore.storeSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY, refreshToken.trim(), SecretCategory.LLM_API_KEY)
+        } else {
+            secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+        }
+        val normalizedIdToken = idToken?.trim().orEmpty()
+        if (normalizedIdToken.isBlank()) {
+            secretStore.deleteSecret(CODEX_OAUTH_ID_TOKEN_KEY)
+        } else {
+            secretStore.storeSecret(CODEX_OAUTH_ID_TOKEN_KEY, normalizedIdToken, SecretCategory.LLM_API_KEY)
         }
         if (expiresAtMs != null && expiresAtMs > 0L) {
             secretStore.storeSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY, expiresAtMs.toString(), SecretCategory.LLM_API_KEY)
         } else {
             secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+        }
+        val normalizedApiKey = apiKey?.trim().orEmpty()
+        if (normalizedApiKey.isBlank()) {
+            secretStore.deleteSecret(CODEX_OAUTH_API_KEY_KEY)
+        } else {
+            secretStore.storeSecret(CODEX_OAUTH_API_KEY_KEY, normalizedApiKey, SecretCategory.LLM_API_KEY)
         }
         val normalizedAccountId = accountId?.trim().orEmpty()
         if (normalizedAccountId.isBlank()) {
@@ -353,12 +510,8 @@ class AgentEngine(private val context: Context) {
                 profiles = updatedProfiles,
             ),
         )
-        configManager.save(updatedConfig)
-        config = updatedConfig
-
         initMutex.withLock {
-            registerProviders()
-            ensureGatewayServer(startGateway = true)
+            saveConfigInternal(updatedConfig)
             initialized = true
         }
     }
@@ -367,7 +520,9 @@ class AgentEngine(private val context: Context) {
         ensureConfigLoaded()
         secretStore.deleteSecret(CODEX_OAUTH_TOKEN_KEY)
         secretStore.deleteSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
+        secretStore.deleteSecret(CODEX_OAUTH_ID_TOKEN_KEY)
         secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+        secretStore.deleteSecret(CODEX_OAUTH_API_KEY_KEY)
         secretStore.deleteSecret(CODEX_ACCOUNT_ID_KEY)
         secretStore.deleteSecret(CODEX_EMAIL_KEY)
 
@@ -378,12 +533,8 @@ class AgentEngine(private val context: Context) {
         }
         val updatedConfig = config.copy(auth = updatedAuth)
 
-        configManager.save(updatedConfig)
-        config = updatedConfig
-
         initMutex.withLock {
-            registerProviders()
-            ensureGatewayServer(startGateway = true)
+            saveConfigInternal(updatedConfig)
             initialized = true
         }
     }
@@ -392,6 +543,7 @@ class AgentEngine(private val context: Context) {
         val expiresAtMs = secretStore.getSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)?.toLongOrNull()
         return CodexOauthStatus(
             tokenSet = secretStore.hasSecret(CODEX_OAUTH_TOKEN_KEY),
+            apiAccessReady = secretStore.hasSecret(CODEX_OAUTH_API_KEY_KEY),
             accountId = secretStore.getSecret(CODEX_ACCOUNT_ID_KEY),
             email = secretStore.getSecret(CODEX_EMAIL_KEY),
             expiresAtMs = expiresAtMs,
@@ -412,12 +564,8 @@ class AgentEngine(private val context: Context) {
         }
         val updatedConfig = config.copy(auth = updatedAuth)
 
-        configManager.save(updatedConfig)
-        config = updatedConfig
-
         initMutex.withLock {
-            registerProviders()
-            ensureGatewayServer(startGateway = true)
+            saveConfigInternal(updatedConfig)
             initialized = true
         }
     }
@@ -447,12 +595,15 @@ class AgentEngine(private val context: Context) {
             pluginsStarted = false
             cronStarted = false
             initialized = false
+            backgroundRuntimeActive = false
 
             providerRegistry.clear()
             toolRegistry.clear()
             sessionToolLoopDetectors.clear()
             sessionHookSessionIds.clear()
             memoryManager.clear()
+            processRegistry?.close()
+            processRegistry = null
 
             runCatching {
                 secretStore.listSecretKeys().forEach { key ->
@@ -469,7 +620,7 @@ class AgentEngine(private val context: Context) {
             configManager.save(config)
             configLoaded = true
 
-            applyRuntimeConfiguration(notifyPluginReload = false, startGateway = true)
+            applyRuntimeConfiguration(notifyPluginReload = false)
             initialized = true
         }
     }
@@ -489,6 +640,22 @@ class AgentEngine(private val context: Context) {
         return agent?.model?.primary
             ?: config.agents?.defaults?.model?.primary
             ?: resolveConfiguredDefaultModel()
+    }
+
+    fun preferredReasoningEffortForAgent(
+        agentId: String = defaultAgentId(),
+        modelId: String? = preferredModelForAgent(agentId),
+    ): String? {
+        ensureConfigLoaded()
+        val agent = resolveAgentConfig(agentId)
+        val configured = agent?.model?.reasoningEffort
+            ?: config.agents?.defaults?.model?.reasoningEffort
+        return normalizeReasoningEffort(modelId, configured)
+    }
+
+    fun availableReasoningEffortsForModel(modelId: String): List<String> {
+        ensureConfigLoaded()
+        return supportedReasoningEfforts(modelId)
     }
 
     fun availableModelIdsForEnabledProviders(): List<String> {
@@ -514,12 +681,12 @@ class AgentEngine(private val context: Context) {
                 canonicalProvider(providerId) == provider && providerConfig.models.isNotEmpty()
             }
             if (!hasConfiguredModels) {
-                defaultModelForProvider(provider)?.let(available::add)
+                available += suggestedModelsForProvider(provider)
             }
         }
 
         if (available.isEmpty()) {
-            val defaults = enabledProviders.mapNotNull(::defaultModelForProvider)
+            val defaults = enabledProviders.flatMap(::suggestedModelsForProvider)
             if (defaults.isNotEmpty()) {
                 available += defaults
             } else {
@@ -533,22 +700,31 @@ class AgentEngine(private val context: Context) {
             .distinct()
     }
 
-    fun setDefaultModel(modelId: String) {
+    fun setDefaultModel(modelId: String, reasoningEffort: String? = preferredReasoningEffortForAgent()) {
         val normalized = modelId.trim()
         require(normalized.isNotEmpty()) { "Model ID cannot be blank" }
 
         val currentAgents = config.agents ?: AgentsConfig()
         val currentDefaults = currentAgents.defaults ?: AgentDefaultsConfig()
         val currentModel = currentDefaults.model ?: AgentModelConfig()
+        val normalizedReasoningEffort = normalizeReasoningEffort(normalized, reasoningEffort)
 
         val updatedConfig = config.copy(
             agents = currentAgents.copy(
                 defaults = currentDefaults.copy(
-                    model = currentModel.copy(primary = normalized),
+                    model = currentModel.copy(
+                        primary = normalized,
+                        reasoningEffort = normalizedReasoningEffort,
+                    ),
                 ),
             ),
         )
         saveConfig(updatedConfig)
+    }
+
+    fun setDefaultReasoningEffort(reasoningEffort: String?) {
+        val currentModel = preferredModelForAgent() ?: defaultModelForProvider("openai") ?: return
+        setDefaultModel(currentModel, reasoningEffort)
     }
 
     fun currentToolNames(): List<String> = toolRegistry.names().sorted()
@@ -703,6 +879,10 @@ class AgentEngine(private val context: Context) {
             val ownerDisplay = resolveOwnerDisplayMode()
             val ownerDisplaySecret = config.commands?.ownerDisplaySecret
             val heartbeatPrompt = resolveHeartbeatPrompt(resolvedAgentId)
+            val reasoningEffort = preferredReasoningEffortForAgent(
+                agentId = resolvedAgentId,
+                modelId = routedModel,
+            )
             runner.runTurn(
                 EmbeddedRunParams(
                     messages = messages,
@@ -725,6 +905,7 @@ class AgentEngine(private val context: Context) {
                     ownerDisplay = ownerDisplay,
                     ownerDisplaySecret = ownerDisplaySecret,
                     reasoningTagHint = resolveReasoningTagHint(routedModel),
+                    reasoningEffort = reasoningEffort,
                     extraSystemPrompt = extraSystemPrompt,
                     contextFiles = contextFiles,
                     bootstrapTruncationWarningLines = bootstrapTruncationWarningLines,
@@ -799,23 +980,27 @@ class AgentEngine(private val context: Context) {
      * Shut down the engine gracefully.
      */
     suspend fun shutdown() {
-        cronScheduler.stop()
-        channelManager.stopAll()
+        backgroundRuntimeActive = false
+        syncBackgroundRuntimeState()
         pluginRegistry.stopAll()
-        gatewayServerInternal?.stop()
+        processRegistry?.close()
+        processRegistry = null
+        gatewayHttpClient.connectionPool.evictAll()
+        sharedHttpClient.connectionPool.evictAll()
+        gatewayHttpClient.dispatcher.executorService.shutdown()
+        sharedHttpClient.dispatcher.executorService.shutdown()
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
     }
 
-    private suspend fun applyRuntimeConfiguration(
-        notifyPluginReload: Boolean,
-        startGateway: Boolean,
-    ) {
+    private suspend fun applyRuntimeConfiguration(notifyPluginReload: Boolean) {
         sessionPersistence.setTranscriptRepairPolicy(
             TranscriptRepairPolicy.fromConfig(config.session?.transcriptRepair),
         )
         sessionToolLoopDetectors.clear()
+        refreshExecEnvironment()
         registerProviders()
         registerTools()
+        registerChannels()
 
         if (!pluginsStarted) {
             runCatching { pluginRegistry.startAll() }
@@ -824,12 +1009,7 @@ class AgentEngine(private val context: Context) {
             runCatching { pluginRegistry.notifyConfigReload() }
         }
 
-        ensureGatewayServer(startGateway = startGateway)
-
-        if (!cronStarted) {
-            runCatching { cronScheduler.start() }
-            cronStarted = true
-        }
+        syncBackgroundRuntimeState()
     }
 
     private suspend fun registerProviders() {
@@ -867,6 +1047,7 @@ class AgentEngine(private val context: Context) {
                     AnthropicProvider(
                         apiKey = apiKey,
                         baseUrl = providerConfig?.baseUrl ?: "https://api.anthropic.com",
+                        client = sharedHttpClient,
                     ),
                 )
             }
@@ -880,6 +1061,7 @@ class AgentEngine(private val context: Context) {
                     OpenAiProvider(
                         apiKey = apiKey,
                         baseUrl = providerConfig?.baseUrl ?: "https://api.openai.com/v1",
+                        client = sharedHttpClient,
                         extraHeaders = resolveOpenAiHeaders(providerConfig),
                     ),
                 )
@@ -895,6 +1077,7 @@ class AgentEngine(private val context: Context) {
                         apiKey = apiKey,
                         baseUrl = providerConfig?.baseUrl
                             ?: "https://generativelanguage.googleapis.com/v1beta",
+                        client = sharedHttpClient,
                     ),
                 )
             }
@@ -908,6 +1091,7 @@ class AgentEngine(private val context: Context) {
                     OllamaProvider(
                         baseUrl = providerConfig?.baseUrl ?: "http://localhost:11434",
                         apiKey = apiKey,
+                        client = sharedHttpClient,
                     ),
                 )
             }
@@ -921,7 +1105,7 @@ class AgentEngine(private val context: Context) {
         resolveSecretInput(providerConfig?.apiKey)?.let { return it }
 
         if (aliases.any { canonicalProvider(it) == "openai" } && shouldUseCodexOauth(providerConfig)) {
-            resolveCodexOauthAccessToken()?.let { return it }
+            resolveCodexOauthApiKey()?.let { return it }
         }
 
         for (provider in aliases) {
@@ -948,21 +1132,36 @@ class AgentEngine(private val context: Context) {
         return null
     }
 
-    private suspend fun resolveCodexOauthAccessToken(): String? {
+    private suspend fun resolveCodexOauthApiKey(): String? {
+        val currentApiKey = secretStore.getSecret(CODEX_OAUTH_API_KEY_KEY)
+            ?.takeIf { it.isNotBlank() }
+        val currentIdToken = secretStore.getSecret(CODEX_OAUTH_ID_TOKEN_KEY)
+            ?.takeIf { it.isNotBlank() }
         val currentToken = secretStore.getSecret(CODEX_OAUTH_TOKEN_KEY)
             ?.takeIf { it.isNotBlank() }
-            ?: return null
+            ?: return currentApiKey
         val expiresAtMs = secretStore.getSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)?.toLongOrNull()
         val now = System.currentTimeMillis()
-        if (expiresAtMs == null || expiresAtMs > now + CODEX_EXPIRY_MARGIN_MS) {
-            return currentToken
+        val tokenFresh = expiresAtMs == null || expiresAtMs > now + CODEX_EXPIRY_MARGIN_MS
+        if (currentApiKey != null && tokenFresh) {
+            return currentApiKey
+        }
+        if (currentApiKey == null && currentIdToken != null && tokenFresh) {
+            return runCatching {
+                codexOauthManager.exchangeApiKeyFromIdToken(currentIdToken).also { apiKey ->
+                    secretStore.storeSecret(CODEX_OAUTH_API_KEY_KEY, apiKey, SecretCategory.LLM_API_KEY)
+                }
+            }.getOrElse {
+                currentApiKey
+            }
         }
 
         val refreshToken = secretStore.getSecret(CODEX_OAUTH_REFRESH_TOKEN_KEY)
             ?.takeIf { it.isNotBlank() }
-            ?: return currentToken
+            ?: return currentApiKey
 
         return runCatching {
+            val previousIdToken = currentIdToken
             val refreshed = codexOauthManager.refreshFromRefreshToken(refreshToken)
             secretStore.storeSecret(CODEX_OAUTH_TOKEN_KEY, refreshed.accessToken, SecretCategory.LLM_API_KEY)
             secretStore.storeSecret(
@@ -970,12 +1169,30 @@ class AgentEngine(private val context: Context) {
                 (refreshed.refreshToken ?: refreshToken),
                 SecretCategory.LLM_API_KEY,
             )
+            val nextIdToken = refreshed.idToken?.trim().orEmpty().ifBlank { previousIdToken.orEmpty() }
+            if (nextIdToken.isBlank()) {
+                secretStore.deleteSecret(CODEX_OAUTH_ID_TOKEN_KEY)
+            } else {
+                secretStore.storeSecret(CODEX_OAUTH_ID_TOKEN_KEY, nextIdToken, SecretCategory.LLM_API_KEY)
+            }
             if (refreshed.expiresAtMs != null && refreshed.expiresAtMs > 0L) {
                 secretStore.storeSecret(
                     CODEX_OAUTH_EXPIRES_AT_MS_KEY,
                     refreshed.expiresAtMs.toString(),
                     SecretCategory.LLM_API_KEY,
                 )
+            } else {
+                secretStore.deleteSecret(CODEX_OAUTH_EXPIRES_AT_MS_KEY)
+            }
+            val refreshedApiKey = refreshed.apiKey
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: nextIdToken.takeIf { it.isNotBlank() }?.let { codexOauthManager.exchangeApiKeyFromIdToken(it) }
+                ?: currentApiKey
+            if (refreshedApiKey.isNullOrBlank()) {
+                secretStore.deleteSecret(CODEX_OAUTH_API_KEY_KEY)
+            } else {
+                secretStore.storeSecret(CODEX_OAUTH_API_KEY_KEY, refreshedApiKey, SecretCategory.LLM_API_KEY)
             }
             val refreshedAccountId = refreshed.accountId?.trim().orEmpty()
             if (refreshedAccountId.isBlank()) {
@@ -990,9 +1207,9 @@ class AgentEngine(private val context: Context) {
                 secretStore.storeSecret(CODEX_EMAIL_KEY, refreshedEmail, SecretCategory.LLM_API_KEY)
             }
             _codexOauthEvents.tryEmit("Codex OAuth token refreshed.")
-            refreshed.accessToken
+            refreshedApiKey
         }.getOrElse {
-            currentToken
+            currentApiKey
         }
     }
 
@@ -1007,19 +1224,10 @@ class AgentEngine(private val context: Context) {
     }
 
     private suspend fun resolveOpenAiHeaders(providerConfig: ModelProviderConfig?): Map<String, String> {
-        val headers = providerConfig?.headers
+        return providerConfig?.headers
             .orEmpty()
             .filterValues { it.isNotBlank() }
             .toMutableMap()
-
-        secretStore.getSecret(CODEX_ACCOUNT_ID_KEY)
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.let { accountId ->
-                headers.putIfAbsent("ChatGPT-Account-ID", accountId)
-            }
-
-        return headers
     }
 
     private suspend fun resolveProfileApiKey(profile: AuthProfileConfig): String? {
@@ -1051,6 +1259,9 @@ class AgentEngine(private val context: Context) {
         val applyPatchConfig = execConfig?.applyPatch
         val applyPatchEnabled = applyPatchConfig?.enabled == true
         val applyPatchWorkspaceOnly = workspaceOnly || applyPatchConfig?.workspaceOnly != false
+        val registry = processRegistry ?: ProcessRegistry(
+            cleanupMs = execConfig?.cleanupMs?.toLong()?.coerceAtLeast(1L) ?: 300_000L,
+        ).also { processRegistry = it }
 
         CodingToolsModule.registerAll(
             registry = toolRegistry,
@@ -1062,7 +1273,10 @@ class AgentEngine(private val context: Context) {
                 execTimeoutSec = execConfig?.timeoutSec?.coerceAtLeast(1) ?: 120,
                 execYieldMs = execConfig?.backgroundMs?.toLong()?.coerceAtLeast(0L) ?: 10_000L,
                 processCleanupMs = execConfig?.cleanupMs?.toLong()?.coerceAtLeast(1L) ?: 300_000L,
+                shellPath = execEnvironment.shellPath,
+                baseEnv = execEnvironment.environment,
             ),
+            processRegistry = registry,
         )
 
         DeviceToolsModule.registerAll(
@@ -1084,6 +1298,371 @@ class AgentEngine(private val context: Context) {
                 },
             ),
         )
+    }
+
+    private suspend fun registerChannels() {
+        channelManager.setInboundHandler(::handleInboundChannelMessage)
+
+        val registrations = mutableListOf<Pair<ChannelManager.ChannelAdapter, String>>()
+        val initiallyStopped = mutableSetOf<String>()
+        val channels = config.channels
+
+        fun markAutoStart(channelId: String, accountId: String, enabled: Boolean?) {
+            if (enabled == false) {
+                initiallyStopped += "$channelId:$accountId"
+            }
+        }
+
+        suspend fun registerTelegram(cfg: TelegramConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to TelegramAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val adapter: ChannelManager.ChannelAdapter = resolveSecretInput(account.botToken)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { token ->
+                        pluginChannelAdapter(
+                            TelegramChannel(
+                                botToken = token,
+                                client = sharedHttpClient,
+                            ),
+                        )
+                    } 
+                    ?: unsupportedChannelAdapter(
+                        channelId = "telegram",
+                        displayName = "Telegram",
+                        reason = "Missing bot token.",
+                    )
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("telegram", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerDiscord(cfg: DiscordConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to DiscordAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val adapter: ChannelManager.ChannelAdapter = resolveSecretInput(account.botToken)
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { token ->
+                        pluginChannelAdapter(
+                            DiscordChannel(
+                                botToken = token,
+                                client = gatewayHttpClient,
+                                intents = resolveDiscordIntents(account),
+                            ),
+                        )
+                    } 
+                    ?: unsupportedChannelAdapter(
+                        channelId = "discord",
+                        displayName = "Discord",
+                        reason = "Missing bot token.",
+                    )
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("discord", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerSlack(cfg: SlackConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to SlackAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val botToken = resolveSecretInput(account.botToken)
+                val appToken = resolveSecretInput(account.appToken)
+                val adapter: ChannelManager.ChannelAdapter = if (!botToken.isNullOrBlank() && !appToken.isNullOrBlank()) {
+                    pluginChannelAdapter(
+                        SlackChannel(
+                            botToken = botToken,
+                            appToken = appToken,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "slack",
+                        displayName = "Slack",
+                        reason = "Missing bot token or app token.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("slack", accountId, cfg.enabled)
+            }
+        }
+
+        fun registerSignal(cfg: SignalConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to SignalAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val apiUrl = account.apiUrl?.takeIf { it.isNotBlank() }
+                val number = account.number?.takeIf { it.isNotBlank() }
+                val adapter: ChannelManager.ChannelAdapter = if (apiUrl != null && number != null) {
+                    pluginChannelAdapter(
+                        SignalChannel(
+                            apiUrl = apiUrl,
+                            number = number,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "signal",
+                        displayName = "Signal",
+                        reason = "Missing API URL or phone number.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("signal", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerMatrix(cfg: MatrixConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to ai.openclaw.core.model.MatrixAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val homeserverUrl = account.homeserverUrl?.takeIf { it.isNotBlank() }
+                val accessToken = resolveSecretInput(account.accessToken)
+                val userId = account.userId?.takeIf { it.isNotBlank() }
+                val adapter: ChannelManager.ChannelAdapter = if (
+                    homeserverUrl != null &&
+                    !accessToken.isNullOrBlank() &&
+                    userId != null
+                ) {
+                    pluginChannelAdapter(
+                        MatrixChannel(
+                            homeserverUrl = homeserverUrl,
+                            accessToken = accessToken,
+                            userId = userId,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "matrix",
+                        displayName = "Matrix",
+                        reason = "Missing homeserver URL, access token, or user ID.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("matrix", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerIrc(cfg: IrcConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to IrcAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val server = account.server?.takeIf { it.isNotBlank() }
+                val nick = account.nick?.takeIf { it.isNotBlank() }
+                val password = resolveSecretInput(account.password)
+                val adapter: ChannelManager.ChannelAdapter = if (server != null && nick != null) {
+                    pluginChannelAdapter(
+                        IrcChannel(
+                            server = server,
+                            port = account.port ?: 6667,
+                            nick = nick,
+                            password = password,
+                            channels = account.channels.orEmpty(),
+                            useTls = account.useTls == true,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "irc",
+                        displayName = "IRC",
+                        reason = "Missing server or nickname.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("irc", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerLine(cfg: LineConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to LineAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val accessToken = resolveSecretInput(account.channelAccessToken)
+                val secret = resolveSecretInput(account.channelSecret)
+                val adapter: ChannelManager.ChannelAdapter = if (!accessToken.isNullOrBlank() && !secret.isNullOrBlank()) {
+                    pluginChannelAdapter(
+                        LineChannel(
+                            channelAccessToken = accessToken,
+                            channelSecret = secret,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "line",
+                        displayName = "LINE",
+                        reason = "Missing channel access token or channel secret.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("line", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerMattermost(cfg: MattermostConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to MattermostAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val serverUrl = account.serverUrl?.takeIf { it.isNotBlank() }
+                val accessToken = resolveSecretInput(account.accessToken)
+                val adapter: ChannelManager.ChannelAdapter = if (serverUrl != null && !accessToken.isNullOrBlank()) {
+                    pluginChannelAdapter(
+                        MattermostChannel(
+                            serverUrl = serverUrl,
+                            accessToken = accessToken,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "mattermost",
+                        displayName = "Mattermost",
+                        reason = "Missing server URL or access token.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("mattermost", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerNostr(cfg: NostrConfig) {
+            val accounts = cfg.accounts.orEmpty().ifEmpty { mapOf("default" to NostrAccountConfig()) }
+            for ((accountId, account) in accounts) {
+                val privateKey = resolveSecretInput(account.privateKey)
+                val relayUrls = account.relayUrls?.takeIf { it.isNotEmpty() }
+                val adapter: ChannelManager.ChannelAdapter = if (!privateKey.isNullOrBlank() && relayUrls != null) {
+                    pluginChannelAdapter(
+                        NostrChannel(
+                            privateKeyHex = privateKey,
+                            relayUrls = relayUrls,
+                            client = sharedHttpClient,
+                        ),
+                    )
+                } else {
+                    unsupportedChannelAdapter(
+                        channelId = "nostr",
+                        displayName = "Nostr",
+                        reason = "Missing private key or relay URLs.",
+                    )
+                }
+                registrations += wrapChannelAdapter(accountId, adapter) to accountId
+                markAutoStart("nostr", accountId, cfg.enabled)
+            }
+        }
+
+        suspend fun registerMSTeams(cfg: MSTeamsConfig) {
+            val appId = cfg.appId?.takeIf { it.isNotBlank() }
+            val appPassword = cfg.appPassword?.takeIf { it.isNotBlank() }
+            val adapter: ChannelManager.ChannelAdapter = if (appId != null && appPassword != null) {
+                pluginChannelAdapter(
+                    MSTeamsChannel(
+                        appId = appId,
+                        appPassword = appPassword,
+                        tenantId = cfg.tenantId,
+                        client = sharedHttpClient,
+                    ),
+                )
+            } else {
+                unsupportedChannelAdapter(
+                    channelId = "msteams",
+                    displayName = "Microsoft Teams",
+                    reason = "Missing app ID or app password.",
+                )
+            }
+            registrations += wrapChannelAdapter("default", adapter) to "default"
+            markAutoStart("msteams", "default", cfg.enabled)
+        }
+
+        fun registerUnsupportedAccountChannel(
+            channelId: String,
+            displayName: String,
+            enabled: Boolean?,
+            accounts: Map<String, Any?>,
+            reason: String,
+        ) {
+            val resolvedAccounts = accounts.ifEmpty { mapOf("default" to null) }
+            for ((accountId, _) in resolvedAccounts) {
+                registrations += wrapChannelAdapter(
+                    accountId,
+                    unsupportedChannelAdapter(
+                        channelId = channelId,
+                        displayName = displayName,
+                        reason = reason,
+                    ),
+                ) to accountId
+                markAutoStart(channelId, accountId, enabled)
+            }
+        }
+
+        channels?.telegram?.let { registerTelegram(it) }
+        channels?.discord?.let { registerDiscord(it) }
+        channels?.slack?.let { registerSlack(it) }
+        channels?.signal?.let { registerSignal(it) }
+        channels?.matrix?.let { registerMatrix(it) }
+        channels?.irc?.let { registerIrc(it) }
+        channels?.line?.let { registerLine(it) }
+        channels?.mattermost?.let { registerMattermost(it) }
+        channels?.nostr?.let { registerNostr(it) }
+        channels?.msteams?.let { registerMSTeams(it) }
+        channels?.googlechat?.let {
+            registerUnsupportedAccountChannel(
+                channelId = "googlechat",
+                displayName = "Google Chat",
+                enabled = it.enabled,
+                accounts = it.accounts.orEmpty(),
+                reason = "Google Chat service-account token exchange is not wired yet.",
+            )
+        }
+        channels?.whatsapp?.let {
+            registerUnsupportedAccountChannel(
+                channelId = "whatsapp",
+                displayName = "WhatsApp",
+                enabled = it.enabled,
+                accounts = it.accounts.orEmpty(),
+                reason = "WhatsApp Cloud API credentials are not represented in the current config model.",
+            )
+        }
+        channels?.imessage?.let {
+            registerUnsupportedAccountChannel(
+                channelId = "imessage",
+                displayName = "iMessage",
+                enabled = it.enabled,
+                accounts = it.accounts.orEmpty(),
+                reason = "The iMessage runtime module is not included in this Android build.",
+            )
+        }
+        channels?.webchat?.let { cfg ->
+            registrations += wrapChannelAdapter(
+                "default",
+                gatewayBackedChannelAdapter(),
+            ) to "default"
+            markAutoStart("webchat", "default", cfg.enabled)
+        }
+
+        defaultStoppedChannelKeys = initiallyStopped
+        channelManager.replaceChannels(
+            registrations = registrations,
+            defaultStoppedKeys = defaultStoppedChannelKeys,
+        )
+    }
+
+    private suspend fun syncBackgroundRuntimeState() {
+        if (!backgroundRuntimeActive) {
+            runCatching { channelManager.stopAll() }
+            runCatching { gatewayServerInternal?.stop() }
+            runCatching { cronScheduler.stop() }
+            cronStarted = false
+            return
+        }
+
+        ensureGatewayServer(startGateway = true)
+
+        if (config.cron?.enabled == false) {
+            if (cronStarted) {
+                runCatching { cronScheduler.stop() }
+                cronStarted = false
+            }
+        } else if (!cronStarted) {
+            runCatching { cronScheduler.start() }
+            cronStarted = true
+        }
+
+        runCatching { channelManager.startAll() }
     }
 
     private fun ensureGatewayServer(startGateway: Boolean) {
@@ -1147,6 +1726,157 @@ class AgentEngine(private val context: Context) {
             host = gatewayHost,
             config = config,
         )
+    }
+
+    private suspend fun handleInboundChannelMessage(message: InboundMessage) {
+        if (message.text.isBlank()) return
+        val responseText = StringBuilder()
+        runCatching {
+            sendMessage(
+                userMessage = message.text,
+                agentId = defaultAgentId(),
+                sessionKey = channelSessionKey(message),
+                messageProvider = message.channelId,
+                messageChannelId = message.channelId,
+                messageAccountId = message.accountId,
+            ).collect { event ->
+                when (event) {
+                    is AcpRuntimeEvent.TextDelta -> responseText.append(event.text)
+                    is AcpRuntimeEvent.Done -> {
+                        val text = responseText.toString().trim()
+                        if (text.isNotEmpty()) {
+                            channelManager.send(
+                                channelId = message.channelId,
+                                accountId = message.accountId,
+                                message = OutboundMessage(
+                                    channelId = message.channelId,
+                                    accountId = message.accountId,
+                                    targetId = message.targetId,
+                                    text = text,
+                                    threadId = message.threadId,
+                                    replyToMessageId = message.messageId,
+                                ),
+                            )
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    private fun channelSessionKey(message: InboundMessage): String {
+        val threadPart = message.threadId?.takeIf { it.isNotBlank() } ?: "root"
+        val targetPart = message.targetId.ifBlank { "unknown" }
+        val chatScope = when (message.chatType) {
+            ChatType.DIRECT -> "dm"
+            ChatType.GROUP -> "group"
+            ChatType.CHANNEL -> "channel"
+        }
+        return "channel:${message.channelId}:${message.accountId}:$chatScope:$targetPart:$threadPart"
+    }
+
+    private fun wrapChannelAdapter(
+        accountId: String,
+        delegate: ChannelManager.ChannelAdapter,
+    ): ChannelManager.ChannelAdapter {
+        return object : ChannelManager.ChannelAdapter {
+            override val channelId: ChannelId = delegate.channelId
+            override val displayName: String = delegate.displayName
+
+            override suspend fun start(handler: suspend (InboundMessage) -> Unit) {
+                delegate.start { inbound ->
+                    handler(
+                        inbound.copy(
+                            channelId = channelId,
+                            accountId = accountId,
+                        ),
+                    )
+                }
+            }
+
+            override suspend fun stop() {
+                delegate.stop()
+            }
+
+            override suspend fun send(message: OutboundMessage): Boolean {
+                return delegate.send(
+                    message.copy(
+                        channelId = channelId,
+                        accountId = accountId,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun pluginChannelAdapter(plugin: ChannelPlugin): ChannelManager.ChannelAdapter {
+        return object : ChannelManager.ChannelAdapter {
+            override val channelId: ChannelId = plugin.channelId
+            override val displayName: String = plugin.displayName
+
+            override suspend fun start(handler: suspend (InboundMessage) -> Unit) {
+                plugin.start(handler)
+            }
+
+            override suspend fun stop() {
+                plugin.stop()
+            }
+
+            override suspend fun send(message: OutboundMessage): Boolean {
+                return plugin.send(message)
+            }
+        }
+    }
+
+    private fun unsupportedChannelAdapter(
+        channelId: String,
+        displayName: String,
+        reason: String,
+    ): ChannelManager.ChannelAdapter {
+        return object : ChannelManager.ChannelAdapter {
+            override val channelId: ChannelId = channelId
+            override val displayName: String = displayName
+
+            override suspend fun start(handler: suspend (InboundMessage) -> Unit) {
+                throw ChannelManager.NonRetryableChannelException(reason)
+            }
+
+            override suspend fun stop() = Unit
+
+            override suspend fun send(message: OutboundMessage): Boolean = false
+        }
+    }
+
+    private fun gatewayBackedChannelAdapter(): ChannelManager.ChannelAdapter {
+        return object : ChannelManager.ChannelAdapter {
+            override val channelId: ChannelId = "webchat"
+            override val displayName: String = "Web Chat"
+
+            override suspend fun start(handler: suspend (InboundMessage) -> Unit) = Unit
+
+            override suspend fun stop() = Unit
+
+            override suspend fun send(message: OutboundMessage): Boolean = false
+        }
+    }
+
+    private fun resolveDiscordIntents(account: DiscordAccountConfig): Int {
+        if (account.intents.isNullOrEmpty()) return DiscordChannel.DEFAULT_INTENTS
+        val mapping = mapOf(
+            "guilds" to DiscordChannel.INTENT_GUILDS,
+            "guild_members" to DiscordChannel.INTENT_GUILD_MEMBERS,
+            "guild_messages" to DiscordChannel.INTENT_GUILD_MESSAGES,
+            "guild_message_reactions" to DiscordChannel.INTENT_GUILD_MESSAGE_REACTIONS,
+            "direct_messages" to DiscordChannel.INTENT_DIRECT_MESSAGES,
+            "direct_message_reactions" to DiscordChannel.INTENT_DIRECT_MESSAGE_REACTIONS,
+            "message_content" to DiscordChannel.INTENT_MESSAGE_CONTENT,
+            "guild_voice_states" to DiscordChannel.INTENT_GUILD_VOICE_STATES,
+        )
+        val resolved = account.intents.orEmpty()
+            .mapNotNull { mapping[it.trim().lowercase()] }
+            .fold(0) { acc, intent -> acc or intent }
+        return if (resolved == 0) DiscordChannel.DEFAULT_INTENTS else resolved
     }
 
     private fun resolveModelChain(
@@ -1294,6 +2024,12 @@ class AgentEngine(private val context: Context) {
         return DEFAULT_MODELS_BY_PROVIDER[canonicalProvider(providerId)]
     }
 
+    private fun suggestedModelsForProvider(providerId: String): List<String> {
+        val canonical = canonicalProvider(providerId)
+        val suggested = SUGGESTED_MODELS_BY_PROVIDER[canonical].orEmpty()
+        return if (suggested.isNotEmpty()) suggested else listOfNotNull(defaultModelForProvider(canonical))
+    }
+
     private fun providerSortKey(providerId: String): Int {
         val idx = DEFAULT_PROVIDER_ORDER.indexOf(providerId)
         return if (idx == -1) Int.MAX_VALUE else idx
@@ -1317,6 +2053,67 @@ class AgentEngine(private val context: Context) {
             routeModelToProvider(modelB),
             ignoreCase = true,
         )
+    }
+
+    private fun resolveModelDefinition(modelId: String?): ModelDefinitionConfig? {
+        val routed = modelId?.trim()?.takeIf { it.isNotEmpty() }?.let(::routeModelToProvider) ?: return null
+        val providerId = resolveProviderFromModel(routed) ?: return null
+        val requestedModelId = routed.substringAfter("/", missingDelimiterValue = routed)
+        val providerConfig = config.models?.providers
+            ?.entries
+            ?.firstOrNull { canonicalProvider(it.key) == providerId }
+            ?.value
+            ?: return null
+        return providerConfig.models.firstOrNull { definition ->
+            val routedDefinition = routeModelToProvider(
+                if ('/' in definition.id) definition.id else "$providerId/${definition.id}",
+            )
+            routedDefinition.equals(routed, ignoreCase = true) ||
+                definition.id.equals(requestedModelId, ignoreCase = true)
+        }
+    }
+
+    private fun supportsReasoningEffort(modelId: String?): Boolean {
+        val definitionSupport = resolveModelDefinition(modelId)
+            ?.compat
+            ?.supportsReasoningEffort
+        if (definitionSupport != null) return definitionSupport
+        val normalized = modelId
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(::routeModelToProvider)
+            ?.substringAfter("/", missingDelimiterValue = "")
+            ?.lowercase()
+            ?: return false
+        return normalized.startsWith("gpt-5")
+    }
+
+    private fun supportedReasoningEfforts(modelId: String?): List<String> {
+        if (!supportsReasoningEffort(modelId)) return emptyList()
+        val normalized = modelId
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let(::routeModelToProvider)
+            ?.substringAfter("/", missingDelimiterValue = "")
+            ?.lowercase()
+            .orEmpty()
+        return when {
+            normalized.startsWith("gpt-5.4-pro") -> listOf("medium", "high", "xhigh")
+            normalized.startsWith("gpt-5.4") -> listOf("none", "low", "medium", "high", "xhigh")
+            normalized.startsWith("gpt-5.1") -> listOf("none", "low", "medium", "high")
+            normalized.startsWith("gpt-5") -> listOf("minimal", "low", "medium", "high")
+            else -> listOf("low", "medium", "high")
+        }
+    }
+
+    private fun normalizeReasoningEffort(modelId: String?, reasoningEffort: String?): String? {
+        val normalized = reasoningEffort
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
+        val supported = supportedReasoningEfforts(modelId)
+        return normalized.takeIf { it in supported }
     }
 
     private fun resolveAgentConfig(agentId: String): AgentConfig? {
@@ -1373,6 +2170,15 @@ class AgentEngine(private val context: Context) {
             if (channelContext?.supportsRichText == true) add("rich_text")
         }
         val preferredDefaultModel = preferredModelForAgent(agentId)
+        val reasoningEffort = preferredReasoningEffortForAgent(
+            agentId = agentId,
+            modelId = modelId ?: preferredDefaultModel,
+        )
+        val reasoningState = when {
+            reasoningEffort != null -> reasoningEffort
+            supportsReasoningEffort(modelId ?: preferredDefaultModel) -> "default"
+            else -> "off"
+        }
         return SystemPromptBuilder.RuntimeInfo(
             os = "Android ${android.os.Build.VERSION.RELEASE}",
             arch = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown",
@@ -1381,12 +2187,12 @@ class AgentEngine(private val context: Context) {
             repoRoot = terminalWorkingDirectory(),
             model = modelId,
             defaultModel = preferredDefaultModel,
-            node = System.getenv("NODE_VERSION"),
-            shell = System.getenv("SHELL"),
+            node = execEnvironment.nodeVersion,
+            shell = execEnvironment.shellPath,
             channel = channelContext?.channelId,
             capabilities = capabilities,
             thinking = "off",
-            reasoning = "off",
+            reasoning = reasoningState,
             timezone = java.util.TimeZone.getDefault().id,
             currentTime = java.time.Instant.now().toString(),
             sandboxed = sandboxed,
@@ -1557,6 +2363,20 @@ class AgentEngine(private val context: Context) {
         initialize()
     }
 
+    private suspend fun refreshExecEnvironment() {
+        managedToolchainActivation = managedToolchainManager.prepare(config)
+        execEnvironment = execEnvironmentResolver.resolve(
+            config = config,
+            workspaceDir = terminalWorkingDirectory(),
+            managedNodePath = managedToolchainActivation.nodePath,
+            managedPathPrepend = managedToolchainActivation.prependPaths,
+        )
+        managedToolchainStatus = managedToolchainManager.buildStatus(
+            activation = managedToolchainActivation,
+            execEnvironment = execEnvironment,
+        )
+    }
+
     private fun ensureConfigLoaded() {
         if (configLoaded) return
         ensureStorageStructure()
@@ -1580,7 +2400,9 @@ class AgentEngine(private val context: Context) {
         private const val DEFAULT_GATEWAY_HOST = "127.0.0.1"
         private const val CODEX_OAUTH_TOKEN_KEY = "codex_oauth_access_token"
         private const val CODEX_OAUTH_REFRESH_TOKEN_KEY = "codex_oauth_refresh_token"
+        private const val CODEX_OAUTH_ID_TOKEN_KEY = "codex_oauth_id_token"
         private const val CODEX_OAUTH_EXPIRES_AT_MS_KEY = "codex_oauth_expires_at_ms"
+        private const val CODEX_OAUTH_API_KEY_KEY = "codex_oauth_openai_api_key"
         private const val CODEX_ACCOUNT_ID_KEY = "codex_account_id"
         private const val CODEX_EMAIL_KEY = "codex_email"
         private const val CODEX_EXPIRY_MARGIN_MS = 60_000L
@@ -1596,9 +2418,16 @@ class AgentEngine(private val context: Context) {
             "gemini" to "gemini/gemini-2.0-flash",
             "ollama" to "ollama/llama3",
         )
+        private val SUGGESTED_MODELS_BY_PROVIDER = mapOf(
+            "anthropic" to listOf("anthropic/claude-sonnet-4-5-20250514"),
+            "openai" to listOf("openai/gpt-5.4", "openai/gpt-4o-mini"),
+            "gemini" to listOf("gemini/gemini-2.0-flash"),
+            "ollama" to listOf("ollama/llama3"),
+        )
 
         private val DEFAULT_MODEL_CANDIDATES = listOf(
             "anthropic/claude-sonnet-4-5-20250514",
+            "openai/gpt-5.4",
             "openai/gpt-4o-mini",
             "gemini/gemini-2.0-flash",
             "ollama/llama3",
@@ -1607,6 +2436,7 @@ class AgentEngine(private val context: Context) {
             "config",
             "sessions",
             "cron",
+            "toolchains",
             "camera_output",
             "screen_captures",
             "tts_output",

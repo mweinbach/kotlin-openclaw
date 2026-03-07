@@ -546,7 +546,6 @@ private fun saveChannel(
     }
 
     engine.saveConfig(config.copy(channels = updatedChannels))
-    engine.reloadConfig()
 }
 
 private fun secretFromValue(value: String?): SecretInput? {

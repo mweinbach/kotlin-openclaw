@@ -106,7 +106,7 @@ fun ChatDetailScreen(
             ) {
                 items(
                     items = viewModel.messages,
-                    key = { it.hashCode() }
+                    key = { it.id }
                 ) { message ->
                     MessageBubble(
                         message = message,

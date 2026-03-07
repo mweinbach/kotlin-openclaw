@@ -72,6 +72,20 @@ class ShellExecutorTest {
     }
 
     @Test
+    fun `execute uses provided base environment`() = runTest {
+        val executor = ShellExecutor(
+            environmentProvider = {
+                mapOf(
+                    "FOO" to "from-base-env",
+                    "PATH" to (System.getenv("PATH") ?: ""),
+                )
+            },
+        )
+        val output = executor.execute("echo \$FOO").toList()
+        assertContains(output.joinToString("\n"), "from-base-env")
+    }
+
+    @Test
     fun `execute piped commands work`() = runTest {
         val executor = ShellExecutor()
         val output = executor.execute("echo 'abc def ghi' | wc -w").toList()

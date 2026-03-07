@@ -95,6 +95,8 @@ data class LlmRequest(
     val systemPrompt: String? = null,
     /** When set, enables extended thinking with this token budget (Anthropic only). */
     val thinkingBudget: Int? = null,
+    /** Provider-native reasoning effort control (for example GPT-5 family reasoning levels). */
+    val reasoningEffort: String? = null,
 )
 
 /**

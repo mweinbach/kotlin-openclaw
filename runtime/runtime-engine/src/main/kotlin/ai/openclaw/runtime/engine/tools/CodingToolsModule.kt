@@ -22,14 +22,15 @@ object CodingToolsModule {
         val execTimeoutSec: Int = 120,
         val execYieldMs: Long = 10_000L,
         val processCleanupMs: Long = 5 * 60_000L,
+        val shellPath: String? = null,
+        val baseEnv: Map<String, String> = emptyMap(),
     )
 
     fun registerAll(
         registry: ToolRegistry,
         config: Config,
+        processRegistry: ProcessRegistry = ProcessRegistry(cleanupMs = config.processCleanupMs),
     ) {
-        val processRegistry = ProcessRegistry(cleanupMs = config.processCleanupMs)
-
         registry.register(ReadTool(config.workspaceDir, workspaceOnly = config.workspaceOnly))
         registry.register(WriteTool(config.workspaceDir, workspaceOnly = config.workspaceOnly))
         registry.register(EditTool(config.workspaceDir, workspaceOnly = config.workspaceOnly))
@@ -39,6 +40,8 @@ object CodingToolsModule {
                 workspaceDir = config.workspaceDir,
                 defaultTimeoutSec = config.execTimeoutSec,
                 defaultYieldMs = config.execYieldMs,
+                shellPath = config.shellPath,
+                baseEnv = config.baseEnv,
             ),
         )
         registry.register(ProcessTool(processRegistry = processRegistry))

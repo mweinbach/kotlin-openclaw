@@ -55,6 +55,7 @@ data class EmbeddedRunParams(
     val ownerDisplay: SystemPromptBuilder.OwnerDisplay = SystemPromptBuilder.OwnerDisplay.RAW,
     val ownerDisplaySecret: String? = null,
     val reasoningTagHint: Boolean = false,
+    val reasoningEffort: String? = null,
     val extraSystemPrompt: String? = null,
     val contextFiles: List<SystemPromptBuilder.ContextFile> = emptyList(),
     val bootstrapTruncationWarningLines: List<String> = emptyList(),

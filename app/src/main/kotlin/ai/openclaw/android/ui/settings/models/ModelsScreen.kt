@@ -44,22 +44,56 @@ fun ModelsScreen(engine: AgentEngine, onBack: () -> Unit) {
     val currentModel = engine.config.agents?.defaults?.model?.primary?.trim()
         ?.takeIf { it.isNotEmpty() }
         ?: fallbackModel
+    val currentReasoningEffort = engine.preferredReasoningEffortForAgent(
+        modelId = currentModel,
+    )
 
     var selectedModel by remember { mutableStateOf(currentModel) }
+    var selectedReasoningEffort by remember { mutableStateOf(currentReasoningEffort) }
     var manualModel by remember { mutableStateOf("") }
     var showPicker by remember { mutableStateOf(false) }
+    var showReasoningPicker by remember { mutableStateOf(false) }
 
     val availableModels = engine.availableModelIdsForEnabledProviders()
         .let { models ->
             if (selectedModel in models) models else listOf(selectedModel) + models
         }
         .distinct()
+    val availableReasoningEfforts = engine.availableReasoningEffortsForModel(selectedModel)
+
+    fun reasoningLabel(value: String?): String {
+        return when (value?.trim()?.lowercase()) {
+            null -> "Default"
+            "none" -> "None"
+            "minimal" -> "Minimal"
+            "low" -> "Low"
+            "medium" -> "Medium"
+            "high" -> "High"
+            "xhigh" -> "XHigh"
+            else -> value
+        }
+    }
 
     fun applyModel(modelId: String) {
         val normalized = modelId.trim()
         if (normalized.isEmpty()) return
+        val supportedReasoning = engine.availableReasoningEffortsForModel(normalized)
+        val normalizedReasoningEffort = selectedReasoningEffort
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it in supportedReasoning }
         selectedModel = normalized
-        engine.setDefaultModel(normalized)
+        selectedReasoningEffort = normalizedReasoningEffort
+        engine.setDefaultModel(normalized, normalizedReasoningEffort)
+    }
+
+    fun applyReasoning(reasoningEffort: String?) {
+        val normalized = reasoningEffort
+            ?.trim()
+            ?.lowercase()
+            ?.takeIf { it in availableReasoningEfforts }
+        selectedReasoningEffort = normalized
+        engine.setDefaultReasoningEffort(normalized)
     }
 
     Scaffold(
@@ -115,6 +149,51 @@ fun ModelsScreen(engine: AgentEngine, onBack: () -> Unit) {
             }
 
             Text(
+                text = "Reasoning Effort",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = availableReasoningEfforts.isNotEmpty()) {
+                        showReasoningPicker = true
+                    },
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "GPT-5 Reasoning",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (availableReasoningEfforts.isEmpty()) {
+                            "Not available for $selectedModel"
+                        } else {
+                            reasoningLabel(selectedReasoningEffort)
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = if (availableReasoningEfforts.isEmpty()) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.primary
+                        },
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = if (availableReasoningEfforts.isEmpty()) {
+                            "This model does not expose reasoning-effort controls."
+                        } else {
+                            "Tap to choose how much deliberate reasoning GPT-5 should use."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            Text(
                 text = "Manual Model ID",
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.primary,
@@ -124,7 +203,7 @@ fun ModelsScreen(engine: AgentEngine, onBack: () -> Unit) {
                 value = manualModel,
                 onValueChange = { manualModel = it },
                 label = { Text("provider/model") },
-                placeholder = { Text("openai/gpt-5") },
+                placeholder = { Text("openai/gpt-5.4") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -197,6 +276,59 @@ fun ModelsScreen(engine: AgentEngine, onBack: () -> Unit) {
             },
             confirmButton = {
                 TextButton(onClick = { showPicker = false }) {
+                    Text("Close")
+                }
+            },
+        )
+    }
+
+    if (showReasoningPicker) {
+        AlertDialog(
+            onDismissRequest = { showReasoningPicker = false },
+            title = { Text("Reasoning Effort") },
+            text = {
+                LazyColumn {
+                    item {
+                        ListItem(
+                            headlineContent = { Text("Default") },
+                            supportingContent = { Text("Use the provider default for this model.") },
+                            trailingContent = {
+                                if (selectedReasoningEffort == null) {
+                                    Icon(
+                                        Icons.Default.Check,
+                                        contentDescription = "Selected",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            },
+                            modifier = Modifier.clickable {
+                                applyReasoning(null)
+                                showReasoningPicker = false
+                            },
+                        )
+                    }
+                    items(availableReasoningEfforts) { reasoningEffort ->
+                        ListItem(
+                            headlineContent = { Text(reasoningLabel(reasoningEffort)) },
+                            trailingContent = {
+                                if (reasoningEffort == selectedReasoningEffort) {
+                                    Icon(
+                                        Icons.Default.Check,
+                                        contentDescription = "Selected",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            },
+                            modifier = Modifier.clickable {
+                                applyReasoning(reasoningEffort)
+                                showReasoningPicker = false
+                            },
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showReasoningPicker = false }) {
                     Text("Close")
                 }
             },

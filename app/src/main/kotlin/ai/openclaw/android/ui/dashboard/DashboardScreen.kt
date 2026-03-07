@@ -23,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -41,6 +42,7 @@ fun DashboardScreen(engine: AgentEngine) {
     var toolbarExpanded by remember { mutableStateOf(true) }
     var contentVisible by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
 
     LaunchedEffect(Unit) {
         contentVisible = true
@@ -85,6 +87,135 @@ fun DashboardScreen(engine: AgentEngine) {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     Spacer(modifier = Modifier.height(4.dp))
+
+                SectionCard(
+                    title = "Background Runtime",
+                    subtitle = if (state.backgroundRuntimeActive) "Active" else "Stopped",
+                    trailing = {
+                        Switch(
+                            checked = state.keepAliveInBackground,
+                            onCheckedChange = { enabled ->
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                viewModel.setKeepAliveInBackground(context, enabled)
+                            },
+                        )
+                    },
+                ) {
+                    Text(
+                        text = if (state.keepAliveInBackground) {
+                            "Foreground service will restart on app launch and boot."
+                        } else {
+                            "Background work is opt-in. Start it explicitly when needed."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (state.backgroundRuntimeActive) {
+                            OutlinedButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.stopBackgroundRuntime(context)
+                                },
+                            ) {
+                                Text("Stop")
+                            }
+                        } else {
+                            Button(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.startBackgroundRuntime(context)
+                                },
+                            ) {
+                                Text("Start")
+                            }
+                        }
+                    }
+                }
+
+                SectionCard(
+                    title = "Toolchains",
+                    subtitle = when {
+                        state.nodeActive && !state.nodeVersion.isNullOrBlank() -> "Node ${state.nodeVersion}"
+                        state.nodeActive -> "Node available"
+                        state.nodeSupported -> "Node missing"
+                        else -> "Custom Node bundle required"
+                    },
+                    trailing = {
+                        StatusIndicator(
+                            status = when {
+                                state.nodeActive && state.missingEssentialBins.isEmpty() -> Status.Connected
+                                state.nodeSupported -> Status.Warning
+                                else -> Status.Offline
+                            },
+                        )
+                    },
+                ) {
+                    val nodeSource = when {
+                        state.nodeManaged -> "Managed runtime active."
+                        state.nodeActive -> "Shell/runtime Node active."
+                        else -> "Node is not available in the current exec environment."
+                    }
+                    Text(
+                        text = nodeSource,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    val nodeMessage = state.nodeMessage
+                    if (nodeMessage != null) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = nodeMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (state.availableBins.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Available: ${state.availableBins.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (state.missingEssentialBins.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Missing JS bins: ${state.missingEssentialBins.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (state.missingRecommendedBins.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Recommended host bins missing: ${state.missingRecommendedBins.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (state.nodeSupported) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            enabled = !state.toolchainInstallInProgress,
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                viewModel.installManagedNode()
+                            },
+                        ) {
+                            Text(
+                                if (state.toolchainInstallInProgress) {
+                                    "Installing..."
+                                } else if (state.nodeInstalled) {
+                                    "Reinstall Node"
+                                } else {
+                                    "Install Node"
+                                },
+                            )
+                        }
+                    }
+                }
 
                 // Gateway Card
                 SectionCard(

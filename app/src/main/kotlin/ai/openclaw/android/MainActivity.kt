@@ -27,8 +27,14 @@ class MainActivity : ComponentActivity() {
                 AppNavigation(engine = app.engine)
             }
         }
-        runCatching { AgentForegroundService.start(applicationContext) }
-            .onFailure { Log.w(TAG, "Foreground service start skipped", it) }
+        lifecycleScope.launch {
+            runCatching { app.engine.initialize() }
+                .onFailure { Log.w(TAG, "Engine initialization failed", it) }
+            if (app.engine.keepAliveInBackgroundEnabled()) {
+                runCatching { AgentForegroundService.start(applicationContext) }
+                    .onFailure { Log.w(TAG, "Foreground service start skipped", it) }
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {

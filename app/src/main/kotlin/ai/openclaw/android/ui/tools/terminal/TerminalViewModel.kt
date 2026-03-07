@@ -22,6 +22,8 @@ class TerminalViewModel(
 
     private val executor = ShellExecutor(
         defaultWorkingDir = engine?.terminalWorkingDirectory() ?: System.getProperty("user.dir") ?: "/tmp",
+        environmentProvider = { engine?.currentShellEnvironment().orEmpty() },
+        shellPathProvider = { engine?.currentShellPath() ?: "/bin/sh" },
     )
     private var currentJob: Job? = null
 

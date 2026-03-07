@@ -39,10 +39,6 @@ fun ChatListScreen(
     var fabMenuExpanded by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
 
-    LaunchedEffect(Unit) {
-        viewModel.refreshSessions()
-    }
-
     Scaffold(
         topBar = {
             TopAppBar(

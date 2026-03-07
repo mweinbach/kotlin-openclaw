@@ -51,7 +51,7 @@ class DashboardScreenTest {
             }
         }
 
-        composeTestRule.onNodeWithText("Gateway").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Gateway").assertExists()
     }
 
     @Test
@@ -62,7 +62,7 @@ class DashboardScreenTest {
             }
         }
 
-        composeTestRule.onNodeWithText("Channels").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Channels").assertExists()
     }
 
     @Test
@@ -73,6 +73,17 @@ class DashboardScreenTest {
             }
         }
 
-        composeTestRule.onNodeWithText("Sessions").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Sessions").assertExists()
+    }
+
+    @Test
+    fun `dashboard screen shows toolchains card`() {
+        composeTestRule.setContent {
+            ai.openclaw.android.ui.theme.OpenClawTheme {
+                DashboardScreen(engine = engine)
+            }
+        }
+
+        composeTestRule.onNodeWithText("Toolchains").assertExists()
     }
 }

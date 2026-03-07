@@ -8,6 +8,7 @@ import kotlinx.serialization.Serializable
 data class AgentModelConfig(
     val primary: String? = null,
     val fallbacks: List<String>? = null,
+    val reasoningEffort: String? = null,
 ) {
     companion object {
         /** Parse from either a plain string or structured config. */

@@ -1,6 +1,8 @@
 package ai.openclaw.android.ui.dashboard
 
 import ai.openclaw.android.AgentEngine
+import ai.openclaw.android.AgentForegroundService
+import android.content.Context
 import ai.openclaw.runtime.gateway.ChannelManager
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -14,6 +16,8 @@ import kotlinx.coroutines.launch
 class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
 
     data class DashboardState(
+        val backgroundRuntimeActive: Boolean = false,
+        val keepAliveInBackground: Boolean = false,
         val gatewayRunning: Boolean = false,
         val gatewayPort: Int = 18789,
         val gatewayHost: String = "127.0.0.1",
@@ -24,6 +28,16 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
         val memoryEntries: Int = 0,
         val cronJobCount: Int = 0,
         val pluginCount: Int = 0,
+        val nodeSupported: Boolean = false,
+        val nodeInstalled: Boolean = false,
+        val nodeActive: Boolean = false,
+        val nodeManaged: Boolean = false,
+        val nodeVersion: String? = null,
+        val nodeMessage: String? = null,
+        val availableBins: List<String> = emptyList(),
+        val missingEssentialBins: List<String> = emptyList(),
+        val missingRecommendedBins: List<String> = emptyList(),
+        val toolchainInstallInProgress: Boolean = false,
         val lastError: String? = null,
     )
 
@@ -48,9 +62,12 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
                 val memorySize = engine.memoryManager.size()
                 val cronJobs = engine.cronScheduler.list()
                 val plugins = engine.pluginRegistry.allRecords()
+                val toolchainStatus = engine.currentToolchainStatus()
 
                 DashboardState(
-                    gatewayRunning = engine.gatewayServer.isRunning,
+                    backgroundRuntimeActive = engine.isBackgroundRuntimeActive(),
+                    keepAliveInBackground = engine.keepAliveInBackgroundEnabled(),
+                    gatewayRunning = engine.isGatewayRunning(),
                     gatewayPort = engine.config.gateway?.port ?: 18789,
                     gatewayHost = engine.config.gateway?.customBindHost ?: "127.0.0.1",
                     channelCount = snapshot.size,
@@ -60,6 +77,16 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
                     memoryEntries = memorySize,
                     cronJobCount = cronJobs.size,
                     pluginCount = plugins.size,
+                    nodeSupported = toolchainStatus.nodeSupported,
+                    nodeInstalled = toolchainStatus.nodeInstalled,
+                    nodeActive = toolchainStatus.nodeActive,
+                    nodeManaged = toolchainStatus.nodeManaged,
+                    nodeVersion = toolchainStatus.nodeVersion,
+                    nodeMessage = toolchainStatus.nodeMessage,
+                    availableBins = toolchainStatus.availableBins,
+                    missingEssentialBins = toolchainStatus.missingEssentialBins,
+                    missingRecommendedBins = toolchainStatus.missingRecommendedBins,
+                    toolchainInstallInProgress = _state.value.toolchainInstallInProgress,
                     lastError = null,
                 )
             }.onSuccess { freshState ->
@@ -70,11 +97,53 @@ class DashboardViewModel(private val engine: AgentEngine) : ViewModel() {
         }
     }
 
+    fun installManagedNode() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.value = _state.value.copy(toolchainInstallInProgress = true, lastError = null)
+            runCatching {
+                engine.installManagedNode()
+            }.onFailure { error ->
+                _state.value = _state.value.copy(
+                    toolchainInstallInProgress = false,
+                    lastError = error.message ?: "Managed Node install failed",
+                )
+            }.onSuccess {
+                _state.value = _state.value.copy(toolchainInstallInProgress = false)
+                refresh()
+            }
+        }
+    }
+
+    fun startBackgroundRuntime(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            AgentForegroundService.start(context.applicationContext)
+            refresh()
+        }
+    }
+
+    fun stopBackgroundRuntime(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            AgentForegroundService.stop(context.applicationContext)
+            refresh()
+        }
+    }
+
+    fun setKeepAliveInBackground(context: Context, enabled: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            engine.setKeepAliveInBackground(enabled)
+            if (enabled) {
+                AgentForegroundService.start(context.applicationContext)
+            } else {
+                AgentForegroundService.stop(context.applicationContext)
+            }
+            refresh()
+        }
+    }
+
     fun restartGateway() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                engine.gatewayServer.stop()
-                engine.gatewayServer.start()
+                engine.startBackgroundRuntime()
             } catch (_: Exception) {
                 // Best-effort restart
             }

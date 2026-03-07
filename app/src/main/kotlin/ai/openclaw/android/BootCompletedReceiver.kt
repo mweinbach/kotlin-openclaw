@@ -13,7 +13,12 @@ class BootCompletedReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED,
             Intent.ACTION_LOCKED_BOOT_COMPLETED,
             Intent.ACTION_MY_PACKAGE_REPLACED,
-            -> AgentForegroundService.start(context.applicationContext)
+            -> {
+                val config = ConfigManager(context.applicationContext).load()
+                if (config.appRuntime?.keepAliveInBackground == true) {
+                    AgentForegroundService.start(context.applicationContext)
+                }
+            }
         }
     }
 }

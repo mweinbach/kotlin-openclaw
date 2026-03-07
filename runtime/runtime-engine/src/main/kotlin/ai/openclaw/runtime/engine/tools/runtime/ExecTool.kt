@@ -15,6 +15,8 @@ class ExecTool(
     private val defaultTimeoutSec: Int = 120,
     private val defaultYieldMs: Long = 10_000L,
     private val maxOutputChars: Int = 30_000,
+    private val shellPath: String? = null,
+    private val baseEnv: Map<String, String> = emptyMap(),
 ) : AgentTool {
     override val name: String = "exec"
     override val description: String = "Run shell commands (supports background sessions)"
@@ -115,13 +117,19 @@ class ExecTool(
         workdir: String,
         env: Map<String, String>,
     ): Process {
-        val shellPath = if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
-        val pb = ProcessBuilder(shellPath, "-c", command)
+        val resolvedShellPath = shellPath
+            ?.takeIf { it.isNotBlank() }
+            ?.takeIf { File(it).exists() }
+            ?: if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
+        val pb = ProcessBuilder(resolvedShellPath, "-c", command)
         pb.redirectErrorStream(true)
         pb.directory(File(workdir))
-        if (env.isNotEmpty()) {
-            pb.environment().putAll(env)
-        }
+        val mergedEnv = LinkedHashMap(System.getenv())
+        mergedEnv.putAll(baseEnv)
+        mergedEnv.putAll(env)
+        val processEnv = pb.environment()
+        processEnv.clear()
+        processEnv.putAll(mergedEnv)
         return pb.start()
     }
 

@@ -15,22 +15,23 @@ import kotlin.coroutines.coroutineContext
  */
 class ShellExecutor(
     defaultWorkingDir: String = detectDefaultWorkingDir(),
+    private val environmentProvider: () -> Map<String, String> = { emptyMap() },
+    private val shellPathProvider: () -> String = { detectShellPath() },
 ) {
     private val processLock = Any()
     private var process: Process? = null
 
     var workingDir: String = defaultWorkingDir
 
-    private val shellPath: String
-        get() {
-            val androidSh = java.io.File("/system/bin/sh")
-            return if (androidSh.exists()) "/system/bin/sh" else "/bin/sh"
-        }
-
     fun execute(command: String): Flow<String> = flow {
-        val pb = ProcessBuilder(shellPath, "-c", command)
+        val pb = ProcessBuilder(shellPathProvider(), "-c", command)
             .redirectErrorStream(true)
             .directory(java.io.File(workingDir))
+        val processEnv = pb.environment()
+        val mergedEnv = LinkedHashMap(System.getenv())
+        mergedEnv.putAll(environmentProvider())
+        processEnv.clear()
+        processEnv.putAll(mergedEnv)
 
         val proc = pb.start()
         reserveProcess(proc)
@@ -83,6 +84,18 @@ class ShellExecutor(
     }
 
     companion object {
+        private fun detectShellPath(): String {
+            val shell = System.getenv("SHELL")
+                ?.takeIf { it.isNotBlank() }
+                ?.let { java.io.File(it) }
+                ?.takeIf { it.exists() && it.canExecute() }
+            if (shell != null) {
+                return shell.absolutePath
+            }
+            val androidSh = java.io.File("/system/bin/sh")
+            return if (androidSh.exists()) "/system/bin/sh" else "/bin/sh"
+        }
+
         private fun detectDefaultWorkingDir(): String {
             return System.getProperty("user.home")
                 ?: System.getProperty("user.dir")

@@ -291,6 +291,7 @@ class AgentRunner(
             ownerDisplay = params.ownerDisplay,
             ownerDisplaySecret = params.ownerDisplaySecret,
             reasoningTagHint = params.reasoningTagHint,
+            reasoningEffort = params.reasoningEffort,
             extraSystemPrompt = params.extraSystemPrompt,
             contextFiles = params.contextFiles,
             bootstrapTruncationWarningLines = params.bootstrapTruncationWarningLines,
@@ -340,6 +341,7 @@ class AgentRunner(
         ownerDisplay: SystemPromptBuilder.OwnerDisplay = SystemPromptBuilder.OwnerDisplay.RAW,
         ownerDisplaySecret: String? = null,
         reasoningTagHint: Boolean = false,
+        reasoningEffort: String? = null,
         extraSystemPrompt: String? = null,
         contextFiles: List<SystemPromptBuilder.ContextFile> = emptyList(),
         bootstrapTruncationWarningLines: List<String> = emptyList(),
@@ -600,6 +602,7 @@ class AgentRunner(
                         messages = currentMessages,
                         tools = buildRequestTools(allowedToolNames, clientTools),
                         systemPrompt = effectiveSystemPrompt,
+                        reasoningEffort = reasoningEffort,
                     )
 
                     val textBuffer = StringBuilder()

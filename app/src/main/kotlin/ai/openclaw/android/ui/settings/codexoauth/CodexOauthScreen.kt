@@ -91,6 +91,19 @@ fun CodexOauthScreen(
                             MaterialTheme.colorScheme.error
                         },
                     )
+                    Text(
+                        if (status?.apiAccessReady == true) {
+                            "OpenAI API access ready"
+                        } else {
+                            "OpenAI API access not ready yet"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (status?.apiAccessReady == true) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
                     if (!status?.accountId.isNullOrBlank()) {
                         Text(
                             "Account ID: ${status?.accountId}",
@@ -113,7 +126,7 @@ fun CodexOauthScreen(
                         )
                     }
                     Text(
-                        "Sign in opens auth.openai.com in your browser and returns to the app automatically.",
+                        "Sign in opens auth.openai.com in your browser, then the app exchanges the returned Codex session for local OpenAI API credentials when that exchange is available.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

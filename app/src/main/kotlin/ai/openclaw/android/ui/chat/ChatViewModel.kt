@@ -20,6 +20,7 @@ import kotlinx.coroutines.withContext
 import java.util.UUID
 
 data class ChatMessage(
+    val id: String = UUID.randomUUID().toString(),
     val role: String,
     val content: String,
     val isStreaming: Boolean = false,
@@ -139,58 +140,65 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
     }
 
     fun sendMessage(text: String) {
-        if (text.isBlank() || isLoading) return
+        val trimmedText = text.trim()
+        if (trimmedText.isEmpty() || isLoading) return
 
         errorMessage = null
 
-        // Create session if new
-        if (currentSessionId == null) {
-            val sessionId = UUID.randomUUID().toString()
-            currentSessionId = sessionId
+        val existingSessionId = currentSessionId
+        val sessionId = existingSessionId ?: UUID.randomUUID().toString().also { generatedId ->
+            currentSessionId = generatedId
             currentAgentId = engine.defaultAgentId()
             currentModelId = engine.preferredModelForAgent(currentAgentId)
-            engine.sessionPersistence.initSession(
-                sessionId,
-                SessionPersistence.SessionHeader(
-                    sessionId = sessionId,
-                    agentId = currentAgentId,
-                    model = currentModelId,
-                ),
+        }
+        val sessionHeader = if (existingSessionId == null) {
+            SessionPersistence.SessionHeader(
+                sessionId = sessionId,
+                agentId = currentAgentId,
+                model = currentModelId,
             )
+        } else {
+            null
         }
 
         // Add user message
-        val userMessage = LlmMessage(role = LlmMessage.Role.USER, content = text)
+        val userMessage = LlmMessage(role = LlmMessage.Role.USER, content = trimmedText)
         conversationHistory.add(userMessage)
-        messages = messages + ChatMessage(role = "user", content = text)
-
-        // Persist user message
-        currentSessionId?.let { sid ->
-            engine.sessionPersistence.appendMessage(sid, userMessage)
-        }
+        messages = messages + ChatMessage(role = "user", content = trimmedText)
 
         // Stream assistant response
         isLoading = true
         val assistantToolCalls = linkedMapOf<String, ChatToolCall>()
         val responseBuilder = StringBuilder()
+        val assistantMessageId = UUID.randomUUID().toString()
 
         // Add a streaming placeholder
-        messages = messages + ChatMessage(role = "assistant", content = "", isStreaming = true)
+        messages = messages + ChatMessage(
+            id = assistantMessageId,
+            role = "assistant",
+            content = "",
+            isStreaming = true,
+        )
 
         viewModelScope.launch {
             try {
+                withContext(Dispatchers.IO) {
+                    sessionHeader?.let { engine.sessionPersistence.initSession(sessionId, it) }
+                    engine.sessionPersistence.appendMessage(sessionId, userMessage)
+                }
                 val flow = engine.sendMessage(
-                    userMessage = text,
+                    userMessage = trimmedText,
                     conversationHistory = conversationHistory.dropLast(1),
                     model = currentModelId,
                     agentId = currentAgentId,
-                    sessionKey = currentSessionId ?: "",
+                    sessionKey = sessionId,
                 )
                 flow.collect { event ->
                     when (event) {
                         is AcpRuntimeEvent.TextDelta -> {
                             responseBuilder.append(event.text)
                             messages = messages.dropLast(1) + ChatMessage(
+                                id = assistantMessageId,
                                 role = "assistant",
                                 content = responseBuilder.toString(),
                                 isStreaming = true,
@@ -200,6 +208,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                         is AcpRuntimeEvent.ToolCall -> {
                             val mergedToolCalls = applyToolCallEvent(assistantToolCalls, event)
                             messages = messages.dropLast(1) + ChatMessage(
+                                id = assistantMessageId,
                                 role = "assistant",
                                 content = responseBuilder.toString(),
                                 isStreaming = true,
@@ -212,6 +221,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                         is AcpRuntimeEvent.Done -> {
                             val finalContent = responseBuilder.toString()
                             messages = messages.dropLast(1) + ChatMessage(
+                                id = assistantMessageId,
                                 role = "assistant",
                                 content = finalContent,
                                 isStreaming = false,
@@ -231,6 +241,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                                 messages = messages.dropLast(1)
                             } else {
                                 messages = messages.dropLast(1) + ChatMessage(
+                                    id = assistantMessageId,
                                     role = "assistant",
                                     content = responseBuilder.toString(),
                                     isStreaming = false,
@@ -246,6 +257,7 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                     val finalContent = responseBuilder.toString()
                     if (finalContent.isNotEmpty()) {
                         messages = messages.dropLast(1) + ChatMessage(
+                            id = assistantMessageId,
                             role = "assistant",
                             content = finalContent,
                             isStreaming = false,
@@ -256,10 +268,8 @@ class ChatViewModel(private val engine: AgentEngine) : ViewModel() {
                             content = finalContent,
                         )
                         conversationHistory.add(assistantMessage)
-                        currentSessionId?.let { sid ->
-                            withContext(Dispatchers.IO) {
-                                engine.sessionPersistence.appendMessage(sid, assistantMessage)
-                            }
+                        withContext(Dispatchers.IO) {
+                            engine.sessionPersistence.appendMessage(sessionId, assistantMessage)
                         }
                     }
                     isLoading = false

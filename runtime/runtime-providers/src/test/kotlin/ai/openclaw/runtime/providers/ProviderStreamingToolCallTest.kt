@@ -63,6 +63,35 @@ class ProviderStreamingToolCallTest {
     }
 
     @Test
+    fun `openai request serializes gpt 5_4 reasoning effort and max completion tokens`() = runTest {
+        enqueueSse("""{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}""")
+
+        val provider = OpenAiProvider(
+            apiKey = "test-key",
+            baseUrl = server.url("/v1").toString().removeSuffix("/"),
+        )
+
+        provider.streamCompletion(
+            LlmRequest(
+                model = "openai/gpt-5.4",
+                messages = listOf(
+                    LlmMessage(role = LlmMessage.Role.USER, content = "hello"),
+                ),
+                maxTokens = 321,
+                reasoningEffort = "xhigh",
+            ),
+        ).toList()
+
+        val recorded = server.takeRequest()
+        val body = json.parseToJsonElement(recorded.body.readUtf8()).jsonObject
+
+        assertEquals("/v1/chat/completions", recorded.path)
+        assertEquals(321, body["max_completion_tokens"]!!.jsonPrimitive.content.toInt())
+        assertTrue(body["max_tokens"] == null)
+        assertEquals("xhigh", body["reasoning_effort"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `ollama stream emits tool calls from native ndjson chunks`() = runTest {
         enqueueNdjson(
             """

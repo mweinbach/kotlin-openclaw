@@ -103,10 +103,17 @@ class OpenAiProvider(
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             if (request.maxTokens > 0) {
-                put("max_tokens", request.maxTokens)
+                put("max_completion_tokens", request.maxTokens)
             }
             if (request.temperature != null) {
                 put("temperature", request.temperature)
+            }
+            val reasoningEffort = normalizeReasoningEffort(
+                modelId = modelId,
+                reasoningEffort = request.reasoningEffort,
+            )
+            if (reasoningEffort != null) {
+                put("reasoning_effort", reasoningEffort)
             }
             if (request.tools.isNotEmpty()) {
                 putJsonArray("tools") {
@@ -243,5 +250,21 @@ class OpenAiProvider(
         var id: String = ""
         var name: String = ""
         val arguments = StringBuilder()
+    }
+
+    private fun normalizeReasoningEffort(modelId: String, reasoningEffort: String?): String? {
+        val normalized = reasoningEffort?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+        if (!supportsReasoningEffort(modelId)) return null
+        val supported = when {
+            modelId.lowercase().startsWith("gpt-5.4-pro") -> setOf("medium", "high", "xhigh")
+            modelId.lowercase().startsWith("gpt-5.4") -> setOf("none", "low", "medium", "high", "xhigh")
+            modelId.lowercase().startsWith("gpt-5.1") -> setOf("none", "low", "medium", "high")
+            else -> setOf("minimal", "low", "medium", "high")
+        }
+        return normalized.takeIf { it in supported }
+    }
+
+    private fun supportsReasoningEffort(modelId: String): Boolean {
+        return modelId.lowercase().startsWith("gpt-5")
     }
 }

@@ -1,6 +1,10 @@
 package ai.openclaw.android.ui.channels
 
 import ai.openclaw.android.AgentEngine
+import ai.openclaw.core.model.ChannelsConfig
+import ai.openclaw.core.model.OpenClawConfig
+import ai.openclaw.core.model.TelegramAccountConfig
+import ai.openclaw.core.model.TelegramConfig
 import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import kotlinx.coroutines.Dispatchers
@@ -16,6 +20,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -66,6 +71,32 @@ class ChannelsViewModelTest {
         val vm = ChannelsViewModel(engine)
         vm.removeChannel("nonexistent")
         advanceUntilIdle()
+    }
+
+    @Test
+    fun `removeChannel preserves sibling accounts for account based configs`() = runTest(testDispatcher) {
+        engine.saveConfig(
+            OpenClawConfig(
+                channels = ChannelsConfig(
+                    telegram = TelegramConfig(
+                        enabled = true,
+                        accounts = mapOf(
+                            "alpha" to TelegramAccountConfig(),
+                            "beta" to TelegramAccountConfig(),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val vm = ChannelsViewModel(engine)
+        vm.removeChannel("telegram:alpha")
+        advanceUntilIdle()
+
+        assertEquals(
+            setOf("beta"),
+            engine.config.channels?.telegram?.accounts?.keys,
+        )
     }
 
     @Test

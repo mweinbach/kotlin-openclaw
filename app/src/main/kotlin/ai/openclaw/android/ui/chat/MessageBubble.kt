@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -125,7 +126,7 @@ private fun ToolCallCard(toolCall: ChatToolCall) {
 
 @Composable
 private fun RichContent(text: String, isUser: Boolean) {
-    val segments = parseCodeBlocks(text)
+    val segments = remember(text) { parseCodeBlocks(text) }
     val textColor = if (isUser) {
         MaterialTheme.colorScheme.onPrimaryContainer
     } else {

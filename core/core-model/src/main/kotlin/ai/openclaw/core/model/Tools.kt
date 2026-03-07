@@ -53,11 +53,27 @@ data class ExecApplyPatchConfig(
 )
 
 @Serializable
+data class ManagedNodeToolchainConfig(
+    val enabled: Boolean? = null,
+    val autoInstall: Boolean? = null,
+    val version: String? = null,
+    val baseUrl: String? = null,
+    val downloadUrl: String? = null,
+    val sha256: String? = null,
+)
+
+@Serializable
+data class ManagedExecToolchainsConfig(
+    val node: ManagedNodeToolchainConfig? = null,
+)
+
+@Serializable
 data class ExecToolConfig(
     val host: String? = null,
     val security: String? = null,
     val ask: String? = null,
     val node: String? = null,
+    val managed: ManagedExecToolchainsConfig? = null,
     val pathPrepend: List<String>? = null,
     val safeBins: List<String>? = null,
     val safeBinTrustedDirs: List<String>? = null,

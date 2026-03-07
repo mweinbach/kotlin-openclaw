@@ -120,7 +120,7 @@ class GatewayServer(
     )
 
     // Managed coroutine scope for background work (chat streaming, etc.)
-    private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var serverScope = createServerScope()
 
     init {
         registerCoreMethods()
@@ -129,6 +129,10 @@ class GatewayServer(
     // --- Lifecycle ---
 
     fun start() {
+        if (server != null) return
+        if (serverScope.coroutineContext[kotlinx.coroutines.Job]?.isActive != true) {
+            serverScope = createServerScope()
+        }
         server = embeddedServer(Netty, port = port, host = host) {
             install(ContentNegotiation) {
                 json(json)
@@ -145,13 +149,16 @@ class GatewayServer(
     }
 
     fun stop() {
-        serverScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+        serverScope.coroutineContext.cancelChildren(CancellationException("gateway.stop"))
+        clearTransientChatState()
         connections.clear()
         server?.stop(1000, 5000)
         server = null
     }
 
     val isRunning: Boolean get() = server != null
+
+    private fun createServerScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // --- REST Routes ---
 
@@ -1179,6 +1186,16 @@ class GatewayServer(
         val next = (chatSeqByRun[runId] ?: 0) + 1
         chatSeqByRun[runId] = next
         return next
+    }
+
+    private fun clearTransientChatState() {
+        activeChatJobs.clear()
+        activeChatSessions.clear()
+        activeChatConnections.clear()
+        chatBuffers.clear()
+        chatSeqByRun.clear()
+        abortedChatRuns.clear()
+        persistedAbortRuns.clear()
     }
 
     private suspend fun abortActiveChatRun(

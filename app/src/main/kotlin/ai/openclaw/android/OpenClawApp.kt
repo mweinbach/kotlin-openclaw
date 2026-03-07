@@ -1,10 +1,6 @@
 package ai.openclaw.android
 
 import android.app.Application
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -12,18 +8,11 @@ import kotlinx.coroutines.runBlocking
  * Initializes the agent engine and subsystems on startup.
  */
 class OpenClawApp : Application() {
-    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
     val engine: AgentEngine by lazy { AgentEngine(this) }
 
     override fun onCreate() {
         super.onCreate()
         instance = this
-
-        // Initialize engine asynchronously.
-        appScope.launch {
-            runCatching { engine.initialize() }
-        }
     }
 
     override fun onTerminate() {

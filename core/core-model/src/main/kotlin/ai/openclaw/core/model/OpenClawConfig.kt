@@ -189,6 +189,11 @@ data class UiConfig(
 )
 
 @Serializable
+data class AppRuntimeConfig(
+    val keepAliveInBackground: Boolean? = null,
+)
+
+@Serializable
 data class WebReconnectConfig(
     val initialMs: Long? = null,
     val maxMs: Long? = null,
@@ -259,6 +264,7 @@ data class OpenClawConfig(
     val update: UpdateConfig? = null,
     val browser: BrowserConfig? = null,
     val ui: UiConfig? = null,
+    val appRuntime: AppRuntimeConfig? = null,
     val secrets: SecretsConfig? = null,
     val skills: SkillsConfig? = null,
     val plugins: PluginsConfig? = null,

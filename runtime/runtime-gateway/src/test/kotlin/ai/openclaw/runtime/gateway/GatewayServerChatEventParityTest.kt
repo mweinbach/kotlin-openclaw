@@ -1,11 +1,17 @@
 package ai.openclaw.runtime.gateway
 
 import ai.openclaw.core.model.AcpRuntimeEvent
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.*
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -22,6 +28,39 @@ class GatewayServerChatEventParityTest {
             ),
             gateway = server,
         )
+    }
+
+    private fun chatSendRequest(
+        id: String,
+        runId: String,
+        sessionKey: String = "s1",
+        message: String = "hello",
+    ): GatewayRequestFrame {
+        return GatewayRequestFrame(
+            id = id,
+            method = "chat.send",
+            params = buildJsonObject {
+                put("sessionKey", sessionKey)
+                put("message", message)
+                put("idempotencyKey", runId)
+            },
+        )
+    }
+
+    private fun GatewayServer.privateCollectionSize(fieldName: String): Int {
+        val field = GatewayServer::class.java.getDeclaredField(fieldName)
+        field.isAccessible = true
+        return when (val value = field.get(this)) {
+            is Map<*, *> -> value.size
+            is Collection<*> -> value.size
+            else -> error("Unsupported field type for $fieldName: ${value?.javaClass?.name}")
+        }
+    }
+
+    private suspend fun awaitRealtime(signal: CompletableDeferred<Unit>) {
+        withContext(Dispatchers.IO) {
+            withTimeout(2_000) { signal.await() }
+        }
     }
 
     @Test
@@ -214,6 +253,80 @@ class GatewayServerChatEventParityTest {
         assertEquals("run-1", second.payload?.jsonObject?.get("runId")?.jsonPrimitive?.content)
         assertEquals("in_flight", second.payload?.jsonObject?.get("status")?.jsonPrimitive?.content)
         server.stop()
+    }
+
+    @Test
+    fun `stop clears chat state and later chat runs still start`() = runTest {
+        val server = GatewayServer()
+        val firstBlocked = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val secondStarted = CompletableDeferred<Unit>()
+        val invocations = AtomicInteger(0)
+        server.onChatSend = {
+            flow {
+                when (invocations.incrementAndGet()) {
+                    1 -> {
+                        emit(AcpRuntimeEvent.TextDelta(text = "partial"))
+                        withContext(NonCancellable) {
+                            firstBlocked.complete(Unit)
+                            releaseFirst.await()
+                        }
+                    }
+
+                    2 -> {
+                        secondStarted.complete(Unit)
+                        emit(AcpRuntimeEvent.Done(stopReason = "end_turn"))
+                    }
+
+                    else -> error("unexpected chat invocation")
+                }
+            }
+        }
+
+        try {
+            val first = server.dispatcher.dispatch(
+                chatSendRequest(
+                    id = "req-1",
+                    runId = "run-1",
+                ),
+                adminContext(server),
+            )
+
+            assertEquals(true, first.ok)
+            assertEquals("run-1", first.payload?.jsonObject?.get("runId")?.jsonPrimitive?.content)
+            assertEquals("started", first.payload?.jsonObject?.get("status")?.jsonPrimitive?.content)
+            awaitRealtime(firstBlocked)
+
+            assertTrue(server.privateCollectionSize("activeChatJobs") > 0)
+            assertTrue(server.privateCollectionSize("activeChatSessions") > 0)
+            assertTrue(server.privateCollectionSize("activeChatConnections") > 0)
+            assertTrue(server.privateCollectionSize("chatBuffers") > 0)
+            assertTrue(server.privateCollectionSize("chatSeqByRun") > 0)
+
+            server.stop()
+
+            assertEquals(0, server.privateCollectionSize("activeChatJobs"))
+            assertEquals(0, server.privateCollectionSize("activeChatSessions"))
+            assertEquals(0, server.privateCollectionSize("activeChatConnections"))
+            assertEquals(0, server.privateCollectionSize("chatBuffers"))
+            assertEquals(0, server.privateCollectionSize("chatSeqByRun"))
+
+            val second = server.dispatcher.dispatch(
+                chatSendRequest(
+                    id = "req-2",
+                    runId = "run-2",
+                ),
+                adminContext(server),
+            )
+
+            assertEquals(true, second.ok)
+            assertEquals("run-2", second.payload?.jsonObject?.get("runId")?.jsonPrimitive?.content)
+            assertEquals("started", second.payload?.jsonObject?.get("status")?.jsonPrimitive?.content)
+            awaitRealtime(secondStarted)
+        } finally {
+            releaseFirst.complete(Unit)
+            server.stop()
+        }
     }
 
     @Test

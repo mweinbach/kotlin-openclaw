@@ -11,6 +11,8 @@ import java.util.concurrent.ConcurrentHashMap
 class ChannelManager(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
+    class NonRetryableChannelException(message: String) : IllegalStateException(message)
+
     /**
      * Interface for channel adapters to implement for gateway integration.
      */
@@ -43,6 +45,23 @@ class ChannelManager(
     fun registerChannel(adapter: ChannelAdapter, accountId: String = "default") {
         val key = channelKey(adapter.channelId, accountId)
         channels[key] = ChannelAccountState(adapter = adapter, accountId = accountId)
+    }
+
+    suspend fun replaceChannels(
+        registrations: List<Pair<ChannelAdapter, String>>,
+        defaultStoppedKeys: Set<String> = emptySet(),
+    ) {
+        val manuallyStopped = channels.mapValues { (_, state) -> state.manuallyStopped }
+        stopAll()
+        channels.clear()
+        for ((adapter, accountId) in registrations) {
+            val key = channelKey(adapter.channelId, accountId)
+            channels[key] = ChannelAccountState(
+                adapter = adapter,
+                accountId = accountId,
+                manuallyStopped = manuallyStopped[key] ?: (key in defaultStoppedKeys),
+            )
+        }
     }
 
     fun setInboundHandler(handler: suspend (InboundMessage) -> Unit) {
@@ -91,10 +110,15 @@ class ChannelManager(
             state.status = ChannelStatus.RUNNING
             state.startedAt = System.currentTimeMillis()
             state.restartAttempts = 0
+        } catch (e: CancellationException) {
+            state.status = ChannelStatus.STOPPED
+            throw e
         } catch (e: Exception) {
             state.status = ChannelStatus.ERROR
             state.error = e.message
-            scheduleRestart(state)
+            if (e !is NonRetryableChannelException) {
+                scheduleRestart(state)
+            }
         }
     }
 

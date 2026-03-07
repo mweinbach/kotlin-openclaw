@@ -184,7 +184,6 @@ class ChannelsViewModel(private val engine: AgentEngine) : ViewModel() {
             val config = engine.config
             val updatedChannels = removeChannelFromConfig(config.channels, type, accountId)
             engine.saveConfig(config.copy(channels = updatedChannels))
-            engine.reloadConfig()
             refresh()
         }
     }
@@ -196,32 +195,83 @@ class ChannelsViewModel(private val engine: AgentEngine) : ViewModel() {
     ): ChannelsConfig? {
         if (channels == null) return null
         return when (type) {
-            "telegram" -> channels.copy(telegram = removeAccount(channels.telegram, accountId))
-            "discord" -> channels.copy(discord = removeAccount(channels.discord, accountId))
-            "slack" -> channels.copy(slack = removeAccount(channels.slack, accountId))
-            "signal" -> channels.copy(signal = removeAccount(channels.signal, accountId))
-            "matrix" -> channels.copy(matrix = removeAccount(channels.matrix, accountId))
-            "irc" -> channels.copy(irc = removeAccount(channels.irc, accountId))
-            "googlechat" -> channels.copy(googlechat = removeAccount(channels.googlechat, accountId))
-            "whatsapp" -> channels.copy(whatsapp = removeAccount(channels.whatsapp, accountId))
+            "telegram" -> channels.copy(
+                telegram = removeAccountConfig(channels.telegram, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "discord" -> channels.copy(
+                discord = removeAccountConfig(channels.discord, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "slack" -> channels.copy(
+                slack = removeAccountConfig(channels.slack, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "signal" -> channels.copy(
+                signal = removeAccountConfig(channels.signal, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "matrix" -> channels.copy(
+                matrix = removeAccountConfig(channels.matrix, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "irc" -> channels.copy(
+                irc = removeAccountConfig(channels.irc, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "googlechat" -> channels.copy(
+                googlechat = removeAccountConfig(channels.googlechat, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "whatsapp" -> channels.copy(
+                whatsapp = removeAccountConfig(channels.whatsapp, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
             "msteams" -> channels.copy(msteams = null)
-            "imessage" -> channels.copy(imessage = removeAccount(channels.imessage, accountId))
-            "line" -> channels.copy(line = removeAccount(channels.line, accountId))
-            "mattermost" -> channels.copy(mattermost = removeAccount(channels.mattermost, accountId))
-            "nostr" -> channels.copy(nostr = removeAccount(channels.nostr, accountId))
+            "imessage" -> channels.copy(
+                imessage = removeAccountConfig(channels.imessage, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "line" -> channels.copy(
+                line = removeAccountConfig(channels.line, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "mattermost" -> channels.copy(
+                mattermost = removeAccountConfig(channels.mattermost, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
+            "nostr" -> channels.copy(
+                nostr = removeAccountConfig(channels.nostr, accountId, { it.accounts }) { cfg, accounts ->
+                    cfg.copy(accounts = accounts)
+                },
+            )
             "webchat" -> channels.copy(webchat = null)
             else -> channels
         }
     }
 
-    @Suppress("UNCHECKED_CAST")
-    private fun <T> removeAccount(cfg: Any?, accountId: String): T? {
+    private fun <C, A> removeAccountConfig(
+        cfg: C?,
+        accountId: String,
+        accountsOf: (C) -> Map<String, A>?,
+        copyWithAccounts: (C, Map<String, A>) -> C,
+    ): C? {
         if (cfg == null) return null
-        // Use reflection-free approach: for account-based configs, if removing the only account,
-        // remove the whole config. The caller passes the typed config.
-        // Since we can't generically access .accounts on different types, we null the whole config
-        // when removing. A more precise approach would need per-type handling.
-        return null as T?
+        val updatedAccounts = accountsOf(cfg)
+            .orEmpty()
+            .filterKeys { it != accountId }
+        return if (updatedAccounts.isEmpty()) null else copyWithAccounts(cfg, updatedAccounts)
     }
 
     class Factory(private val engine: AgentEngine) : ViewModelProvider.Factory {

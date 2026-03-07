@@ -33,8 +33,9 @@ class AgentForegroundService : Service() {
                 statusJob = null
                 scope.launch {
                     val app = application as OpenClawApp
-                    runCatching { app.engine.channelManager.stopAll() }
-                    updateNotification("Paused", "Channels stopped")
+                    runCatching { app.engine.stopBackgroundRuntime() }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
                 }
             }
             else -> {
@@ -42,7 +43,7 @@ class AgentForegroundService : Service() {
                 statusJob = scope.launch {
                     val app = application as OpenClawApp
                     try {
-                        app.engine.initialize()
+                        app.engine.startBackgroundRuntime()
                         updateStatusNotification(app.engine)
 
                         // Periodically update notification with live stats.
@@ -61,6 +62,8 @@ class AgentForegroundService : Service() {
 
     override fun onDestroy() {
         statusJob?.cancel()
+        val app = application as OpenClawApp
+        runCatching { runBlocking { app.engine.stopBackgroundRuntime() } }
         scope.cancel()
         super.onDestroy()
     }
@@ -154,6 +157,15 @@ class AgentForegroundService : Service() {
                 ContextCompat.startForegroundService(appContext, intent)
             }.onFailure {
                 Log.w(TAG, "Unable to start foreground service", it)
+            }
+        }
+
+        fun stop(context: Context) {
+            val appContext = context.applicationContext
+            runCatching {
+                appContext.stopService(Intent(appContext, AgentForegroundService::class.java))
+            }.onFailure {
+                Log.w(TAG, "Unable to stop foreground service", it)
             }
         }
     }

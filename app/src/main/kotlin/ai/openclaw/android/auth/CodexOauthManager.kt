@@ -19,8 +19,14 @@ import java.util.Base64
 
 /**
  * Handles Codex OAuth authorization URL generation and token exchange using PKCE.
+ *
+ * Mirrors the official Codex login flow closely enough for this app: browser OAuth yields
+ * ChatGPT/Codex tokens, then the ID token is exchanged for an API-key-style credential.
  */
-class CodexOauthManager(context: Context) {
+class CodexOauthManager(
+    context: Context,
+    private val issuer: String = ISSUER,
+) {
     data class CodexOauthSession(
         val accessToken: String,
         val refreshToken: String?,
@@ -28,6 +34,7 @@ class CodexOauthManager(context: Context) {
         val expiresAtMs: Long?,
         val accountId: String?,
         val email: String?,
+        val apiKey: String?,
     )
 
     private val appContext = context.applicationContext
@@ -52,7 +59,7 @@ class CodexOauthManager(context: Context) {
             .putLong(KEY_PENDING_CREATED_AT_MS, createdAt)
             .apply()
 
-        return Uri.parse("$ISSUER/oauth/authorize")
+        return Uri.parse("$issuer/oauth/authorize")
             .buildUpon()
             .appendQueryParameter("response_type", "code")
             .appendQueryParameter("client_id", CLIENT_ID)
@@ -105,8 +112,8 @@ class CodexOauthManager(context: Context) {
             val body = "grant_type=refresh_token" +
                 "&refresh_token=${Uri.encode(refreshToken)}" +
                 "&client_id=${Uri.encode(CLIENT_ID)}"
-            val response = postForm("$ISSUER/oauth/token", body)
-            parseTokenResponse(response)
+            val response = postForm("$issuer/oauth/token", body)
+            enrichSessionWithApiKey(parseTokenResponse(response))
         }
     }
 
@@ -120,8 +127,30 @@ class CodexOauthManager(context: Context) {
             "&redirect_uri=${Uri.encode(redirectUri())}" +
             "&client_id=${Uri.encode(CLIENT_ID)}" +
             "&code_verifier=${Uri.encode(codeVerifier)}"
-        val response = postForm("$ISSUER/oauth/token", body)
-        return parseTokenResponse(response)
+        val response = postForm("$issuer/oauth/token", body)
+        return enrichSessionWithApiKey(parseTokenResponse(response))
+    }
+
+    fun exchangeApiKeyFromIdToken(idToken: String): String {
+        val normalized = idToken.trim()
+        require(normalized.isNotEmpty()) { "Codex OAuth ID token cannot be blank" }
+        val body = "grant_type=${Uri.encode(TOKEN_EXCHANGE_GRANT_TYPE)}" +
+            "&client_id=${Uri.encode(CLIENT_ID)}" +
+            "&requested_token=${Uri.encode(REQUESTED_OPENAI_API_KEY_TOKEN)}" +
+            "&subject_token=${Uri.encode(normalized)}" +
+            "&subject_token_type=${Uri.encode(ID_TOKEN_TYPE)}"
+        val response = postForm("$issuer/oauth/token", body)
+        val obj = json.parseToJsonElement(response).jsonObject
+        return obj["access_token"]?.jsonPrimitive?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("Token exchange response missing access_token.")
+    }
+
+    private fun enrichSessionWithApiKey(session: CodexOauthSession): CodexOauthSession {
+        val idToken = session.idToken?.trim().orEmpty()
+        if (idToken.isBlank()) return session.copy(apiKey = null)
+        val apiKey = runCatching { exchangeApiKeyFromIdToken(idToken) }.getOrNull()
+        return session.copy(apiKey = apiKey)
     }
 
     private fun postForm(url: String, body: String): String {
@@ -165,6 +194,7 @@ class CodexOauthManager(context: Context) {
             expiresAtMs = expiresAtMs,
             accountId = accountId,
             email = email,
+            apiKey = null,
         )
     }
 
@@ -244,6 +274,9 @@ class CodexOauthManager(context: Context) {
     companion object {
         const val CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
         const val ISSUER = "https://auth.openai.com"
+        private const val TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+        private const val ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token"
+        private const val REQUESTED_OPENAI_API_KEY_TOKEN = "openai-api-key"
 
         private const val PREFS_NAME = "openclaw_oauth"
         private const val KEY_PENDING_STATE = "codex_pending_state"
