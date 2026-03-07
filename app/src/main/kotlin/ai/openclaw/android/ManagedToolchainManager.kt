@@ -174,7 +174,8 @@ class ManagedToolchainManager(
         execEnvironment: ResolvedExecEnvironment,
     ): ManagedToolchainStatus {
         val path = execEnvironment.environment["PATH"]
-        val availableBins = (ESSENTIAL_JS_BINS + RECOMMENDED_HOST_BINS)
+        val recommendedHostBins = recommendedHostBins(activation)
+        val availableBins = (ESSENTIAL_JS_BINS + recommendedHostBins)
             .filter { bin ->
                 when (bin) {
                     "node" -> !execEnvironment.nodePath.isNullOrBlank()
@@ -184,7 +185,7 @@ class ManagedToolchainManager(
             .distinct()
 
         val missingEssentialBins = ESSENTIAL_JS_BINS.filterNot { it in availableBins }
-        val missingRecommendedBins = RECOMMENDED_HOST_BINS.filterNot { it in availableBins }
+        val missingRecommendedBins = recommendedHostBins.filterNot { it in availableBins }
         val managedNodePath = activation.nodeRecord?.nodePath
 
         return ManagedToolchainStatus(
@@ -199,6 +200,15 @@ class ManagedToolchainManager(
             missingEssentialBins = missingEssentialBins,
             missingRecommendedBins = missingRecommendedBins,
         )
+    }
+
+    private fun recommendedHostBins(activation: ManagedToolchainActivation): List<String> {
+        val platform = activation.nodeRecord?.platform ?: platformDetector().label
+        return if (platform.startsWith("android-")) {
+            ANDROID_RECOMMENDED_HOST_BINS
+        } else {
+            DESKTOP_RECOMMENDED_HOST_BINS
+        }
     }
 
     private suspend fun installNodeInternal(
@@ -804,7 +814,8 @@ class ManagedToolchainManager(
         private const val ANDROID_HOME_SUBDIR = "home"
         private const val TAR_BLOCK_SIZE = 512
         private val ESSENTIAL_JS_BINS = listOf("node", "npm", "npx", "corepack")
-        private val RECOMMENDED_HOST_BINS = listOf("git", "rg")
+        private val ANDROID_RECOMMENDED_HOST_BINS = listOf("rg")
+        private val DESKTOP_RECOMMENDED_HOST_BINS = listOf("git", "rg")
         private val SHA256_HEX = Regex("^[0-9a-fA-F]{64}$")
 
         private fun androidBundleArchiveName(

@@ -39,11 +39,13 @@ The bundle currently includes:
 - `corepack`
 - `rg` via the Termux `ripgrep` package
 
+The Android bundle intentionally does not include `git`. The current Termux `git` recipe enables Tcl/Tk and Perl features, which drags in a large desktop-oriented dependency tree (`fontconfig`, X11 macros/protocols, Subversion, and more) that does not make sense for the on-device OpenClaw runtime.
+
 The repository no longer auto-builds or auto-publishes this bundle in GitHub Actions. Build and publish happen from your local machine with the scripts in `scripts/`.
 
 To build the bundle locally:
 
-1. Ensure your machine has `docker`, `git`, `python3`, and the archive tools required by `scripts/build_android_node_bundle.sh`.
+1. Ensure your machine has `docker`, `gh`, `git`, `python3`, and the archive tools required by `scripts/build_android_node_bundle.sh`.
 2. Run `./scripts/publish_android_node_bundle.sh`.
 
 Useful overrides:
@@ -51,13 +53,18 @@ Useful overrides:
 - `RELEASE_TAG=toolchain-node-android-arm64`
 - `COREPACK_VERSION=0.34.6`
 - `GITHUB_REPOSITORY=mweinbach/kotlin-openclaw`
+- `TERMUX_PKG_MAKE_PROCESSES=2`
+- `SKIP_TERMUX_BUILD=1` to package and upload from an already-built `termux-packages` work tree
 
 The local publisher script:
 - clones `termux-packages`
 - patches `TERMUX_APP__PACKAGE_NAME` to `ai.openclaw.android`
+- starts the local Termux builder container and installs a working `ninja-build` into it
 - builds the required runtime packages for `aarch64`
 - repackages them into a rootfs-style bundle rooted at `files/usr`
 - adds a pinned `corepack` payload
 - uploads the versioned bundle assets plus the stable manifest to GitHub Releases with `gh release upload --clobber`
+
+The publisher defaults `TERMUX_DOCKER_RUN_EXTRA_ARGS` to a privileged container run because the local Termux Docker flow uses `fuse-overlayfs`. Override that env var if you need a different Docker runtime setup.
 
 The packager lives at `scripts/build_android_node_bundle.sh`. The local publisher lives at `scripts/publish_android_node_bundle.sh`.

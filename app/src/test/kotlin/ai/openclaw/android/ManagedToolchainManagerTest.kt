@@ -270,6 +270,11 @@ class ManagedToolchainManagerTest {
                     content = "console.log('corepack');".toByteArray(),
                 ),
                 TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/bin/rg",
+                    content = "#!/bin/sh\necho rg\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+                TarEntry(
                     path = "openclaw-node-$version-android-arm64/usr/etc/tls/cert.pem",
                     content = "cert".toByteArray(),
                 ),
@@ -326,6 +331,10 @@ class ManagedToolchainManagerTest {
         assertEquals(context.filesDir.resolve("usr/lib").absolutePath, resolved.environment["LD_LIBRARY_PATH"])
         assertEquals(context.filesDir.resolve("usr/etc/tls/cert.pem").absolutePath, resolved.environment["SSL_CERT_FILE"])
         assertTrue(resolved.nodePath?.endsWith("/usr/bin/node") == true)
+
+        val status = manager.buildStatus(activation, resolved)
+        assertEquals(listOf("corepack", "node", "npm", "npx", "rg"), status.availableBins)
+        assertTrue(status.missingRecommendedBins.isEmpty())
     }
 
     private data class TarEntry(
