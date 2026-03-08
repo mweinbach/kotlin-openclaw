@@ -380,8 +380,7 @@ class ManagedToolchainManager(
 
         val packagedNodeBinary = locateAndroidApkRuntimeBinary(ANDROID_APK_NODE_BINARY)
         require(packagedNodeBinary != null || context.applicationInfo.targetSdkVersion < 29) {
-            "Managed Android Node runtime requires APK-packaged native binaries under " +
-                "nativeLibraryDir; $ANDROID_APK_NODE_BINARY is missing."
+            missingAndroidApkRuntimeBinaryMessage(ANDROID_APK_NODE_BINARY)
         }
         val finalNodeBinary = packagedNodeBinary ?: locateNodeBinary(finalPrefixDir)
         val finalBinDir = finalPrefixDir.resolve("bin")
@@ -736,6 +735,35 @@ class ManagedToolchainManager(
         val runtimeDir = androidApkRuntimeDirProvider() ?: return null
         return runtimeDir.resolve(fileName)
             .takeIf { it.exists() && it.canExecute() }
+    }
+
+    private fun missingAndroidApkRuntimeBinaryMessage(fileName: String): String {
+        val runtimeDir = androidApkRuntimeDirProvider()
+        return buildString {
+            append("Managed Android Node runtime requires APK-packaged native binaries under ")
+            append("nativeLibraryDir; $fileName is missing")
+            when {
+                runtimeDir == null -> {
+                    append(" (nativeLibraryDir is null)")
+                }
+
+                else -> {
+                    append(" (nativeLibraryDir=${runtimeDir.absolutePath}")
+                    append(", exists=${runtimeDir.exists()}")
+                    append(", isDirectory=${runtimeDir.isDirectory}")
+                    val visibleFiles = runtimeDir.list()
+                        ?.sorted()
+                        ?.joinToString(limit = 8, truncated = "...") { it }
+                    if (!visibleFiles.isNullOrBlank()) {
+                        append(", files=$visibleFiles")
+                    }
+                    append(")")
+                }
+            }
+            append(". Ensure the app is installed from an APK/AAB built with ")
+            append("packaging.jniLibs.useLegacyPackaging = true so Android extracts ")
+            append("the packaged $fileName binary onto disk under nativeLibraryDir.")
+        }
     }
 
     private fun moveDirectory(source: File, destination: File): Boolean {

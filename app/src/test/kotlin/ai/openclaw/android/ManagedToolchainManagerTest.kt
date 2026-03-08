@@ -22,6 +22,7 @@ import java.time.Instant
 import java.util.zip.GZIPOutputStream
 import kotlin.test.assertFalse
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -427,6 +428,63 @@ class ManagedToolchainManagerTest {
         val status = manager.buildStatus(activation, resolved)
         assertEquals(listOf("corepack", "node", "npm", "npx", "rg"), status.availableBins)
         assertTrue(status.missingRecommendedBins.isEmpty())
+    }
+
+    @Test
+    fun `installNode reports missing extracted apk runtime binaries with packaging guidance`() = runTest {
+        val version = "v25.3.0"
+        val archiveName = "openclaw-node-$version-android-arm64.tar.xz"
+        val apkRuntimeDir = context.filesDir.resolve("apk-native-missing").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        apkRuntimeDir.resolve("libc++_shared.so").writeText("placeholder")
+        val archiveBytes = createTarXzArchive(
+            entries = listOf(
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/bin/node",
+                    content = "#!/bin/sh\necho $version\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+            ),
+        )
+        val sha256 = sha256(archiveBytes)
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+            platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+            androidApkRuntimeDirProvider = { apkRuntimeDir },
+            downloadToFile = { _, _ ->
+                error("Built-in Android bundle should not hit the network when bundled in the APK")
+            },
+            extractBundledAssetToFile = { assetPath, target ->
+                assertEquals("toolchains/$archiveName", assetPath)
+                target.writeBytes(archiveBytes)
+                true
+            },
+            nowProvider = { Instant.parse("2026-03-07T00:00:00Z") },
+        )
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            manager.installNode(
+                OpenClawConfig(
+                    tools = ExpandedToolsConfig(
+                        exec = ExecToolConfig(
+                            managed = ManagedExecToolchainsConfig(
+                                node = ManagedNodeToolchainConfig(
+                                    version = version.removePrefix("v"),
+                                    sha256 = sha256,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        assertTrue(error.message?.contains("libopenclaw_node.so is missing") == true)
+        assertTrue(error.message?.contains(apkRuntimeDir.absolutePath) == true)
+        assertTrue(error.message?.contains("useLegacyPackaging = true") == true)
     }
 
     @Test

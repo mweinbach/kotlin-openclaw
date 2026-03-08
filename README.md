@@ -33,6 +33,8 @@ That bundled archive is not sufficient by itself on modern Android app targets. 
 - the managed runtime executes Node and ripgrep from `applicationInfo.nativeLibraryDir` instead of `files/usr/bin`
 - shell shims map `npm`, `npx`, `corepack`, and `rg` back onto that APK-backed Node binary plus the extracted JS payload
 
+Those packaged ELF binaries must also be extracted onto disk at install time. Keep `packaging.jniLibs.useLegacyPackaging = true` enabled in `app/build.gradle.kts`; AGP will derive the effective `extractNativeLibs` setting for the packaged app from that build configuration.
+
 For the current baked-in Android bundle, the app hardcodes the exact GitHub release asset URL and SHA-256 for `openclaw-node-v25.3.0-android-arm64.tar.xz`, so normal installs do not need a separate checksum lookup or manual dashboard configuration.
 
 Assets:
