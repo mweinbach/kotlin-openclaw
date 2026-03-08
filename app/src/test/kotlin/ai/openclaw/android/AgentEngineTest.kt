@@ -297,7 +297,7 @@ class AgentEngineTest {
         val status = arm64Engine.currentToolchainStatus()
 
         assertTrue(status.nodeSupported)
-        assertTrue(status.nodeMessage?.contains("GitHub Releases") == true)
+        assertTrue(status.nodeMessage?.contains("baked-in OpenClaw release metadata") == true)
     }
 
     @Test

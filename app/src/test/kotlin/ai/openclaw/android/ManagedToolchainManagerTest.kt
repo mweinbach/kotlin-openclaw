@@ -194,7 +194,7 @@ class ManagedToolchainManagerTest {
         val activation = manager.prepare(OpenClawConfig())
 
         assertTrue(activation.nodeSupported)
-        assertTrue(activation.nodeMessage?.contains("GitHub Releases") == true)
+        assertTrue(activation.nodeMessage?.contains("baked-in OpenClaw release metadata") == true)
     }
 
     @Test
@@ -244,6 +244,76 @@ class ManagedToolchainManagerTest {
         assertTrue(activation.nodeSupported)
         assertNotNull(activation.nodePath)
         assertTrue(File(activation.nodePath!!).exists())
+    }
+
+    @Test
+    fun `installNode uses baked in android release metadata without checksum fetch`() = runTest {
+        val version = "v25.3.0"
+        val archiveName = "openclaw-node-$version-android-arm64.tar.xz"
+        val archiveBytes = createTarXzArchive(
+            entries = listOf(
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/bin/node",
+                    content = "#!/bin/sh\necho $version\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/npm/bin/npm-cli.js",
+                    content = "console.log('npm');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/npm/bin/npx-cli.js",
+                    content = "console.log('npx');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/lib/node_modules/corepack/dist/corepack.js",
+                    content = "console.log('corepack');".toByteArray(),
+                ),
+                TarEntry(
+                    path = "openclaw-node-$version-android-arm64/usr/bin/rg",
+                    content = "#!/bin/sh\necho rg\n".toByteArray(),
+                    mode = 0b111101101,
+                ),
+            ),
+        )
+        val sha256 = sha256(archiveBytes)
+        var checksumFetches = 0
+        val expectedUrl =
+            "https://github.com/mweinbach/kotlin-openclaw/releases/download/" +
+                "toolchain-node-android-arm64/$archiveName"
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+            platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+            downloadToFile = { url, target ->
+                assertEquals(expectedUrl, url)
+                target.writeBytes(archiveBytes)
+            },
+            downloadText = {
+                checksumFetches += 1
+                error("Built-in Android bundle should not need a checksum fetch")
+            },
+            nowProvider = { Instant.parse("2026-03-07T00:00:00Z") },
+        )
+
+        val activation = manager.installNode(
+            OpenClawConfig(
+                tools = ExpandedToolsConfig(
+                    exec = ExecToolConfig(
+                        managed = ManagedExecToolchainsConfig(
+                            node = ManagedNodeToolchainConfig(
+                                version = version.removePrefix("v"),
+                                sha256 = sha256,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        assertTrue(activation.nodeSupported)
+        assertNotNull(activation.nodePath)
+        assertEquals(0, checksumFetches)
     }
 
     @Test

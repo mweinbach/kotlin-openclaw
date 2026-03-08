@@ -102,6 +102,14 @@ private data class ManagedNodeInstallRequest(
     val archiveName: String,
 )
 
+private data class BuiltInNodeBundle(
+    val version: String,
+    val arch: String,
+    val archiveName: String,
+    val downloadUrl: String,
+    val sha256: String,
+)
+
 class ManagedToolchainManager(
     private val context: Context,
     private val client: OkHttpClient,
@@ -402,6 +410,18 @@ class ManagedToolchainManager(
             require(platform.arch == ANDROID_RELEASE_ARCH) {
                 unsupportedBuiltInMessage(platform)
             }
+            val explicitBaseUrl = nodeConfig?.baseUrl?.trim()?.takeIf { it.isNotEmpty() }
+            val builtInBundle = builtInAndroidBundle(version, platform)
+            if (explicitBaseUrl == null && builtInBundle != null) {
+                return ManagedNodeInstallRequest(
+                    version = version,
+                    platform = platform,
+                    url = builtInBundle.downloadUrl,
+                    sha256 = nodeConfig?.sha256?.trim()?.takeIf { it.isNotEmpty() } ?: builtInBundle.sha256,
+                    shasumsUrl = null,
+                    archiveName = builtInBundle.archiveName,
+                )
+            }
             val baseUrl = normalizeBaseUrl(nodeConfig, platform)
             val archiveName = androidBundleArchiveName(version, platform)
             return ManagedNodeInstallRequest(
@@ -591,7 +611,7 @@ class ManagedToolchainManager(
     private fun unsupportedBuiltInMessage(platform: ToolchainPlatform): String {
         return if (platform.os == "android") {
             if (platform.arch == ANDROID_RELEASE_ARCH) {
-                "OpenClaw publishes a managed Android Node bundle for ${platform.label}. Publish the GitHub release asset or configure tools.exec.managed.node.downloadUrl and sha256 for a custom bundle."
+                "OpenClaw ships built-in Android Node bundle metadata for ${platform.label}. If that download fails, configure tools.exec.managed.node.downloadUrl and sha256 for a custom bundle."
             } else {
                 "OpenClaw only publishes a built-in Android Node bundle for android-$ANDROID_RELEASE_ARCH. Configure tools.exec.managed.node.downloadUrl and sha256 for a custom ${platform.label} bundle."
             }
@@ -797,7 +817,7 @@ class ManagedToolchainManager(
             return null
         }
         return if (request.platform.os == ANDROID_PLATFORM) {
-            "Managed Android Node bundle available from OpenClaw GitHub Releases."
+            "Managed Android Node bundle available from baked-in OpenClaw release metadata."
         } else {
             null
         }
@@ -808,6 +828,7 @@ class ManagedToolchainManager(
         private const val DEFAULT_NODE_BASE_URL = "https://nodejs.org/dist"
         private const val DEFAULT_ANDROID_NODE_BASE_URL =
             "https://github.com/mweinbach/kotlin-openclaw/releases/download/toolchain-node-android-arm64"
+        private const val DEFAULT_ANDROID_NODE_RELEASE_TAG = "toolchain-node-android-arm64"
         private const val ANDROID_PLATFORM = "android"
         private const val ANDROID_RELEASE_ARCH = "arm64"
         private const val ANDROID_PREFIX_SUBDIR = "usr"
@@ -817,12 +838,33 @@ class ManagedToolchainManager(
         private val ANDROID_RECOMMENDED_HOST_BINS = listOf("rg")
         private val DESKTOP_RECOMMENDED_HOST_BINS = listOf("git", "rg")
         private val SHA256_HEX = Regex("^[0-9a-fA-F]{64}$")
+        private val BUILT_IN_ANDROID_NODE_BUNDLES = listOf(
+            BuiltInNodeBundle(
+                version = "v25.3.0",
+                arch = "arm64",
+                archiveName = "openclaw-node-v25.3.0-android-arm64.tar.xz",
+                downloadUrl =
+                    "https://github.com/mweinbach/kotlin-openclaw/releases/download/" +
+                        "$DEFAULT_ANDROID_NODE_RELEASE_TAG/openclaw-node-v25.3.0-android-arm64.tar.xz",
+                sha256 = "b2fbc14f8b355d50f48b23e14373c80a873afed897628d274838141d3b0510ce",
+            ),
+        )
 
         private fun androidBundleArchiveName(
             version: String,
             platform: ToolchainPlatform,
         ): String {
             return "openclaw-node-$version-${platform.os}-${platform.arch}.tar.xz"
+        }
+
+        private fun builtInAndroidBundle(
+            version: String,
+            platform: ToolchainPlatform,
+        ): BuiltInNodeBundle? {
+            if (platform.os != ANDROID_PLATFORM) return null
+            return BUILT_IN_ANDROID_NODE_BUNDLES.firstOrNull {
+                it.version == version && it.arch == platform.arch
+            }
         }
 
         private suspend fun defaultDownloadToFile(
