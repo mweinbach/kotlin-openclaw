@@ -12,6 +12,7 @@ import okhttp3.Request
 import org.tukaani.xz.XZInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.InputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -100,6 +101,7 @@ private data class ManagedNodeInstallRequest(
     val sha256: String?,
     val shasumsUrl: String?,
     val archiveName: String,
+    val bundledAssetPath: String? = null,
 )
 
 private data class BuiltInNodeBundle(
@@ -108,6 +110,7 @@ private data class BuiltInNodeBundle(
     val archiveName: String,
     val downloadUrl: String,
     val sha256: String,
+    val bundledAssetPath: String,
 )
 
 class ManagedToolchainManager(
@@ -116,6 +119,9 @@ class ManagedToolchainManager(
     private val platformDetector: () -> ToolchainPlatform = { ToolchainPlatform.detect() },
     private val downloadToFile: suspend (url: String, target: File) -> Unit = { url, target ->
         defaultDownloadToFile(client, url, target)
+    },
+    private val extractBundledAssetToFile: suspend (assetPath: String, target: File) -> Boolean = { assetPath, target ->
+        defaultExtractBundledAssetToFile(context, assetPath, target)
     },
     private val downloadText: suspend (url: String) -> String = { url ->
         defaultDownloadText(client, url)
@@ -322,7 +328,12 @@ class ManagedToolchainManager(
         stagingDir.deleteRecursively()
         archiveFile.parentFile?.mkdirs()
 
-        downloadToFile(request.url, archiveFile)
+        val extractedFromBundle = request.bundledAssetPath
+            ?.let { assetPath -> extractBundledAssetToFile(assetPath, archiveFile) }
+            ?: false
+        if (!extractedFromBundle) {
+            downloadToFile(request.url, archiveFile)
+        }
         val expectedSha = request.sha256
             ?.takeIf { it.isNotBlank() }
             ?: fetchSha256(request)
@@ -420,6 +431,7 @@ class ManagedToolchainManager(
                     sha256 = nodeConfig?.sha256?.trim()?.takeIf { it.isNotEmpty() } ?: builtInBundle.sha256,
                     shasumsUrl = null,
                     archiveName = builtInBundle.archiveName,
+                    bundledAssetPath = builtInBundle.bundledAssetPath,
                 )
             }
             val baseUrl = normalizeBaseUrl(nodeConfig, platform)
@@ -847,6 +859,7 @@ class ManagedToolchainManager(
                     "https://github.com/mweinbach/kotlin-openclaw/releases/download/" +
                         "$DEFAULT_ANDROID_NODE_RELEASE_TAG/openclaw-node-v25.3.0-android-arm64.tar.xz",
                 sha256 = "b2fbc14f8b355d50f48b23e14373c80a873afed897628d274838141d3b0510ce",
+                bundledAssetPath = "toolchains/openclaw-node-v25.3.0-android-arm64.tar.xz",
             ),
         )
 
@@ -897,6 +910,24 @@ class ManagedToolchainManager(
                     "Failed to fetch managed toolchain metadata from $url (${response.code})"
                 }
                 response.body?.string() ?: error("Managed toolchain metadata response was empty")
+            }
+        }
+
+        private suspend fun defaultExtractBundledAssetToFile(
+            context: Context,
+            assetPath: String,
+            target: File,
+        ): Boolean = withContext(Dispatchers.IO) {
+            try {
+                context.assets.open(assetPath).use { input ->
+                    target.parentFile?.mkdirs()
+                    target.outputStream().buffered().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                true
+            } catch (_: FileNotFoundException) {
+                false
             }
         }
     }

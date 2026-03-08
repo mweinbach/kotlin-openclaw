@@ -278,16 +278,19 @@ class ManagedToolchainManagerTest {
         )
         val sha256 = sha256(archiveBytes)
         var checksumFetches = 0
-        val expectedUrl =
-            "https://github.com/mweinbach/kotlin-openclaw/releases/download/" +
-                "toolchain-node-android-arm64/$archiveName"
+        var bundledAssetExtractions = 0
         val manager = ManagedToolchainManager(
             context = context,
             client = OkHttpClient(),
             platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
-            downloadToFile = { url, target ->
-                assertEquals(expectedUrl, url)
+            downloadToFile = { _, _ ->
+                error("Built-in Android bundle should not hit the network when bundled in the APK")
+            },
+            extractBundledAssetToFile = { assetPath, target ->
+                assertEquals("toolchains/$archiveName", assetPath)
+                bundledAssetExtractions += 1
                 target.writeBytes(archiveBytes)
+                true
             },
             downloadText = {
                 checksumFetches += 1
@@ -313,6 +316,7 @@ class ManagedToolchainManagerTest {
 
         assertTrue(activation.nodeSupported)
         assertNotNull(activation.nodePath)
+        assertEquals(1, bundledAssetExtractions)
         assertEquals(0, checksumFetches)
     }
 

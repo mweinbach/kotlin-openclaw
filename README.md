@@ -25,6 +25,8 @@ git clone https://github.com/openclaw/openclaw tmp/openclaw-reference
 
 The app consumes a dedicated Android arm64 toolchain bundle from GitHub Releases under the stable release tag `toolchain-node-android-arm64`.
 
+Current Android app releases also bundle that archive directly inside the APK under `app/src/main/assets/toolchains/`, so managed Node install works without any network fetch in the normal path. The GitHub release asset remains the fallback/dev source and the publishing target for the local bundle scripts.
+
 For the current baked-in Android bundle, the app hardcodes the exact GitHub release asset URL and SHA-256 for `openclaw-node-v25.3.0-android-arm64.tar.xz`, so normal installs do not need a separate checksum lookup or manual dashboard configuration.
 
 Assets:
