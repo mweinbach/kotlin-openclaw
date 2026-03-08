@@ -3,6 +3,7 @@ package ai.openclaw.android
 import android.content.Context
 import ai.openclaw.core.model.ManagedNodeToolchainConfig
 import ai.openclaw.core.model.OpenClawConfig
+import ai.openclaw.runtime.engine.tools.runtime.ShellCommandBootstrap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -117,6 +118,9 @@ class ManagedToolchainManager(
     private val context: Context,
     private val client: OkHttpClient,
     private val platformDetector: () -> ToolchainPlatform = { ToolchainPlatform.detect() },
+    private val androidApkRuntimeDirProvider: () -> File? = {
+        defaultAndroidApkRuntimeDir(context)
+    },
     private val downloadToFile: suspend (url: String, target: File) -> Unit = { url, target ->
         defaultDownloadToFile(client, url, target)
     },
@@ -190,11 +194,14 @@ class ManagedToolchainManager(
         val path = execEnvironment.environment["PATH"]
         val recommendedHostBins = recommendedHostBins(activation)
         val nodeActive = !execEnvironment.nodePath.isNullOrBlank() && execEnvironment.nodeProbeError == null
+        val shimBins = ShellCommandBootstrap.availableCommandShims(execEnvironment.environment)
         val availableBins = (ESSENTIAL_JS_BINS + recommendedHostBins)
             .filter { bin ->
                 when (bin) {
                     "node" -> nodeActive
-                    else -> ExecEnvironmentResolver.resolveBinaryOnPath(bin, path) != null
+                    "npm", "npx", "corepack" -> (nodeActive && bin in shimBins) ||
+                        ExecEnvironmentResolver.resolveBinaryOnPath(bin, path) != null
+                    else -> bin in shimBins || ExecEnvironmentResolver.resolveBinaryOnPath(bin, path) != null
                 }
             }
             .distinct()
@@ -210,7 +217,11 @@ class ManagedToolchainManager(
             nodeManaged = nodeActive && managedNodePath != null && managedNodePath == execEnvironment.nodePath,
             nodeVersion = execEnvironment.nodeVersion,
             nodePath = execEnvironment.nodePath,
-            nodeMessage = combineNodeMessages(activation.nodeMessage, execEnvironment.nodeProbeError),
+            nodeMessage = combineNodeMessages(
+                activationMessage = activation.nodeMessage,
+                probeError = execEnvironment.nodeProbeError,
+                nodeRecord = activation.nodeRecord,
+            ),
             availableBins = availableBins.sorted(),
             missingEssentialBins = missingEssentialBins,
             missingRecommendedBins = missingRecommendedBins,
@@ -367,9 +378,13 @@ class ManagedToolchainManager(
         finalHomeDir.resolve(".npm").mkdirs()
         finalHomeDir.resolve(".cache/corepack").mkdirs()
 
-        val finalNodeBinary = locateNodeBinary(finalPrefixDir)
-        val finalBinDir = finalNodeBinary.parentFile
-            ?: error("Managed Android Node install is missing a finalized bin directory")
+        val packagedNodeBinary = locateAndroidApkRuntimeBinary(ANDROID_APK_NODE_BINARY)
+        require(packagedNodeBinary != null || context.applicationInfo.targetSdkVersion < 29) {
+            "Managed Android Node runtime requires APK-packaged native binaries under " +
+                "nativeLibraryDir; $ANDROID_APK_NODE_BINARY is missing."
+        }
+        val finalNodeBinary = packagedNodeBinary ?: locateNodeBinary(finalPrefixDir)
+        val finalBinDir = finalPrefixDir.resolve("bin")
         ensureNodeCompanionBinaries(finalPrefixDir, finalBinDir)
         ensureAndroidCompatBinaries(finalBinDir)
 
@@ -379,7 +394,7 @@ class ManagedToolchainManager(
             installDir = finalPrefixDir.absolutePath,
             distRoot = finalPrefixDir.absolutePath,
             binDir = finalBinDir.absolutePath,
-            nodePath = finalBinDir.resolve("node").absolutePath,
+            nodePath = finalNodeBinary.absolutePath,
             npmPath = finalBinDir.resolve("npm").takeIf(File::exists)?.absolutePath,
             npxPath = finalBinDir.resolve("npx").takeIf(File::exists)?.absolutePath,
             corepackPath = finalBinDir.resolve("corepack").takeIf(File::exists)?.absolutePath,
@@ -404,6 +419,10 @@ class ManagedToolchainManager(
         val version = normalizeNodeVersion(nodeConfig?.version ?: DEFAULT_NODE_VERSION)
         val customUrl = nodeConfig?.downloadUrl?.trim()?.takeIf { it.isNotEmpty() }
         if (customUrl != null) {
+            require(!(platform.os == ANDROID_PLATFORM && context.applicationInfo.targetSdkVersion >= 29)) {
+                "Custom Android managed Node bundles require matching APK-packaged native binaries. " +
+                    "Rebuild the app with matching jniLibs instead of using tools.exec.managed.node.downloadUrl."
+            }
             val customSha = nodeConfig.sha256?.trim()?.takeIf { it.isNotEmpty() }
             require(customSha != null) {
                 "tools.exec.managed.node.sha256 is required when using a custom downloadUrl"
@@ -424,6 +443,14 @@ class ManagedToolchainManager(
             }
             val explicitBaseUrl = nodeConfig?.baseUrl?.trim()?.takeIf { it.isNotEmpty() }
             val builtInBundle = builtInAndroidBundle(version, platform)
+            require(!(explicitBaseUrl != null && context.applicationInfo.targetSdkVersion >= 29)) {
+                "Custom Android managed Node bundle base URLs require matching APK-packaged native binaries. " +
+                    "Rebuild the app with matching jniLibs instead of overriding tools.exec.managed.node.baseUrl."
+            }
+            require(!(builtInBundle == null && context.applicationInfo.targetSdkVersion >= 29)) {
+                "OpenClaw only packages APK-backed Android Node binaries for $DEFAULT_NODE_VERSION. " +
+                    "Rebuild the app with matching jniLibs before using Android managed Node $version."
+            }
             if (explicitBaseUrl == null && builtInBundle != null) {
                 return ManagedNodeInstallRequest(
                     version = version,
@@ -705,6 +732,12 @@ class ManagedToolchainManager(
         ensureExecutable(target)
     }
 
+    private fun locateAndroidApkRuntimeBinary(fileName: String): File? {
+        val runtimeDir = androidApkRuntimeDirProvider() ?: return null
+        return runtimeDir.resolve(fileName)
+            .takeIf { it.exists() && it.canExecute() }
+    }
+
     private fun moveDirectory(source: File, destination: File): Boolean {
         destination.parentFile?.mkdirs()
         if (source.renameTo(destination)) {
@@ -732,14 +765,40 @@ class ManagedToolchainManager(
     private fun combineNodeMessages(
         activationMessage: String?,
         probeError: String?,
+        nodeRecord: ManagedNodeInstallRecord?,
     ): String? {
         val messages = buildList {
             activationMessage?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
             probeError?.trim()?.takeIf { it.isNotEmpty() }?.let { error ->
                 add("Node runtime probe failed: $error")
             }
+            androidExecRestrictionHint(nodeRecord, probeError)?.let(::add)
         }
         return messages.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
+    }
+
+    private fun androidExecRestrictionHint(
+        nodeRecord: ManagedNodeInstallRecord?,
+        probeError: String?,
+    ): String? {
+        if (nodeRecord == null) return null
+        if (!nodeRecord.platform.startsWith("$ANDROID_PLATFORM-")) return null
+        if (context.applicationInfo.targetSdkVersion < 29) return null
+        if (probeError.isNullOrBlank()) return null
+        if (!probeError.contains("error=13", ignoreCase = true)) return null
+        if (!probeError.contains("Permission denied", ignoreCase = true)) return null
+
+        val installDir = File(nodeRecord.installDir)
+        val filesDirPath = context.filesDir.absolutePath
+        if (!installDir.absolutePath.startsWith(filesDirPath)) return null
+
+        return buildString {
+            append("Android 10+ blocks exec() from writable app home directories ")
+            append("for apps targeting API 29+, so the managed Node binary under ")
+            append("${installDir.absolutePath} cannot run from files/usr. ")
+            append("This runtime needs an APK-packaged executable location such as ")
+            append("the app's native library directory instead of an extracted filesDir toolchain.")
+        }
     }
 
     private fun sha256(file: File): String {
@@ -820,14 +879,37 @@ class ManagedToolchainManager(
         val certFile = prefixDir.resolve("etc/tls/cert.pem")
         val npmCacheDir = homeDir.resolve(".npm")
         val corepackHomeDir = homeDir.resolve(".cache/corepack")
+        val nativeLibDir = androidApkRuntimeDirProvider()
+        val nativeNode = locateAndroidApkRuntimeBinary(ANDROID_APK_NODE_BINARY)
+        val nativeRg = locateAndroidApkRuntimeBinary(ANDROID_APK_RG_BINARY)
+        val ldLibraryPath = buildList {
+            nativeLibDir?.absolutePath?.let(::add)
+            add(prefixDir.resolve("lib").absolutePath)
+        }.distinct().joinToString(File.pathSeparator)
         return buildMap {
             put("PREFIX", prefixDir.absolutePath)
             put("TERMUX_PREFIX", prefixDir.absolutePath)
             put("HOME", homeDir.absolutePath)
             put("TMPDIR", tmpDir.absolutePath)
-            put("LD_LIBRARY_PATH", prefixDir.resolve("lib").absolutePath)
+            put("LD_LIBRARY_PATH", ldLibraryPath)
             put("npm_config_cache", npmCacheDir.absolutePath)
             put("COREPACK_HOME", corepackHomeDir.absolutePath)
+            nativeNode?.absolutePath?.let { nodeExec ->
+                put(ShellCommandBootstrap.NODE_EXEC_ENV, nodeExec)
+                prefixDir.resolve("lib/node_modules/npm/bin/npm-cli.js")
+                    .takeIf(File::exists)
+                    ?.absolutePath
+                    ?.let { put(ShellCommandBootstrap.NPM_CLI_JS_ENV, it) }
+                prefixDir.resolve("lib/node_modules/npm/bin/npx-cli.js")
+                    .takeIf(File::exists)
+                    ?.absolutePath
+                    ?.let { put(ShellCommandBootstrap.NPX_CLI_JS_ENV, it) }
+                prefixDir.resolve("lib/node_modules/corepack/dist/corepack.js")
+                    .takeIf(File::exists)
+                    ?.absolutePath
+                    ?.let { put(ShellCommandBootstrap.COREPACK_JS_ENV, it) }
+            }
+            nativeRg?.absolutePath?.let { put(ShellCommandBootstrap.RG_EXEC_ENV, it) }
             if (certFile.exists()) {
                 put("SSL_CERT_FILE", certFile.absolutePath)
                 put("NODE_EXTRA_CA_CERTS", certFile.absolutePath)
@@ -859,6 +941,8 @@ class ManagedToolchainManager(
         private const val ANDROID_RELEASE_ARCH = "arm64"
         private const val ANDROID_PREFIX_SUBDIR = "usr"
         private const val ANDROID_HOME_SUBDIR = "home"
+        private const val ANDROID_APK_NODE_BINARY = "libopenclaw_node.so"
+        private const val ANDROID_APK_RG_BINARY = "libopenclaw_rg.so"
         private const val TAR_BLOCK_SIZE = 512
         private val ESSENTIAL_JS_BINS = listOf("node", "npm", "npx", "corepack")
         private val ANDROID_RECOMMENDED_HOST_BINS = listOf("rg")
@@ -892,6 +976,14 @@ class ManagedToolchainManager(
             return BUILT_IN_ANDROID_NODE_BUNDLES.firstOrNull {
                 it.version == version && it.arch == platform.arch
             }
+        }
+
+        private fun defaultAndroidApkRuntimeDir(context: Context): File? {
+            val path = context.applicationInfo.nativeLibraryDir
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: return null
+            return File(path)
         }
 
         private suspend fun defaultDownloadToFile(

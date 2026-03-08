@@ -266,7 +266,7 @@ class AgentEngineTest {
     }
 
     @Test
-    fun `configureManagedNodeCustomBundle persists bundle config and marks toolchain supported`() = runTest {
+    fun `configureManagedNodeCustomBundle persists bundle config but reports unsupported on modern android targets`() = runTest {
         val downloadUrl = "https://example.test/node-android-arm64.tar.xz"
         val sha256 = "a".repeat(64)
 
@@ -280,7 +280,8 @@ class AgentEngineTest {
 
         assertEquals(downloadUrl, savedConfig.downloadUrl)
         assertEquals(sha256, savedConfig.sha256)
-        assertTrue(status.nodeSupported)
+        assertFalse(status.nodeSupported)
+        assertTrue(status.nodeMessage?.contains("matching APK-packaged native binaries") == true)
     }
 
     @Test

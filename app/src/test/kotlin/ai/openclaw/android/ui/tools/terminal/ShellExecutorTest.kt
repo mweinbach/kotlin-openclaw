@@ -3,7 +3,6 @@ package ai.openclaw.android.ui.tools.terminal
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
-import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.test.assertContains
@@ -83,6 +82,56 @@ class ShellExecutorTest {
         )
         val output = executor.execute("echo \$FOO").toList()
         assertContains(output.joinToString("\n"), "from-base-env")
+    }
+
+    @Test
+    fun `execute injects managed node shell shims`() = runTest {
+        val tempDir = createTempDir(prefix = "openclaw-shell-shims")
+        val nodeBinary = tempDir.resolve("node")
+        val npmCli = tempDir.resolve("npm-cli.js")
+        val rgBinary = tempDir.resolve("rg")
+        nodeBinary.writeText(
+            """
+            #!/bin/sh
+            script="${'$'}1"
+            shift
+            case "${'$'}script" in
+              --version)
+                echo v25.3.0
+                ;;
+              ${npmCli.absolutePath})
+                echo npm "${'$'}@"
+                ;;
+              *)
+                echo node "${'$'}script" "${'$'}@"
+                ;;
+            esac
+            """.trimIndent(),
+        )
+        nodeBinary.setExecutable(true)
+        npmCli.writeText("console.log('npm')")
+        rgBinary.writeText("#!/bin/sh\necho rg \"$@\"")
+        rgBinary.setExecutable(true)
+
+        try {
+            val executor = ShellExecutor(
+                environmentProvider = {
+                    mapOf(
+                        "PATH" to (System.getenv("PATH") ?: ""),
+                        "OPENCLAW_NODE_EXEC" to nodeBinary.absolutePath,
+                        "OPENCLAW_NPM_CLI_JS" to npmCli.absolutePath,
+                        "OPENCLAW_RG_EXEC" to rgBinary.absolutePath,
+                    )
+                },
+            )
+
+            val output = executor.execute("npm install && rg hello").toList().joinToString("\n")
+
+            assertContains(output, "npm install")
+            assertContains(output, "rg hello")
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 
     @Test

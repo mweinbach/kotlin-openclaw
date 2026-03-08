@@ -1,5 +1,6 @@
 package ai.openclaw.android.ui.tools.terminal
 
+import ai.openclaw.runtime.engine.tools.runtime.ShellCommandBootstrap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -24,12 +25,13 @@ class ShellExecutor(
     var workingDir: String = defaultWorkingDir
 
     fun execute(command: String): Flow<String> = flow {
-        val pb = ProcessBuilder(shellPathProvider(), "-c", command)
+        val mergedEnv = LinkedHashMap(System.getenv())
+        mergedEnv.putAll(environmentProvider())
+        val wrappedCommand = ShellCommandBootstrap.apply(command, mergedEnv)
+        val pb = ProcessBuilder(shellPathProvider(), "-c", wrappedCommand)
             .redirectErrorStream(true)
             .directory(java.io.File(workingDir))
         val processEnv = pb.environment()
-        val mergedEnv = LinkedHashMap(System.getenv())
-        mergedEnv.putAll(environmentProvider())
         processEnv.clear()
         processEnv.putAll(mergedEnv)
 

@@ -25,7 +25,13 @@ git clone https://github.com/openclaw/openclaw tmp/openclaw-reference
 
 The app consumes a dedicated Android arm64 toolchain bundle from GitHub Releases under the stable release tag `toolchain-node-android-arm64`.
 
-Current Android app releases also bundle that archive directly inside the APK under `app/src/main/assets/toolchains/`, so managed Node install works without any network fetch in the normal path. The GitHub release asset remains the fallback/dev source and the publishing target for the local bundle scripts.
+Current Android app releases also bundle that archive directly inside the APK under `app/src/main/assets/toolchains/`, so managed Node install avoids network fetch in the normal path. The GitHub release asset remains the fallback/dev source and the publishing target for the local bundle scripts.
+
+That bundled archive is not sufficient by itself on modern Android app targets. Android 10+ blocks `exec()` from writable app home directories for apps targeting API 29+, so this repo now treats the asset bundle as the source payload only:
+- the Termux-style prefix tree is still extracted into `files/usr` for JS modules, certs, caches, and config
+- Gradle materializes APK-backed native entrypoints and shared libraries into `jniLibs/arm64-v8a` during the build
+- the managed runtime executes Node and ripgrep from `applicationInfo.nativeLibraryDir` instead of `files/usr/bin`
+- shell shims map `npm`, `npx`, `corepack`, and `rg` back onto that APK-backed Node binary plus the extracted JS payload
 
 For the current baked-in Android bundle, the app hardcodes the exact GitHub release asset URL and SHA-256 for `openclaw-node-v25.3.0-android-arm64.tar.xz`, so normal installs do not need a separate checksum lookup or manual dashboard configuration.
 
@@ -34,7 +40,7 @@ Assets:
 - `openclaw-node-v<node-version>-android-arm64.tar.xz.sha256`
 - `openclaw-node-android-arm64.json`
 
-This bundle is built from `termux-packages`, but it is compiled against the OpenClaw Android package name `ai.openclaw.android`, not `com.termux`. That matters because the Termux `node` binary hardcodes the prefix path `/data/data/<package>/files/usr`, so the bundle must match the app package name to run correctly on-device.
+This bundle is built from `termux-packages`, and it is compiled against the OpenClaw Android package name `ai.openclaw.android`, not `com.termux`. That still matters because the Termux `node` binary hardcodes the prefix path `/data/data/<package>/files/usr`. Matching the package name is necessary so the extracted prefix tree lines up with Node's compiled-in defaults, while the actual ELF binaries now run from the APK native library directory.
 
 The bundle currently includes:
 - `node`
@@ -46,6 +52,10 @@ The bundle currently includes:
 The Android bundle intentionally does not include `git`. The current Termux `git` recipe enables Tcl/Tk and Perl features, which drags in a large desktop-oriented dependency tree (`fontconfig`, X11 macros/protocols, Subversion, and more) that does not make sense for the on-device OpenClaw runtime.
 
 The repository no longer auto-builds or auto-publishes this bundle in GitHub Actions. Build and publish happen from your local machine with the scripts in `scripts/`.
+
+The Android app build also runs `scripts/prepare_android_node_native_libs.py`, which extracts the bundled archive into generated `jniLibs` entries for the packaged Node/ripgrep binaries and their shared-library dependencies.
+
+Because those APK-native binaries are version-coupled to the app build, Android managed Node custom `downloadUrl` or `baseUrl` overrides are no longer a safe runtime-only escape hatch on `targetSdk >= 29`. Rebuild the app with matching generated `jniLibs` if you need a different Android Node bundle version.
 
 To build the bundle locally:
 

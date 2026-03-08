@@ -121,12 +121,13 @@ class ExecTool(
             ?.takeIf { it.isNotBlank() }
             ?.takeIf { File(it).exists() }
             ?: if (File("/system/bin/sh").exists()) "/system/bin/sh" else "/bin/sh"
-        val pb = ProcessBuilder(resolvedShellPath, "-c", command)
-        pb.redirectErrorStream(true)
-        pb.directory(File(workdir))
         val mergedEnv = LinkedHashMap(System.getenv())
         mergedEnv.putAll(baseEnv)
         mergedEnv.putAll(env)
+        val wrappedCommand = ShellCommandBootstrap.apply(command, mergedEnv)
+        val pb = ProcessBuilder(resolvedShellPath, "-c", wrappedCommand)
+        pb.redirectErrorStream(true)
+        pb.directory(File(workdir))
         val processEnv = pb.environment()
         processEnv.clear()
         processEnv.putAll(mergedEnv)

@@ -37,6 +37,7 @@ class ManagedToolchainManagerTest {
         context.filesDir.resolve("toolchains").deleteRecursively()
         context.filesDir.resolve("usr").deleteRecursively()
         context.filesDir.resolve("home").deleteRecursively()
+        context.filesDir.resolve("apk-native").deleteRecursively()
     }
 
     @Test
@@ -251,6 +252,7 @@ class ManagedToolchainManagerTest {
     fun `installNode uses baked in android release metadata without checksum fetch`() = runTest {
         val version = "v25.3.0"
         val archiveName = "openclaw-node-$version-android-arm64.tar.xz"
+        val apkRuntimeDir = createAndroidApkRuntimeDir(version)
         val archiveBytes = createTarXzArchive(
             entries = listOf(
                 TarEntry(
@@ -284,6 +286,7 @@ class ManagedToolchainManagerTest {
             context = context,
             client = OkHttpClient(),
             platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
+            androidApkRuntimeDirProvider = { apkRuntimeDir },
             downloadToFile = { _, _ ->
                 error("Built-in Android bundle should not hit the network when bundled in the APK")
             },
@@ -317,6 +320,7 @@ class ManagedToolchainManagerTest {
 
         assertTrue(activation.nodeSupported)
         assertNotNull(activation.nodePath)
+        assertEquals(apkRuntimeDir.resolve("libopenclaw_node.so").absolutePath, activation.nodePath)
         assertEquals(1, bundledAssetExtractions)
         assertEquals(0, checksumFetches)
     }
@@ -325,6 +329,7 @@ class ManagedToolchainManagerTest {
     fun `installNode installs android bundle into app prefix and exports runtime env`() = runTest {
         val version = "v25.3.0"
         val archiveName = "openclaw-node-$version-android-arm64.tar.xz"
+        val apkRuntimeDir = createAndroidApkRuntimeDir(version)
         val archiveBytes = createTarXzArchive(
             entries = listOf(
                 TarEntry(
@@ -356,18 +361,18 @@ class ManagedToolchainManagerTest {
             ),
         )
         val sha256 = sha256(archiveBytes)
-        val baseUrl = "https://example.test/releases/download/toolchain-node-android-arm64"
         val manager = ManagedToolchainManager(
             context = context,
             client = OkHttpClient(),
             platformDetector = { ToolchainPlatform(os = "android", arch = "arm64") },
-            downloadToFile = { url, target ->
-                assertEquals("$baseUrl/$archiveName", url)
-                target.writeBytes(archiveBytes)
+            androidApkRuntimeDirProvider = { apkRuntimeDir },
+            downloadToFile = { _, _ ->
+                error("Built-in Android bundle should not hit the network when bundled in the APK")
             },
-            downloadText = { url ->
-                assertEquals("$baseUrl/$archiveName.sha256", url)
-                "$sha256  $archiveName\n"
+            extractBundledAssetToFile = { assetPath, target ->
+                assertEquals("toolchains/$archiveName", assetPath)
+                target.writeBytes(archiveBytes)
+                true
             },
             nowProvider = { Instant.parse("2026-03-07T00:00:00Z") },
         )
@@ -377,7 +382,7 @@ class ManagedToolchainManagerTest {
                     managed = ManagedExecToolchainsConfig(
                         node = ManagedNodeToolchainConfig(
                             version = version.removePrefix("v"),
-                            baseUrl = baseUrl,
+                            sha256 = sha256,
                         ),
                     ),
                 ),
@@ -387,7 +392,7 @@ class ManagedToolchainManagerTest {
         val activation = manager.installNode(config)
         val nodePath = activation.nodePath
         assertNotNull(nodePath)
-        assertEquals(context.filesDir.resolve("usr/bin/node").absolutePath, nodePath)
+        assertEquals(apkRuntimeDir.resolve("libopenclaw_node.so").absolutePath, nodePath)
         assertTrue(context.filesDir.resolve("usr/bin/sh").exists())
         assertTrue(context.filesDir.resolve("usr/bin/env").exists())
         assertTrue(context.filesDir.resolve("home").isDirectory)
@@ -403,9 +408,21 @@ class ManagedToolchainManagerTest {
         assertEquals(context.filesDir.resolve("usr").absolutePath, resolved.environment["PREFIX"])
         assertEquals(context.filesDir.resolve("home").absolutePath, resolved.environment["HOME"])
         assertEquals(context.filesDir.resolve("usr/tmp").absolutePath, resolved.environment["TMPDIR"])
-        assertEquals(context.filesDir.resolve("usr/lib").absolutePath, resolved.environment["LD_LIBRARY_PATH"])
+        assertEquals(
+            listOf(
+                apkRuntimeDir.absolutePath,
+                context.filesDir.resolve("usr/lib").absolutePath,
+            ),
+            resolved.environment["LD_LIBRARY_PATH"]?.split(File.pathSeparator),
+        )
         assertEquals(context.filesDir.resolve("usr/etc/tls/cert.pem").absolutePath, resolved.environment["SSL_CERT_FILE"])
-        assertTrue(resolved.nodePath?.endsWith("/usr/bin/node") == true)
+        assertEquals(apkRuntimeDir.resolve("libopenclaw_node.so").absolutePath, resolved.nodePath)
+        assertEquals(apkRuntimeDir.resolve("libopenclaw_rg.so").absolutePath, resolved.environment["OPENCLAW_RG_EXEC"])
+        assertEquals(apkRuntimeDir.resolve("libopenclaw_node.so").absolutePath, resolved.environment["OPENCLAW_NODE_EXEC"])
+        assertEquals(
+            context.filesDir.resolve("usr/lib/node_modules/npm/bin/npm-cli.js").absolutePath,
+            resolved.environment["OPENCLAW_NPM_CLI_JS"],
+        )
 
         val status = manager.buildStatus(activation, resolved)
         assertEquals(listOf("corepack", "node", "npm", "npx", "rg"), status.availableBins)
@@ -448,6 +465,8 @@ class ManagedToolchainManagerTest {
         assertFalse(status.nodeManaged)
         assertTrue("node" in status.missingEssentialBins)
         assertTrue(status.nodeMessage?.contains("Permission denied") == true)
+        assertTrue(status.nodeMessage?.contains("Android 10+ blocks exec() from writable app home directories") == true)
+        assertTrue(status.nodeMessage?.contains("native library directory") == true)
     }
 
     private data class TarEntry(
@@ -455,6 +474,29 @@ class ManagedToolchainManagerTest {
         val content: ByteArray,
         val mode: Int = 0b110100100,
     )
+
+    private fun createAndroidApkRuntimeDir(version: String): File {
+        val runtimeDir = context.filesDir.resolve("apk-native").apply { mkdirs() }
+        runtimeDir.resolve("libopenclaw_node.so").writeText(
+            """
+            #!/bin/sh
+            if [ "${'$'}1" = "--version" ]; then
+              echo $version
+            else
+              echo node
+            fi
+            """.trimIndent(),
+        )
+        runtimeDir.resolve("libopenclaw_node.so").setExecutable(true)
+        runtimeDir.resolve("libopenclaw_rg.so").writeText(
+            """
+            #!/bin/sh
+            echo rg
+            """.trimIndent(),
+        )
+        runtimeDir.resolve("libopenclaw_rg.so").setExecutable(true)
+        return runtimeDir
+    }
 
     private fun createTarGzArchive(entries: List<TarEntry>): ByteArray {
         val out = ByteArrayOutputStream()

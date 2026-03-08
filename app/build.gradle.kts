@@ -4,6 +4,26 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
+val bundledAndroidNodeArchive = fileTree("src/main/assets/toolchains") {
+    include("openclaw-node-v*-android-arm64.tar.xz")
+}.files.singleOrNull()
+    ?: error("Expected exactly one bundled Android Node archive under app/src/main/assets/toolchains")
+val generatedAndroidNodeJniLibsDir = layout.buildDirectory.dir("generated/openclaw-node/jniLibs")
+val generatedAndroidNodeJniLibsPath = generatedAndroidNodeJniLibsDir.get().asFile
+val prepareBundledAndroidNodeNativeLibs = tasks.register<Exec>("prepareBundledAndroidNodeNativeLibs") {
+    inputs.file(bundledAndroidNodeArchive)
+    inputs.file(rootProject.file("scripts/prepare_android_node_native_libs.py"))
+    outputs.dir(generatedAndroidNodeJniLibsDir)
+    commandLine(
+        "python3",
+        rootProject.file("scripts/prepare_android_node_native_libs.py").absolutePath,
+        "--archive",
+        bundledAndroidNodeArchive.absolutePath,
+        "--output-dir",
+        generatedAndroidNodeJniLibsPath.absolutePath,
+    )
+}
+
 android {
     namespace = "ai.openclaw.android"
     compileSdk = 36
@@ -12,8 +32,8 @@ android {
         applicationId = "ai.openclaw.android"
         minSdk = 28
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.2.7"
+        versionCode = 10
+        versionName = "0.2.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -67,6 +87,14 @@ android {
             )
         }
     }
+
+    sourceSets {
+        getByName("main").jniLibs.srcDir(generatedAndroidNodeJniLibsPath)
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(prepareBundledAndroidNodeNativeLibs)
 }
 
 dependencies {
