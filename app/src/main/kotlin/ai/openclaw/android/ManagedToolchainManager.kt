@@ -189,10 +189,11 @@ class ManagedToolchainManager(
     ): ManagedToolchainStatus {
         val path = execEnvironment.environment["PATH"]
         val recommendedHostBins = recommendedHostBins(activation)
+        val nodeActive = !execEnvironment.nodePath.isNullOrBlank() && execEnvironment.nodeProbeError == null
         val availableBins = (ESSENTIAL_JS_BINS + recommendedHostBins)
             .filter { bin ->
                 when (bin) {
-                    "node" -> !execEnvironment.nodePath.isNullOrBlank()
+                    "node" -> nodeActive
                     else -> ExecEnvironmentResolver.resolveBinaryOnPath(bin, path) != null
                 }
             }
@@ -205,11 +206,11 @@ class ManagedToolchainManager(
         return ManagedToolchainStatus(
             nodeSupported = activation.nodeSupported,
             nodeInstalled = activation.nodeRecord != null,
-            nodeActive = !execEnvironment.nodePath.isNullOrBlank(),
-            nodeManaged = managedNodePath != null && managedNodePath == execEnvironment.nodePath,
+            nodeActive = nodeActive,
+            nodeManaged = nodeActive && managedNodePath != null && managedNodePath == execEnvironment.nodePath,
             nodeVersion = execEnvironment.nodeVersion,
             nodePath = execEnvironment.nodePath,
-            nodeMessage = activation.nodeMessage,
+            nodeMessage = combineNodeMessages(activation.nodeMessage, execEnvironment.nodeProbeError),
             availableBins = availableBins.sorted(),
             missingEssentialBins = missingEssentialBins,
             missingRecommendedBins = missingRecommendedBins,
@@ -726,6 +727,19 @@ class ManagedToolchainManager(
 
     private fun ensureExecutable(file: File) {
         runCatching { file.setExecutable(true, false) }
+    }
+
+    private fun combineNodeMessages(
+        activationMessage: String?,
+        probeError: String?,
+    ): String? {
+        val messages = buildList {
+            activationMessage?.trim()?.takeIf { it.isNotEmpty() }?.let(::add)
+            probeError?.trim()?.takeIf { it.isNotEmpty() }?.let { error ->
+                add("Node runtime probe failed: $error")
+            }
+        }
+        return messages.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
     }
 
     private fun sha256(file: File): String {

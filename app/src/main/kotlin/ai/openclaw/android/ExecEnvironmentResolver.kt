@@ -11,6 +11,7 @@ data class ResolvedExecEnvironment(
     val environment: Map<String, String>,
     val nodePath: String? = null,
     val nodeVersion: String? = null,
+    val nodeProbeError: String? = null,
 ) {
     companion object {
         fun fromSystem(): ResolvedExecEnvironment {
@@ -26,6 +27,11 @@ data class ResolvedExecEnvironment(
         }
     }
 }
+
+private data class NodeProbeResult(
+    val version: String? = null,
+    val error: String? = null,
+)
 
 class ExecEnvironmentResolver(
     private val inheritedEnvProvider: () -> Map<String, String> = { System.getenv() },
@@ -108,9 +114,10 @@ class ExecEnvironmentResolver(
 
         val nodePath = explicitNodeFile?.absolutePath
             ?: resolveBinaryOnPath("node", merged["PATH"])?.absolutePath
-        val nodeVersion = nodePath?.let { path ->
+        val nodeProbe = nodePath?.let { path ->
             queryNodeVersion(path = path, environment = merged)
-        }
+        } ?: NodeProbeResult()
+        val nodeVersion = nodeProbe.version
 
         if (nodePath != null) {
             merged["OPENCLAW_NODE_BIN"] = nodePath
@@ -124,6 +131,7 @@ class ExecEnvironmentResolver(
             environment = merged,
             nodePath = nodePath,
             nodeVersion = nodeVersion,
+            nodeProbeError = nodeProbe.error,
         )
     }
 
@@ -315,31 +323,48 @@ class ExecEnvironmentResolver(
         private suspend fun queryNodeVersion(
             path: String,
             environment: Map<String, String>,
-        ): String? = withContext(Dispatchers.IO) {
-            val process = ProcessBuilder(path, "--version")
-                .redirectErrorStream(true)
-                .apply {
-                    val env = environment()
-                    env.clear()
-                    env.putAll(environment)
-                }
-                .start()
+        ): NodeProbeResult = withContext(Dispatchers.IO) {
+            var process: Process? = null
             return@withContext try {
+                process = ProcessBuilder(path, "--version")
+                    .redirectErrorStream(true)
+                    .apply {
+                        val env = environment()
+                        env.clear()
+                        env.putAll(environment)
+                    }
+                    .start()
+
                 if (!process.waitFor(2, TimeUnit.SECONDS)) {
                     process.destroyForcibly()
-                    null
+                    NodeProbeResult(error = "Timed out while running $path --version")
                 } else {
-                    process.inputStream.bufferedReader().use { reader ->
-                        reader.readText().trim().takeIf { it.isNotEmpty() }
+                    val output = process.inputStream.bufferedReader().use { reader ->
+                        reader.readText().trim()
+                    }
+                    if (process.exitValue() == 0) {
+                        output.takeIf { it.isNotEmpty() }
+                            ?.let { NodeProbeResult(version = it) }
+                            ?: NodeProbeResult(error = "Node version probe returned no output")
+                    } else {
+                        NodeProbeResult(
+                            error = output.takeIf { it.isNotEmpty() }
+                                ?: "Node version probe exited with code ${process.exitValue()}",
+                        )
                     }
                 }
-            } catch (_: Throwable) {
-                process.destroyForcibly()
-                null
+            } catch (error: Throwable) {
+                process?.destroyForcibly()
+                NodeProbeResult(
+                    error = error.message?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: "Node version probe failed with ${error::class.java.simpleName}",
+                )
             } finally {
-                runCatching { process.inputStream.close() }
-                runCatching { process.errorStream.close() }
-                runCatching { process.outputStream.close() }
+                process?.let {
+                    runCatching { it.inputStream.close() }
+                    runCatching { it.errorStream.close() }
+                    runCatching { it.outputStream.close() }
+                }
             }
         }
     }

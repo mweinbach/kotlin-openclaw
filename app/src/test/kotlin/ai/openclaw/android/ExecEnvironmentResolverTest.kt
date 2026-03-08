@@ -79,4 +79,43 @@ class ExecEnvironmentResolverTest {
             workspaceDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `resolve keeps node probe failures out of dashboard refresh`() = runTest {
+        val workspaceDir = createTempDir(prefix = "openclaw-env-fail")
+        val nodeDir = workspaceDir.resolve("node-bin").apply { mkdirs() }
+        val nodeBinary = nodeDir.resolve("node")
+        nodeBinary.writeText("this is not a real executable")
+        nodeBinary.setExecutable(true)
+
+        try {
+            val resolver = ExecEnvironmentResolver(
+                inheritedEnvProvider = {
+                    mapOf(
+                        "PATH" to "/usr/bin",
+                        "HOME" to workspaceDir.absolutePath,
+                    )
+                },
+                homeDirProvider = { workspaceDir.absolutePath },
+            )
+
+            val resolved = resolver.resolve(
+                config = OpenClawConfig(
+                    tools = ExpandedToolsConfig(
+                        exec = ExecToolConfig(
+                            node = nodeBinary.absolutePath,
+                        ),
+                    ),
+                ),
+                workspaceDir = workspaceDir.absolutePath,
+            )
+
+            assertEquals(nodeBinary.absolutePath, resolved.nodePath)
+            assertEquals(null, resolved.nodeVersion)
+            assertTrue(resolved.nodeProbeError?.isNotBlank() == true)
+            assertEquals(nodeBinary.absolutePath, resolved.environment["OPENCLAW_NODE_BIN"])
+        } finally {
+            workspaceDir.deleteRecursively()
+        }
+    }
 }

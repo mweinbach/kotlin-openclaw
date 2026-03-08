@@ -20,6 +20,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.Instant
 import java.util.zip.GZIPOutputStream
+import kotlin.test.assertFalse
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -409,6 +410,44 @@ class ManagedToolchainManagerTest {
         val status = manager.buildStatus(activation, resolved)
         assertEquals(listOf("corepack", "node", "npm", "npx", "rg"), status.availableBins)
         assertTrue(status.missingRecommendedBins.isEmpty())
+    }
+
+    @Test
+    fun `buildStatus reports node probe failures without breaking refresh`() {
+        val nodePath = context.filesDir.resolve("usr/bin/node").absolutePath
+        val manager = ManagedToolchainManager(
+            context = context,
+            client = OkHttpClient(),
+        )
+
+        val status = manager.buildStatus(
+            activation = ManagedToolchainActivation(
+                nodeSupported = true,
+                nodeRecord = ManagedNodeInstallRecord(
+                    version = "v25.3.0",
+                    platform = "android-arm64",
+                    installDir = context.filesDir.resolve("usr").absolutePath,
+                    distRoot = context.filesDir.resolve("usr").absolutePath,
+                    binDir = context.filesDir.resolve("usr/bin").absolutePath,
+                    nodePath = nodePath,
+                    sourceUrl = "https://example.test/openclaw-node-v25.3.0-android-arm64.tar.xz",
+                    sha256 = "a".repeat(64),
+                    installedAt = "2026-03-07T00:00:00Z",
+                ),
+            ),
+            execEnvironment = ResolvedExecEnvironment(
+                shellPath = "/system/bin/sh",
+                environment = mapOf("PATH" to context.filesDir.resolve("usr/bin").absolutePath),
+                nodePath = nodePath,
+                nodeProbeError = "Cannot run program \"$nodePath\": error=13, Permission denied",
+            ),
+        )
+
+        assertTrue(status.nodeInstalled)
+        assertFalse(status.nodeActive)
+        assertFalse(status.nodeManaged)
+        assertTrue("node" in status.missingEssentialBins)
+        assertTrue(status.nodeMessage?.contains("Permission denied") == true)
     }
 
     private data class TarEntry(
